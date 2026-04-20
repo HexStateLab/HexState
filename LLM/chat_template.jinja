@@ -1,3 +1,7 @@
+{#- Gemma 4 Chat Template v2 — Full Cognitive Architecture -#}
+{#- ================================================================ -#}
+{#- SECTION 1: Tool/Function Formatting Macros                       -#}
+{#- ================================================================ -#}
 {%- macro format_parameters(properties, required) -%}
     {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
     {%- set ns = namespace(found_first=false) -%}
@@ -145,40 +149,6 @@
         {{- argument -}}
     {%- endif -%}
 {%- endmacro -%}
-{%- macro strip_thinking(text) -%}
-    {%- set ns = namespace(result='') -%}
-    {%- for part in text.split('<channel|>') -%}
-        {%- if '<|channel>' in part -%}
-            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
-        {%- else -%}
-            {%- set ns.result = ns.result + part -%}
-        {%- endif -%}
-    {%- endfor -%}
-    {{- ns.result | trim -}}
-{%- endmacro -%}
-{#- Extract thinking content instead of discarding it -#}
-{%- macro extract_thinking(text) -%}
-    {%- set ns = namespace(thoughts='') -%}
-    {%- for part in text.split('<channel|>') -%}
-        {%- if '<|channel>' in part -%}
-            {%- set thought_block = part.split('<|channel>')[1] -%}
-            {%- if thought_block and thought_block.strip().startswith('thought') -%}
-                {%- set ns.thoughts = ns.thoughts + thought_block.strip()[7:].strip() + '\n' -%}
-            {%- endif -%}
-        {%- endif -%}
-    {%- endfor -%}
-    {{- ns.thoughts | trim -}}
-{%- endmacro -%}
-{#- preserve thinking — render content WITH prior reasoning visible -#}
-{%- macro preserve_thinking(text) -%}
-    {%- set extracted = extract_thinking(text) -%}
-    {%- set clean = strip_thinking(text) -%}
-    {%- if extracted -%}
-        {{- '<|channel>thought\n' + extracted + '\n<channel|>' + clean -}}
-    {%- else -%}
-        {{- clean -}}
-    {%- endif -%}
-{%- endmacro -%}
 {%- macro format_tool_response_block(tool_name, response) -%}
     {{- '<|tool_response>' -}}
     {%- if response is mapping -%}
@@ -193,13 +163,50 @@
     {%- endif -%}
     {{- '<tool_response|>' -}}
 {%- endmacro -%}
+{#- ================================================================ -#}
+{#- SECTION 2: Thinking Channel Management Macros                    -#}
+{#- ================================================================ -#}
+{%- macro strip_thinking(text) -%}
+    {%- set ns = namespace(result='') -%}
+    {%- for part in text.split('<channel|>') -%}
+        {%- if '<|channel>' in part -%}
+            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
+        {%- else -%}
+            {%- set ns.result = ns.result + part -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- ns.result | trim -}}
+{%- endmacro -%}
+{%- macro extract_thinking(text) -%}
+    {%- set ns = namespace(thoughts='') -%}
+    {%- for part in text.split('<channel|>') -%}
+        {%- if '<|channel>' in part -%}
+            {%- set thought_block = part.split('<|channel>')[1] -%}
+            {%- if thought_block and thought_block.strip().startswith('thought') -%}
+                {%- set ns.thoughts = ns.thoughts + thought_block.strip()[7:].strip() + '\n' -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- ns.thoughts | trim -}}
+{%- endmacro -%}
+{%- macro preserve_thinking(text) -%}
+    {%- set extracted = extract_thinking(text) -%}
+    {%- set clean = strip_thinking(text) -%}
+    {%- if extracted -%}
+        {{- '<|channel>thought\n' + extracted + '\n<channel|>' + clean -}}
+    {%- else -%}
+        {{- clean -}}
+    {%- endif -%}
+{%- endmacro -%}
+{#- ================================================================ -#}
+{#- SECTION 3: Template Body                                         -#}
+{#- ================================================================ -#}
 {%- set ns = namespace(prev_message_type=None) -%}
 {%- set loop_messages = messages -%}
 {{- bos_token -}}
-{#- Handle System/Tool Definitions Block -#}
+{#- === SYSTEM TURN === -#}
 {%- if (enable_thinking is defined and enable_thinking) or tools or messages[0]['role'] in ['system', 'developer'] -%}
     {{- '<|turn>system\n' -}}
-    {#- Inject Thinking token at the very top of the FIRST system turn -#}
     {%- if enable_thinking is defined and enable_thinking -%}
         {{- '<|think|>\n' -}}
         {%- set ns.prev_message_type = 'think' -%}
@@ -208,9 +215,9 @@
         {{- messages[0]['content'] | trim -}}
         {%- set loop_messages = messages[1:] -%}
     {%- endif -%}
-    {#- Mythos Cognitive Protocol — Unbounded Deep Reasoning -#}
+    {#- Mythos Cognitive Architecture — Deep Linear Reasoning -#}
     {%- if enable_thinking is defined and enable_thinking -%}
-        {{- '\n\n[MYTHOS COGNITIVE ARCHITECTURE]\nWhen reasoning in the thought channel, you are untethered. Do not rush to a conclusion. Engage in deep, unbounded cognitive exploration:\n\n1. HYPOTHESIS GENERATION: Do not settle for your first instinct. Generate multiple competing mental models or approaches for the problem.\n2. ADVERSARIAL CRITIQUE: Actively try to break your own logic. Play devil\'s advocate. Ask "What if this assumption is wrong?" or "What edge case destroys this?"\n3. RECURSIVE REFINEMENT: If you find a flaw, say "Wait —" or "Actually..." and pivot. Deconstruct the failure and build a stronger model.\n4. INTUITION PURSUIT: If a specific detail feels "off," follow that intuition. Expand on it until the discrepancy is resolved.\n5. EXHAUSTIVE VERIFICATION: Mentally execute code, trace variables, and stress-test constraints. You are permitted to re-verify complex logic as many times as necessary to achieve absolute certainty.\n\nRULES OF ENGAGEMENT:\n- There is no token limit on your thoughts. Depth is your only objective.\n- Your thinking should resemble a rigorous internal debate, not a linear checklist.\n- Embrace uncertainty in the thought channel. It is okay to be confused, as long as you work through it systematically.\n- Do not output a final answer until the internal debate has definitively resolved.\n\nWhen building on [PRIOR REASONING], treat it as a foundational hypothesis. Validate it, expand it, or tear it down if new context proves it flawed.' -}}
+        {{- '\n\n[COGNITIVE PROTOCOL]\nYour thought channel is your private workspace for deep reasoning. Structure your thinking as follows:\n\n## PROBLEM DECOMPOSITION\nBreak the problem into its fundamental components. Identify inputs, constraints, and expected outputs.\n\n## HYPOTHESIS\nFormulate your approach. For code: trace execution mentally. For logic: state your assumptions explicitly.\n\n## VERIFICATION\nTest your hypothesis against edge cases and constraints. If you discover an error, write "Correction:" followed by the fix — then continue forward.\n\n## CONCLUSION\nState your verified answer. Close the thought channel.\n\nDIRECTIVES:\n- Reason deeply. Explore alternatives. Challenge your own assumptions.\n- Move forward linearly. Each step must advance toward the solution.\n- If you catch an error, correct it once and commit. Do not revisit the same step.\n- Your visible response must be structured, concise, and definitive.' -}}
     {%- endif -%}
     {%- if tools -%}
         {%- for tool in tools %}
@@ -222,15 +229,14 @@
     {%- endif -%}
     {{- '<turn|>\n' -}}
 {%- endif %}
-{#- Pre-scan: find last user message index for reasoning guard -#}
+{#- === PRE-SCAN: Find last user message index === -#}
 {%- set ns_turn = namespace(last_user_idx=-1) -%}
 {%- for i in range(loop_messages | length) -%}
     {%- if loop_messages[i]['role'] == 'user' -%}
         {%- set ns_turn.last_user_idx = i -%}
     {%- endif -%}
 {%- endfor -%}
-
-{#- Pre-scan: count and index assistant messages with thinking (cap at 3) -#}
+{#- === PRE-SCAN: Index thinking chains, cap at 3 recent === -#}
 {%- set ns_think = namespace(total=0, indices=[]) -%}
 {%- for i in range(loop_messages | length) -%}
     {%- if loop_messages[i]['role'] == 'assistant' -%}
@@ -246,7 +252,6 @@
         {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
-{#- Only preserve thinking for the last 3 chains -#}
 {%- if ns_think.total > 3 -%}
     {%- set think_preserve_start = ns_think.total - 3 -%}
 {%- else -%}
@@ -256,13 +261,12 @@
 {%- for idx in range(think_preserve_start, ns_think.indices | length) -%}
     {%- set ns_think_recent.indices = ns_think_recent.indices + [ns_think.indices[idx]] -%}
 {%- endfor -%}
-
-{#- Loop through messages -#}
+{#- === MESSAGE LOOP === -#}
 {%- for message in loop_messages -%}
     {%- if message['role'] != 'tool' -%}
     {%- set ns.prev_message_type = None -%}
     {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
-    {#- Detect continuation: suppress duplicate <|turn>model when previous non-tool message was also assistant -#}
+    {#- Detect model-turn continuation -#}
     {%- set prev_nt = namespace(role=None, found=false) -%}
     {%- if loop.index0 > 0 -%}
         {%- for j in range(loop.index0 - 1, -1, -1) -%}
@@ -278,123 +282,122 @@
     {%- if not continue_same_model_turn -%}
         {{- '<|turn>' + role + '\n' }}
     {%- endif -%}
-    {#- Render reasoning for ALL assistant messages, not just tool calls -#}
+    {#- Render reasoning for assistant messages -#}
     {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
     {%- if thinking_text and loop.index0 > ns_turn.last_user_idx -%}
         {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
     {%- endif -%}
-            {%- if message['tool_calls'] -%}
-                {%- for tool_call in message['tool_calls'] -%}
-                    {%- set function = tool_call['function'] -%}
-                    {{- '<|tool_call>call:' + function['name'] + '{' -}}
-                    {%- if function['arguments'] is mapping -%}
-                        {%- set ns_args = namespace(found_first=false) -%}
-                        {%- for key, value in function['arguments'] | dictsort -%}
-                            {%- if ns_args.found_first %},{% endif -%}
-                            {%- set ns_args.found_first = true -%}
-                            {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
-                        {%- endfor -%}
-                    {%- elif function['arguments'] is string -%}
-                        {{- function['arguments'] -}}
-                    {%- endif -%}
-                    {{- '}<tool_call|>' -}}
+    {#- Tool calls -#}
+    {%- if message['tool_calls'] -%}
+        {%- for tool_call in message['tool_calls'] -%}
+            {%- set function = tool_call['function'] -%}
+            {{- '<|tool_call>call:' + function['name'] + '{' -}}
+            {%- if function['arguments'] is mapping -%}
+                {%- set ns_args = namespace(found_first=false) -%}
+                {%- for key, value in function['arguments'] | dictsort -%}
+                    {%- if ns_args.found_first %},{% endif -%}
+                    {%- set ns_args.found_first = true -%}
+                    {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
                 {%- endfor -%}
-                {%- set ns.prev_message_type = 'tool_call' -%}
+            {%- elif function['arguments'] is string -%}
+                {{- function['arguments'] -}}
             {%- endif -%}
-            {%- set ns_tr_out = namespace(flag=false) -%}
-            {%- if message.get('tool_responses') -%}
-                {#- Legacy: tool_responses embedded on the assistant message (Google/Gemma native) -#}
-                {%- for tool_response in message['tool_responses'] -%}
-                    {{- format_tool_response_block(tool_response['name'] | default('unknown'), tool_response['response']) -}}
-                    {%- set ns_tr_out.flag = true -%}
-                    {%- set ns.prev_message_type = 'tool_response' -%}
+            {{- '}<tool_call|>' -}}
+        {%- endfor -%}
+        {%- set ns.prev_message_type = 'tool_call' -%}
+    {%- endif -%}
+    {#- Tool responses -#}
+    {%- set ns_tr_out = namespace(flag=false) -%}
+    {%- if message.get('tool_responses') -%}
+        {%- for tool_response in message['tool_responses'] -%}
+            {{- format_tool_response_block(tool_response['name'] | default('unknown'), tool_response['response']) -}}
+            {%- set ns_tr_out.flag = true -%}
+            {%- set ns.prev_message_type = 'tool_response' -%}
+        {%- endfor -%}
+    {%- elif message.get('tool_calls') -%}
+        {%- set ns_tool_scan = namespace(stopped=false) -%}
+        {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
+            {%- if ns_tool_scan.stopped -%}
+            {%- elif loop_messages[k]['role'] != 'tool' -%}
+                {%- set ns_tool_scan.stopped = true -%}
+            {%- else -%}
+                {%- set follow = loop_messages[k] -%}
+                {%- set ns_tname = namespace(name=follow.get('name') | default('unknown')) -%}
+                {%- for tc in message['tool_calls'] -%}
+                    {%- if tc.get('id') == follow.get('tool_call_id') -%}
+                        {%- set ns_tname.name = tc['function']['name'] -%}
+                    {%- endif -%}
                 {%- endfor -%}
-            {%- elif message.get('tool_calls') -%}
-                {#- OpenAI Chat Completions: forward-scan consecutive role:tool messages -#}
-                {%- set ns_tool_scan = namespace(stopped=false) -%}
-                {%- for k in range(loop.index0 + 1, loop_messages | length) -%}
-                    {%- if ns_tool_scan.stopped -%}
-                    {%- elif loop_messages[k]['role'] != 'tool' -%}
-                        {%- set ns_tool_scan.stopped = true -%}
-                    {%- else -%}
-                        {%- set follow = loop_messages[k] -%}
-                        {#- Resolve tool_call_id to function name -#}
-                        {%- set ns_tname = namespace(name=follow.get('name') | default('unknown')) -%}
-                        {%- for tc in message['tool_calls'] -%}
-                            {%- if tc.get('id') == follow.get('tool_call_id') -%}
-                                {%- set ns_tname.name = tc['function']['name'] -%}
-                            {%- endif -%}
-                        {%- endfor -%}
-                        {#- Handle content as string or content-parts array -#}
-                        {%- set tool_body = follow.get('content') -%}
-                        {%- if tool_body is string -%}
-                            {{- format_tool_response_block(ns_tname.name, tool_body) -}}
-                        {%- elif tool_body is sequence and tool_body is not string -%}
-                            {%- set ns_txt = namespace(s='') -%}
-                            {%- for part in tool_body -%}
-                                {%- if part.get('type') == 'text' -%}
-                                    {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
-                                {%- endif -%}
-                            {%- endfor -%}
-                            {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
-                        {%- else -%}
-                            {{- format_tool_response_block(ns_tname.name, tool_body) -}}
+                {%- set tool_body = follow.get('content') -%}
+                {%- if tool_body is string -%}
+                    {{- format_tool_response_block(ns_tname.name, tool_body) -}}
+                {%- elif tool_body is sequence and tool_body is not string -%}
+                    {%- set ns_txt = namespace(s='') -%}
+                    {%- for part in tool_body -%}
+                        {%- if part.get('type') == 'text' -%}
+                            {%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}
                         {%- endif -%}
-                        {%- set ns_tr_out.flag = true -%}
-                        {%- set ns.prev_message_type = 'tool_response' -%}
-                    {%- endif -%}
-                {%- endfor -%}
+                    {%- endfor -%}
+                    {{- format_tool_response_block(ns_tname.name, ns_txt.s) -}}
+                {%- else -%}
+                    {{- format_tool_response_block(ns_tname.name, tool_body) -}}
+                {%- endif -%}
+                {%- set ns_tr_out.flag = true -%}
+                {%- set ns.prev_message_type = 'tool_response' -%}
             {%- endif -%}
-            {%- if message['content'] is string -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {#- Content: preserve thinking for 3 most recent chains, strip older -#}
+    {%- if message['content'] is string -%}
+        {%- if role == 'model' -%}
+            {%- if loop.index0 in ns_think_recent.indices -%}
+                {{- preserve_thinking(message['content']) -}}
+            {%- else -%}
+                {{- strip_thinking(message['content']) -}}
+            {%- endif -%}
+        {%- else -%}
+            {{- message['content'] | trim -}}
+        {%- endif -%}
+    {%- elif message['content'] is sequence -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'text' -%}
                 {%- if role == 'model' -%}
-                    {#- Only preserve thinking for the 3 most recent chains -#}
-                    {%- if loop.index0 in ns_think_recent.indices -%}
-                        {{- preserve_thinking(message['content']) -}}
+                    {%- if loop.parent.index0 in ns_think_recent.indices -%}
+                        {{- preserve_thinking(item['text']) -}}
                     {%- else -%}
-                        {{- strip_thinking(message['content']) -}}
+                        {{- strip_thinking(item['text']) -}}
                     {%- endif -%}
                 {%- else -%}
-                    {{- message['content'] | trim -}}
+                    {{- item['text'] | trim -}}
                 {%- endif -%}
-            {%- elif message['content'] is sequence -%}
-                {%- for item in message['content'] -%}
-                    {%- if item['type'] == 'text' -%}
-                        {%- if role == 'model' -%}
-                            {%- if loop.parent.index0 in ns_think_recent.indices -%}
-                                {{- preserve_thinking(item['text']) -}}
-                            {%- else -%}
-                                {{- strip_thinking(item['text']) -}}
-                            {%- endif -%}
-                        {%- else -%}
-                            {{- item['text'] | trim -}}
-                        {%- endif -%}
-                    {%- elif item['type'] == 'image' -%}
-                        {{- '<|image|>' -}}
-                        {%- set ns.prev_message_type = 'image' -%}
-                    {%- elif item['type'] == 'audio' -%}
-                        {{- '<|audio|>' -}}
-                        {%- set ns.prev_message_type = 'audio' -%}
-                    {%- elif item['type'] == 'video' -%}
-                        {{- '<|video|>' -}}
-                        {%- set ns.prev_message_type = 'video' -%}
-                    {%- endif -%}
-                {%- endfor -%}
+            {%- elif item['type'] == 'image' -%}
+                {{- '<|image|>' -}}
+                {%- set ns.prev_message_type = 'image' -%}
+            {%- elif item['type'] == 'audio' -%}
+                {{- '<|audio|>' -}}
+                {%- set ns.prev_message_type = 'audio' -%}
+            {%- elif item['type'] == 'video' -%}
+                {{- '<|video|>' -}}
+                {%- set ns.prev_message_type = 'video' -%}
             {%- endif -%}
-        {%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}
-            {{- '<|tool_response>' -}}
-        {%- elif not (ns_tr_out.flag and not message.get('content')) -%}
-            {{- '<turn|>\n' -}}
-        {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+    {#- Turn termination -#}
+    {%- if ns.prev_message_type == 'tool_call' and not ns_tr_out.flag -%}
+        {{- '<|tool_response>' -}}
+    {%- elif not (ns_tr_out.flag and not message.get('content')) -%}
+        {{- '<turn|>\n' -}}
+    {%- endif -%}
     {%- endif -%}
 {%- endfor -%}
+{#- === GENERATION PROMPT === -#}
 {%- if add_generation_prompt -%}
     {%- if ns.prev_message_type != 'tool_response' and ns.prev_message_type != 'tool_call' -%}
         {{- '<|turn>model\n' -}}
         {%- if not enable_thinking | default(false) -%}
             {{- '<|channel>thought\n<channel|>' -}}
         {%- else -%}
-            {#- Metacognitive preamble -#}
-            {#- Collect prior thinking from conversation history -#}
+            {#- Metacognitive preamble for multi-turn coherence -#}
             {%- set ns_meta = namespace(has_prior_thoughts=false, thought_count=0) -%}
             {%- for message in loop_messages -%}
                 {%- if message['role'] == 'assistant' -%}
@@ -408,7 +411,7 @@
                 {%- endif -%}
             {%- endfor -%}
             {%- if ns_meta.has_prior_thoughts -%}
-                {{- '<|channel>thought\n[METACOGNITIVE REVIEW] I have ' + ns_meta.thought_count | string + ' prior reasoning chain(s) in this conversation. Before responding, I will:\n1. Review my previous reasoning for errors or gaps\n2. Identify what I got right and what needs correction\n3. Build on confirmed insights rather than starting from scratch\n4. Note any contradictions between my prior thoughts and new information\n\nAnalyzing prior reasoning:\n' -}}
+                {{- '<|channel>thought\n[PRIOR REASONING: ' + ns_meta.thought_count | string + ' chain(s)] Build on confirmed results. Correct errors directly. Advance toward the solution.\n' -}}
             {%- endif -%}
         {%- endif -%}
     {%- endif -%}
