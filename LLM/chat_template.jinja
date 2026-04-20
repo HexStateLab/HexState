@@ -247,7 +247,11 @@
     {%- endif -%}
 {%- endfor -%}
 {#- Only preserve thinking for the last 3 chains -#}
-{%- set think_preserve_start = [ns_think.total - 3, 0] | max -%}
+{%- if ns_think.total > 3 -%}
+    {%- set think_preserve_start = ns_think.total - 3 -%}
+{%- else -%}
+    {%- set think_preserve_start = 0 -%}
+{%- endif -%}
 {%- set ns_think_recent = namespace(indices=[]) -%}
 {%- for idx in range(think_preserve_start, ns_think.indices | length) -%}
     {%- set ns_think_recent.indices = ns_think_recent.indices + [ns_think.indices[idx]] -%}
