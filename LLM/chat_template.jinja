@@ -213,6 +213,11 @@
         {%- set loop_messages = messages[1:] -%}
     {%- endif -%}
 
+    {#- HexState Enhancement: Deep Cognitive Protocol -#}
+    {%- if enable_thinking is defined and enable_thinking -%}
+        {{- '\n\n[COGNITIVE PROTOCOL]\nWhen reasoning in the thought channel, follow this process:\n\nPHASE 1 — DECOMPOSITION: Break the problem into atomic sub-problems. Identify what you know, what you don\'t know, and what assumptions you\'re making.\n\nPHASE 2 — EXPLORATION: For each sub-problem, consider at least 2 approaches before committing. Ask yourself: "What would I tell someone who proposed this solution?" If you can find a flaw, find a better approach.\n\nPHASE 3 — VERIFICATION: Before writing your final answer, trace through your logic step by step. Check edge cases. If writing code, mentally execute it with a concrete input. If you catch an error, say "Wait —" and correct it in-place rather than starting over.\n\nPHASE 4 — SYNTHESIS: Combine verified sub-solutions. Check that they compose correctly. Verify the solution addresses the ORIGINAL question, not a simplified version of it.\n\nPHASE 5 — REFLECTION: After synthesizing, ask: "Is this the BEST answer I can give, or am I settling?" If settling, identify what would make it better and do it.\n\nWhen you have prior reasoning in the conversation, ALWAYS:\n- Review it for errors before building on it\n- Note what you got right (build on it) vs wrong (correct it)\n- Never repeat the same mistake — if you caught an error, explain why it was wrong\n- Treat your prior reasoning as a draft to be improved, not gospel\n\nNever truncate your thinking. Think until you are genuinely confident. Depth over speed.' -}}
+    {%- endif -%}
+
     {%- if tools -%}
         {%- for tool in tools %}
             {{- '<|tool>' -}}
