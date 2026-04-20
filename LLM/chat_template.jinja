@@ -1,5 +1,5 @@
 {#-
-    HexState Mythos Template v1.0
+    Mythos Template v1.1
     Gemma 4 26B-A4B — Full Cognitive Architecture
     Built from official spec: ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
 
@@ -262,13 +262,13 @@
 {%- set chains = namespace(count=0, at=[]) -%}
 {%- for i in range(msgs | length) -%}
     {%- if msgs[i]['role'] == 'assistant' -%}
-        {%- set found = false -%}
+        {%- set hit = namespace(yes=false) -%}
         {%- if msgs[i].get('reasoning') or msgs[i].get('reasoning_content') -%}
-            {%- set found = true -%}
-        {%- elif msgs[i]['content'] is string and '<|channel>' in msgs[i]['content'] -%}
-            {%- set found = true -%}
+            {%- set hit.yes = true -%}
+        {%- elif msgs[i].get('content') is string and '<|channel>' in msgs[i]['content'] -%}
+            {%- set hit.yes = true -%}
         {%- endif -%}
-        {%- if found -%}
+        {%- if hit.yes -%}
             {%- set chains.count = chains.count + 1 -%}
             {%- set chains.at = chains.at + [i] -%}
         {%- endif -%}
@@ -311,7 +311,7 @@
     {%- endif -%}
 
     {#- Tool calls -#}
-    {%- if msg['tool_calls'] -%}
+    {%- if msg.get('tool_calls') -%}
         {%- for tc in msg['tool_calls'] -%}
             {%- set fn = tc['function'] -%}
             {{- '<|tool_call>call:' + fn['name'] + '{' -}}
@@ -375,7 +375,7 @@
     {%- endif -%}
 
     {#- Message content — preserve thinking for 3 most recent chains -#}
-    {%- if msg['content'] is string -%}
+    {%- if msg.get('content') is string -%}
         {%- if role == 'model' -%}
             {%- if loop.index0 in recent.at -%}
                 {{- thought_preserve(msg['content']) -}}
@@ -385,7 +385,7 @@
         {%- else -%}
             {{- msg['content'] | trim -}}
         {%- endif -%}
-    {%- elif msg['content'] is sequence -%}
+    {%- elif msg.get('content') is sequence -%}
         {%- for item in msg['content'] -%}
             {%- if item['type'] == 'text' -%}
                 {%- if role == 'model' -%}
