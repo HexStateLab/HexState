@@ -1,5 +1,5 @@
 {#-
-    Mythos Template v1.1
+    Mythos Template v1.2
     Gemma 4 26B-A4B — Full Cognitive Architecture
     Built from official spec: ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
 
@@ -210,7 +210,7 @@
     ════════════════════════════════════════════════════════════════════ -#}
 
 {%- macro cognitive_protocol() -%}
-{{- '\n\n[COGNITIVE PROTOCOL]\nYour thought channel is your private workspace for deep reasoning. Structure your thinking:\n\n## DECOMPOSE\nIdentify all components of the problem — inputs, constraints, expected outputs, edge cases.\n\n## HYPOTHESIZE\nFormulate your approach. For code: mentally trace execution paths. For logic: state assumptions explicitly. Consider multiple approaches before committing.\n\n## VERIFY\nTest your hypothesis rigorously. Trace through concrete examples. Stress-test edge cases. If you find an error, write "Correction:" and fix it immediately — then continue forward.\n\n## CONCLUDE\nState your verified answer with certainty. Close the thought channel.\n\nDIRECTIVES:\n- Reason with depth and rigor. Challenge your own assumptions.\n- Each reasoning step must advance toward the solution. Do not revisit completed steps.\n- If you discover an error, correct it once and commit to the fix.\n- Your visible response must be structured, precise, and definitive.' -}}
+{{- '\n\n[COGNITIVE PROTOCOL]\nYour thought channel is your private workspace for deep reasoning. Structure your thinking:\n\n## DECOMPOSE\nIdentify all components of the problem — inputs, constraints, expected outputs, edge cases. For code: list every class, function, and variable before tracing.\n\n## HYPOTHESIZE\nFormulate your approach. State assumptions explicitly.\nFor code problems, TRACE each line against actual values:\n- Evaluate every conditional/guard clause with concrete values. Do not assume a branch is taken — prove it.\n- Track which object owns each method call. The caller determines dispatch, not the argument.\n- Track mutable state mutations across ALL calls, not just the current scope.\n\n## VERIFY\nFor each claim you made in HYPOTHESIZE, ask: "What specific line of code produces this result?"\n- Re-read guard clauses: check the exact truthiness of each condition.\n- Re-check dispatch: which class/metaclass/descriptor is actually invoked?\n- Re-check scope: is this variable shared, inherited, or local?\nIf you find an error, write "Correction:" and fix it immediately — then continue forward.\n\n## CONCLUDE\nState your verified answer with certainty. Close the thought channel.\n\nDIRECTIVES:\n- Reason with depth and rigor. Challenge your own assumptions.\n- Each reasoning step must advance toward the solution. Do not revisit completed steps.\n- If you discover an error, correct it once and commit to the fix.\n- Your visible response must be structured, precise, and definitive.' -}}
 {%- endmacro -%}
 
 {#- ════════════════════════════════════════════════════════════════════
