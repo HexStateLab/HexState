@@ -1,25 +1,24 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# Makefile.quantize — HexState GGUF Quantizer Build
+# makefile.quantize — HexState HPC Quantizer Engine (Shared Library)
 #
-# Build:  make -f Makefile.quantize
-# Clean:  make -f Makefile.quantize clean
+# Build:  make -f makefile.quantize
+# Clean:  make -f makefile.quantize clean
 # ═══════════════════════════════════════════════════════════════════════════
 
 CC       = gcc
-CFLAGS   = -O2 -std=gnu99 -Wall -Wno-unused-function -Wno-unused-variable
+CFLAGS   = -O2 -std=gnu99 -shared -fPIC -Wall -Wno-unused-function -Wno-unused-variable
 LDFLAGS  = -lm -lgmp -lmpfr
 
 # Include parent directory for HExState headers
 INCLUDES = -I..
 
-# Source files — quantizer + HExState engine dependencies
+# Source files — quantizer + HExState engine dependencies (no bigint)
 SRCS     = hexstate_quantize.c \
            ../quhit_triality.c \
            ../quhit_hexagram.c \
-           ../s6_exotic.c \
-           ../bigint.c
+           ../s6_exotic.c
 
-TARGET   = hexstate_quantize
+TARGET   = libhexstate_q2k.so
 
 .PHONY: all clean
 
@@ -29,17 +28,14 @@ $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET) $(SRCS) $(LDFLAGS)
 	@echo ""
 	@echo "  ╔════════════════════════════════════════════════════════════════╗"
-	@echo "  ║  HexState GGUF Quantizer v2.0 built successfully!            ║"
+	@echo "  ║  HexState HPC Quantizer Engine v2.1 built successfully!      ║"
 	@echo "  ║                                                               ║"
-	@echo "  ║  Usage:                                                       ║"
-	@echo "  ║    ./hexstate_quantize <input> <output.gguf> [options]        ║"
+	@echo "  ║  Output: libhexstate_q2k.so (shared library)                 ║"
 	@echo "  ║                                                               ║"
-	@echo "  ║  Input: .safetensors file or model directory                  ║"
+	@echo "  ║  Beam Search:  24-beam Hensel (Q2_K + Q4_0)                  ║"
+	@echo "  ║  Scale Grid:   16×16 = 256 candidates per block              ║"
 	@echo "  ║                                                               ║"
-	@echo "  ║  Options:                                                     ║"
-	@echo "  ║    --optimizer hpc|mse|hybrid  (default: hybrid)              ║"
-	@echo "  ║    --imatrix <file>            importance matrix              ║"
-	@echo "  ║    --verbose                   per-block diagnostics          ║"
+	@echo "  ║  Usage: loaded by Python quantization pipeline via ctypes     ║"
 	@echo "  ╚════════════════════════════════════════════════════════════════╝"
 	@echo ""
 
