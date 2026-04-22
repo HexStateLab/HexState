@@ -1378,7 +1378,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                 beams[b].acc_error = 0.0;
                 beams[b].selections = (int *)calloc(graph_blocks, sizeof(int));
                 for (int64_t j = 0; j < graph_blocks; j++)
-                    beams[b].selections[j] = 5;
+                    beams[b].selections[j] = 10;  /* Q4_NEIGHBOR_MULTS[10] = 1.00 */
             }
 
             for (int64_t i = 0; i < graph_blocks; i++) {
@@ -1387,9 +1387,14 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
                 double cand_score[Q4_N_CAND];
                 int64_t blk = i * stride;
+                /* Count candidates per quhit bin for normalization */
+                int q4_bin_count[6] = {0};
+                for (int ci = 0; ci < Q4_N_CAND; ci++)
+                    q4_bin_count[Q4_CAND_TO_QUHIT[ci]]++;
                 for (int ci = 0; ci < Q4_N_CAND; ci++) {
                     int qi = Q4_CAND_TO_QUHIT[ci];
                     double p = (m_total > 1e-30) ? marg[i][qi] / m_total : 1.0/6.0;
+                    p /= (double)q4_bin_count[qi];  /* normalize by bin occupancy */
                     cand_score[ci] = p / (cand_errors[blk][ci] + 1e-15);
                 }
 
@@ -1846,15 +1851,21 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
 
                 /* Candidate scores for this block: triality prob × (1/error)
-                 * Map 10-state candidates to 6-state quhit marginals via binning */
+                 * Map 16-state candidates to 6-state quhit marginals via binning.
+                 * Normalize by bin count so uneven bins don't bias scoring. */
                 double cand_score[TOTAL_SCALE_CANDIDATES];
                 int64_t blk = i * stride;
+                int d_bin_count[6] = {0}, m_bin_count[6] = {0};
+                for (int k = 0; k < N_CAND_D; k++) d_bin_count[CAND_TO_QUHIT[k]]++;
+                for (int k = 0; k < N_CAND_M; k++) m_bin_count[CAND_TO_QUHIT[k]]++;
                 for (int di = 0; di < N_CAND_D; di++) {
                     int qi_d = CAND_TO_QUHIT[di];
                     double p_d = (c_total > 1e-30) ? coarse_marg[i][qi_d] / c_total : 1.0/6.0;
+                    p_d /= (double)d_bin_count[qi_d];
                     for (int mi = 0; mi < N_CAND_M; mi++) {
                         int qi_m = CAND_TO_QUHIT[mi];
                         double p_m = (f_total > 1e-30) ? fine_marg[i][qi_m] / f_total : 1.0/6.0;
+                        p_m /= (double)m_bin_count[qi_m];
                         int cidx = di * N_CAND_M + mi;
                         cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
                     }
