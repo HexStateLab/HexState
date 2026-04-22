@@ -565,8 +565,8 @@ static const float SCALE_MULTIPLIERS[SCALE_FACTOR_COUNT] = {
  * Quhit encoding: bin 10 → 6 for D=6 quhits (BP operates on 6-state marginals)
  * Beam search: operates on all 100 candidates directly */
 #define QUHITS_PER_BLOCK  2
-#define N_CAND_D   10    /* d multiplier candidates */
-#define N_CAND_M   10    /* dmin multiplier candidates */
+#define N_CAND_D   16    /* d multiplier candidates (was 10) */
+#define N_CAND_M   16    /* dmin multiplier candidates (was 10) */
 #define TOTAL_SCALE_CANDIDATES (N_CAND_D * N_CAND_M)
 
 static float SCALE_TABLE[TOTAL_SCALE_CANDIDATES];
@@ -1213,13 +1213,16 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
  * Q4_0 block: 32 weights, 16 levels (0–15), dequant: w = (q - 8) * d
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define Q4_N_CAND 10  /* scale candidates for Q4_0 */
-#define Q4_N_BEAMS 12
+#define Q4_N_CAND 16  /* scale candidates for Q4_0 (was 10) */
+#define Q4_N_BEAMS 24 /* beam width (was 12) */
 
 static const float Q4_NEIGHBOR_MULTS[Q4_N_CAND] = {
-    0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
+    0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
+    0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
 };
-static const int Q4_CAND_TO_QUHIT[Q4_N_CAND] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5 };
+static const int Q4_CAND_TO_QUHIT[Q4_N_CAND] = {
+    0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
+};
 
 static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                                        BlockQ4_0 *output, float *out_total_error,
@@ -1537,18 +1540,22 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      *          and measure actual reconstruction MSE for each
      * ══════════════════════════════════════════════════════════════════ */
 
-    /* For each block, generate a 10×10 grid of (d, dmin) FP16 neighbors.
+    /* For each block, generate a 16×16 grid of (d, dmin) FP16 neighbors.
      * Narrower range than wide-sweep: 0.82–1.15 with fine spacing.
      * Wider ranges push Q2_K into degenerate clipping territory.
-     * Total: 100 (d, dmin) pairs per block */
+     * Total: 256 (d, dmin) pairs per block (was 100) */
     static const float NEIGHBOR_MULTS_D[N_CAND_D] = {
-        0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
+        0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
+        0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
     };
     static const float NEIGHBOR_MULTS_M[N_CAND_M] = {
-        0.82f, 0.855f, 0.89f, 0.925f, 0.96f, 1.00f, 1.035f, 1.07f, 1.105f, 1.15f
+        0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
+        0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
     };
-    /* Map 10 candidates → 6 quhit states for BP encoding */
-    static const int CAND_TO_QUHIT[10] = { 0, 0, 1, 1, 2, 3, 3, 4, 4, 5 };
+    /* Map 16 candidates → 6 quhit states for BP encoding */
+    static const int CAND_TO_QUHIT[16] = {
+        0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
+    };
 
     /* candidate_errors[blk][36] — MSE per candidate */
     float (*candidate_errors)[TOTAL_SCALE_CANDIDATES] = NULL;
@@ -1813,7 +1820,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
              * score by: accumulated_error + block_error × (1/triality_prob),
              * keep top K. The constraint: blocks are selected JOINTLY. */
 
-            #define N_BEAMS 12  /* K beams — balanced search width */
+            #define N_BEAMS 24  /* K beams — widened for 31B (was 12) */
 
             typedef struct {
                 double acc_error;
