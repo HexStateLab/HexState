@@ -1278,7 +1278,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
     /* ── Phase 3: HPC graph — single quhit per block ── */
     int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
     for (int64_t i = 0; i < n_blocks; i++)
-        best_candidate[i] = 5;  /* Q4_NEIGHBOR_MULTS[5] = 1.00 */
+        best_candidate[i] = 10;  /* Q4_NEIGHBOR_MULTS[10] = 1.00 */
 
     if (n_blocks >= 2) {
         float temperature = 0.5f;
@@ -1660,7 +1660,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     /* Default: use greedy candidate (index 5*10+5 = 55, mult 1.00×1.00) */
     int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
     for (int64_t i = 0; i < n_blocks; i++)
-        best_candidate[i] = 5 * N_CAND_M + 5;  /* NEIGHBOR_MULTS_D[5]=1.00, _M[5]=1.00 */
+        best_candidate[i] = 10 * N_CAND_M + 10;  /* NEIGHBOR_MULTS_D[10]=1.00, _M[10]=1.00 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
         float temperature = 0.5f;
@@ -1834,7 +1834,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 beams[b].acc_error = 0.0;
                 beams[b].selections = (int *)calloc(graph_blocks, sizeof(int));
                 for (int64_t j = 0; j < graph_blocks; j++)
-                    beams[b].selections[j] = 5 * N_CAND_M + 5;  /* default = greedy (1.00×1.00) */
+                    beams[b].selections[j] = 10 * N_CAND_M + 10;  /* default = greedy (1.00×1.00) */
             }
 
             /* Process blocks sequentially with beam search */
