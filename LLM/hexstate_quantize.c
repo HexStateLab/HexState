@@ -1447,25 +1447,169 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             }
             for (int b = 0; b < active_beams; b++) free(beams[b].selections);
 
+            /* ══════════════════════════════════════════════════════════════
+             * Phase 3.5: Born-Rule Multi-Shot Scale Refinement
+             *
+             * The beam search found the MAP candidate sequence. But the
+             * triality marginals encode quantum phase-coherent structure
+             * that a greedy beam can miss.
+             *
+             * Like tesseract_factor's MCMC period recovery (lines 1920-1964):
+             *   1. Take N independent Born samples from triality marginals
+             *   2. Each sample → full candidate assignment across all blocks
+             *   3. Evaluate actual RMSE for each assignment
+             *   4. Keep assignment with lowest total RMSE
+             *
+             * Reuses the EXISTING converged Möbius sheet — zero new BP.
+             * ══════════════════════════════════════════════════════════════ */
+            {
+                #define Q4_BORN_SHOTS 64
+
+                /* Compute beam-search baseline RMSE for comparison */
+                float beam_total_err = 0.0f;
+                for (int64_t bi = 0; bi < n_blocks; bi++)
+                    beam_total_err += cand_errors[bi][best_candidate[bi]];
+
+                /* Build per-block CDFs from triality marginals */
+                unsigned int born_rng = 314159;
+                int *shot_assignment = (int *)malloc(n_blocks * sizeof(int));
+
+                for (int shot = 0; shot < Q4_BORN_SHOTS; shot++) {
+                    float shot_err = 0.0f;
+                    /* Init from beam result so tail blocks beyond
+                     * graph_blocks*stride keep valid indices */
+                    memcpy(shot_assignment, best_candidate,
+                           n_blocks * sizeof(int));
+
+                    for (int64_t gi = 0; gi < graph_blocks; gi++) {
+                        /* Normalize marginals to CDF */
+                        double m_total = 0.0;
+                        for (int v = 0; v < 6; v++) m_total += marg[gi][v];
+
+                        /* Born sample: CDF inversion (same as born_sample) */
+                        born_rng = born_rng * 1664525u + 1013904223u;
+                        double rnd = (double)(born_rng >> 8) / 16777216.0;
+                        double target = rnd * m_total;
+                        double cum = 0.0;
+                        int sampled_qi = 5;
+                        for (int v = 0; v < 6; v++) {
+                            cum += marg[gi][v];
+                            if (cum > target) { sampled_qi = v; break; }
+                        }
+
+                        /* Find the best candidate WITHIN this quhit bin */
+                        int64_t blk = gi * stride;
+                        float best_bin_err = 1e30f;
+                        int best_bin_cand = 10; /* default */
+                        for (int ci = 0; ci < Q4_N_CAND; ci++) {
+                            if (Q4_CAND_TO_QUHIT[ci] == sampled_qi) {
+                                if (cand_errors[blk][ci] < best_bin_err) {
+                                    best_bin_err = cand_errors[blk][ci];
+                                    best_bin_cand = ci;
+                                }
+                            }
+                        }
+
+                        /* Apply to all blocks in this stride group */
+                        for (int64_t b = gi * stride;
+                             b < (gi + 1) * stride && b < n_blocks; b++) {
+                            shot_assignment[b] = best_bin_cand;
+                            shot_err += cand_errors[b][best_bin_cand];
+                        }
+                    }
+                    /* Add error for tail blocks not covered by graph */
+                    for (int64_t b = graph_blocks * stride; b < n_blocks; b++)
+                        shot_err += cand_errors[b][shot_assignment[b]];
+
+                    /* Metropolis acceptance: adopt if better than current best */
+                    if (shot_err < beam_total_err) {
+                        for (int64_t b = 0; b < n_blocks; b++)
+                            best_candidate[b] = shot_assignment[b];
+                        beam_total_err = shot_err;
+                    }
+                }
+
+                free(shot_assignment);
+            }
+
             free(marg);
             mobius_destroy(mobius);
             hpc_destroy(graph);
         }
     }
 
-    /* ── Phase 4: Write blocks using selected candidates ── */
+    /* ══════════════════════════════════════════════════════════════════
+     * PHASE 4: Assemble blocks via least-squares scale extraction
+     *
+     * The factorer assembles a frequency register from BP marginals,
+     * then EXTRACTS the exact period via continued fractions.
+     *
+     * We do the same: the beam search / Born shots selected a grid
+     * candidate (the "assembled frequency"). Now we EXTRACT the exact
+     * optimal FP16 scale via weighted least-squares (the "CF step").
+     *
+     * For Q4_0:  d_optimal = Σ(w_j × x_j × q̃_j) / Σ(w_j × q̃_j²)
+     * where q̃_j = (q_j - 8) and q_j is quantized at the grid scale.
+     *
+     * This iterates: quantize at d_init → compute d_optimal → re-quantize
+     * → re-compute until convergence. 3 iterations suffice since Q4_0
+     * has only 16 levels — the assignment stabilizes immediately.
+     *
+     * The grid gave us 16 possible scales. This gives us 65,536 (all FP16).
+     * ══════════════════════════════════════════════════════════════════ */
+
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *bw = weights + blk * QK4_0;
         int cidx = best_candidate[blk];
-        output[blk].d = cand_d16[blk][cidx];
-        float actual_d = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
+
+        /* Start from the grid-selected scale (the "assembled frequency") */
+        float d_current = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
+
+        /* Iterative least-squares extraction (the "continued fraction")
+         * Converges in 2-3 iterations since Q4_0 has only 16 quantization levels */
+        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
+            if (d_current < 1e-15f) break;
+            float id = 1.0f / d_current;
+
+            /* Quantize at current scale */
+            int qs_tmp[QK4_0];
+            for (int j = 0; j < QK4_0; j++) {
+                int q = (int)(bw[j] * id + 8.5f);
+                if (q < 0) q = 0; if (q > 15) q = 15;
+                qs_tmp[j] = q;
+            }
+
+            /* Weighted least-squares: d = Σ(w × x × q̃) / Σ(w × q̃²)
+             * where q̃ = q - 8 (centered quantized value) */
+            float num = 0.0f, den = 0.0f;
+            for (int j = 0; j < QK4_0; j++) {
+                float q_centered = (float)qs_tmp[j] - 8.0f;
+                float w = (imat_importance) ?
+                          imat_importance[blk * QK4_0 + j] : 1.0f;
+                num += w * bw[j] * q_centered;
+                den += w * q_centered * q_centered;
+            }
+
+            if (den > 1e-15f) {
+                float d_new = num / den;
+                /* Clamp magnitude to prevent runaway (Q4_0 d can be negative) */
+                float d_seed = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
+                if (fabsf(d_new) < 4.0f * (fabsf(d_seed) + 1e-10f)) {
+                    uint16_t d16 = gguf_fp32_to_fp16(d_new);
+                    d_current = gguf_fp16_to_fp32(d16);
+                }
+            }
+        }
+
+        /* Store the extracted optimal FP16 scale */
+        output[blk].d = gguf_fp32_to_fp16(d_current);
+        float actual_d = d_current;
         float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
 
-        /* Nibble packing: llama.cpp convention — first half in low nibble,
-         * second half in high nibble: qs[j] = quant(bw[j]) | (quant(bw[j+16]) << 4) */
+        /* Pack nibbles and compute error */
         for (int j = 0; j < QK4_0 / 2; j++) {
-            float x0 = bw[j];           /* first half:  elements 0..15  */
-            float x1 = bw[j + QK4_0/2]; /* second half: elements 16..31 */
+            float x0 = bw[j];
+            float x1 = bw[j + QK4_0/2];
             int q0 = (int)(x0 * id + 8.5f);
             int q1 = (int)(x1 * id + 8.5f);
             if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
@@ -1938,6 +2082,94 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             for (int b = 0; b < active_beams; b++)
                 free(beams[b].selections);
 
+            /* ══════════════════════════════════════════════════════════════
+             * Phase 3.5: Born-Rule Multi-Shot Scale Refinement (Q2_K)
+             *
+             * 2D Born sampling: sample coarse quhit (d dimension) and
+             * fine quhit (dmin dimension) jointly from triality marginals.
+             * Each shot produces a (d_idx, dmin_idx) pair per block.
+             * ══════════════════════════════════════════════════════════════ */
+            {
+                #define Q2K_BORN_SHOTS 64
+
+                float beam_total_err = 0.0f;
+                for (int64_t bi = 0; bi < n_blocks; bi++)
+                    beam_total_err += candidate_errors[bi][best_candidate[bi]];
+
+                unsigned int born_rng_q2 = 271828;
+                int *shot_assignment = (int *)malloc(n_blocks * sizeof(int));
+
+                for (int shot = 0; shot < Q2K_BORN_SHOTS; shot++) {
+                    float shot_err = 0.0f;
+                    /* Init from beam result so tail blocks beyond
+                     * graph_blocks*stride keep valid indices */
+                    memcpy(shot_assignment, best_candidate,
+                           n_blocks * sizeof(int));
+
+                    for (int64_t gi = 0; gi < graph_blocks; gi++) {
+                        /* Born sample coarse (d) quhit */
+                        double c_total = 0.0;
+                        for (int v = 0; v < 6; v++) c_total += coarse_marg[gi][v];
+                        born_rng_q2 = born_rng_q2 * 1664525u + 1013904223u;
+                        double rnd_c = (double)(born_rng_q2 >> 8) / 16777216.0;
+                        double target_c = rnd_c * c_total;
+                        double cum_c = 0.0;
+                        int qi_d = 5;
+                        for (int v = 0; v < 6; v++) {
+                            cum_c += coarse_marg[gi][v];
+                            if (cum_c > target_c) { qi_d = v; break; }
+                        }
+
+                        /* Born sample fine (dmin) quhit */
+                        double f_total = 0.0;
+                        for (int v = 0; v < 6; v++) f_total += fine_marg[gi][v];
+                        born_rng_q2 = born_rng_q2 * 1664525u + 1013904223u;
+                        double rnd_f = (double)(born_rng_q2 >> 8) / 16777216.0;
+                        double target_f = rnd_f * f_total;
+                        double cum_f = 0.0;
+                        int qi_m = 5;
+                        for (int v = 0; v < 6; v++) {
+                            cum_f += fine_marg[gi][v];
+                            if (cum_f > target_f) { qi_m = v; break; }
+                        }
+
+                        /* Find best candidate within the sampled (d_bin, m_bin) */
+                        int64_t blk = gi * stride;
+                        float best_bin_err = 1e30f;
+                        int best_bin_cand = 10 * N_CAND_M + 10;
+                        for (int di = 0; di < N_CAND_D; di++) {
+                            if (CAND_TO_QUHIT[di] != qi_d) continue;
+                            for (int mi = 0; mi < N_CAND_M; mi++) {
+                                if (CAND_TO_QUHIT[mi] != qi_m) continue;
+                                int cidx = di * N_CAND_M + mi;
+                                if (candidate_errors[blk][cidx] < best_bin_err) {
+                                    best_bin_err = candidate_errors[blk][cidx];
+                                    best_bin_cand = cidx;
+                                }
+                            }
+                        }
+
+                        for (int64_t b = gi * stride;
+                             b < (gi + 1) * stride && b < n_blocks; b++) {
+                            shot_assignment[b] = best_bin_cand;
+                            shot_err += candidate_errors[b][best_bin_cand];
+                        }
+                    }
+
+                    /* Add error for tail blocks not covered by graph */
+                    for (int64_t b = graph_blocks * stride; b < n_blocks; b++)
+                        shot_err += candidate_errors[b][shot_assignment[b]];
+
+                    if (shot_err < beam_total_err) {
+                        for (int64_t b = 0; b < n_blocks; b++)
+                            best_candidate[b] = shot_assignment[b];
+                        beam_total_err = shot_err;
+                    }
+                }
+
+                free(shot_assignment);
+            }
+
             free(coarse_marg);
             free(fine_marg);
             mobius_destroy(mobius);
@@ -1959,23 +2191,110 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     }
 
     /* ══════════════════════════════════════════════════════════════════
-     * PHASE 4: Write final blocks using HPC-selected (d, dmin)
+     * PHASE 4: Assemble blocks via least-squares (d, dmin) extraction
+     *
+     * Like Q4_0's CF analog: the beam search / Born shots selected a
+     * grid candidate (d_grid, dmin_grid). Now we EXTRACT the exact
+     * optimal FP16 (d, dmin) via weighted least-squares, holding the
+     * sub-block Ls/Lm and quantized levels fixed.
+     *
+     * Q2_K model: x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
+     *
+     * This is a 2-variable linear system:
+     *   [Σ(w×a²)   -Σ(w×a×b) ] [d   ]   [Σ(w×x×a) ]
+     *   [-Σ(w×a×b)  Σ(w×b²)  ] [dmin] = [Σ(w×x×b) ]  (negated for min)
+     *
+     * where a = Ls[j]×q[j,k], b = Lm[j].
+     *
+     * Iterates 3× for q-value stability (Q2_K has only 4 levels).
      * ══════════════════════════════════════════════════════════════════ */
 
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
         int cidx = best_candidate[blk];
-        uint8_t L[QK_K];
+        uint8_t Ls_blk[16], Lm_blk[16];
 
-        output[blk].d    = candidate_d[blk][cidx];
-        output[blk].dmin = candidate_dmin[blk][cidx];
-        float dm = gguf_fp16_to_fp32(output[blk].d);
-        float mm = gguf_fp16_to_fp32(output[blk].dmin);
+        /* Start from grid-selected Ls/Lm (the "assembled frequency") */
+        memcpy(Ls_blk, candidate_Ls[blk][cidx], 16);
+        memcpy(Lm_blk, candidate_Lm[blk][cidx], 16);
+
+        float dm = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
+        float mm = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
+
+        /* Iterative least-squares extraction (the "continued fraction")
+         * Converges in 2-3 iterations since Q2_K has only 4 levels */
+        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
+            /* Quantize all elements at current (dm, mm) */
+            uint8_t L[QK_K];
+            for (int j = 0; j < N_SUB; j++) {
+                float d_sub = dm * (float)Ls_blk[j];
+                float m_sub = mm * (float)Lm_blk[j];
+                if (d_sub < 1e-15f) {
+                    for (int k = 0; k < 16; k++) L[16*j+k] = 0;
+                    continue;
+                }
+                for (int k = 0; k < 16; k++) {
+                    int q = gguf_nearest_int((block_x[16*j+k] + m_sub) / d_sub);
+                    if (q < 0) q = 0; if (q > 3) q = 3;
+                    L[16*j+k] = (uint8_t)q;
+                }
+            }
+
+            /* 2×2 weighted least-squares:
+             * x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
+             * Let a = Ls[j]×q[j,k], b = Lm[j]
+             * Minimize Σ w×(x - d×a + dmin×b)²
+             * Normal equations:
+             *   d × Σ(w×a²) - dmin × Σ(w×a×b) = Σ(w×x×a)
+             *  -d × Σ(w×a×b) + dmin × Σ(w×b²) = -Σ(w×x×b)  */
+            double Saa = 0, Sab = 0, Sbb = 0, Sxa = 0, Sxb = 0;
+            for (int j = 0; j < N_SUB; j++) {
+                float ls_f = (float)Ls_blk[j];
+                float lm_f = (float)Lm_blk[j];
+                for (int k = 0; k < 16; k++) {
+                    float x = block_x[16*j+k];
+                    float w = (imat_importance) ?
+                              imat_importance[blk * QK_K + 16*j+k] : 1.0f;
+                    float a = ls_f * (float)L[16*j+k];
+                    float b = lm_f;
+                    Saa += w * a * a;
+                    Sab += w * a * b;
+                    Sbb += w * b * b;
+                    Sxa += w * x * a;
+                    Sxb += w * x * b;
+                }
+            }
+
+            /* Solve 2×2 system via Cramer's rule
+             * System: [Saa, -Sab; -Sab, Sbb] × [d; dmin] = [Sxa; -Sxb]
+             * d    = (Sbb×Sxa - Sab×Sxb) / det
+             * dmin = (Sab×Sxa - Saa×Sxb) / det */
+            double det = Saa * Sbb - Sab * Sab;
+            if (fabs(det) > 1e-30) {
+                double d_new  = (Sbb * Sxa - Sab * Sxb) / det;
+                double dm_new = (Sab * Sxa - Saa * Sxb) / det;
+                /* Clamp to reasonable range: must be positive and not wildly
+                 * larger than the grid-selected seed (prevent runaway LS) */
+                float d_seed = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
+                float m_seed = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
+                if (d_new > 0.0 && d_new < 4.0 * (d_seed + 1e-10))
+                    dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)d_new));
+                if (dm_new > 0.0 && dm_new < 4.0 * (m_seed + 1e-10))
+                    mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)dm_new));
+            }
+        }
+
+        /* Store the extracted optimal FP16 (d, dmin) */
+        output[blk].d    = gguf_fp32_to_fp16(dm);
+        output[blk].dmin = gguf_fp32_to_fp16(mm);
+        dm = gguf_fp16_to_fp32(output[blk].d);
+        mm = gguf_fp16_to_fp32(output[blk].dmin);
 
         for (int j = 0; j < N_SUB; j++)
-            output[blk].scales[j] = candidate_Ls[blk][cidx][j]
-                                   | (candidate_Lm[blk][cidx][j] << 4);
+            output[blk].scales[j] = Ls_blk[j] | (Lm_blk[j] << 4);
 
+        /* Final quantization and nibble packing with extracted scales */
+        uint8_t L[QK_K];
         for (int j = 0; j < N_SUB; j++) {
             float d = dm * (float)(output[blk].scales[j] & 0xF);
             if (d < 1e-15f) {
