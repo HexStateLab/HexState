@@ -542,7 +542,7 @@ def is_attention_tensor(name):
     return False
 
 
-def should_quantize(name, n_dims, dims):
+def should_quantize(name, n_dims, dims, tied_embeddings=False):
     """Should this tensor be quantized to Q2_K?
 
     With iMatrix importance weighting, Q2_K is applied to ALL eligible
@@ -554,6 +554,9 @@ def should_quantize(name, n_dims, dims):
       - ffn_gate_inp — MoE routing gate
       - layer_output_scale — per-layer scaling factor (scalar)
       - altup, laurel — small Gemma-specific tensors
+      - token_embd.weight / output.weight when embeddings are tied
+        (the same tensor serves as both embedding lookup AND LM head;
+         quantizing it to Q2_K destroys logit precision → garbage output)
     """
     n_elements = 1
     for d in dims:
@@ -570,6 +573,9 @@ def should_quantize(name, n_dims, dims):
         return False
     if 'layer_output_scale' in name:
         return False
+    # When embeddings are tied, token_embd.weight doubles as the output
+    # projection (LM head). It gets routed to Q4_0 in the quant plan
+    # instead of Q2_K — handled in main(), not here.
     # Skip vision/audio encoder tensors
     if 'v.' in name and name.startswith('v.'):
         return False
@@ -679,6 +685,16 @@ def main():
         print(f"  Data section starts at: {data_section_start:,}")
         print()
 
+        # ── Detect tied embeddings ──
+        # If no separate output.weight tensor exists, token_embd.weight
+        # doubles as the LM head. Must preserve it at full precision.
+        tensor_names = {ti['name'] for ti in tensor_infos}
+        has_output_weight = 'output.weight' in tensor_names
+        tied_embeddings = not has_output_weight and 'token_embd.weight' in tensor_names
+        if tied_embeddings:
+            print("  ⚠ Tied embeddings detected — token_embd.weight promoted to Q4_0 (serves as LM head)")
+            print()
+
         # ── Determine output types ──
         quant_plan = []
         total_quant = 0
@@ -687,9 +703,12 @@ def main():
         for ti in tensor_infos:
             if quantize_none:
                 will_quant = False
-            elif should_quantize(ti['name'], ti['n_dims'], ti['dims']):
+            elif should_quantize(ti['name'], ti['n_dims'], ti['dims'], tied_embeddings):
                 if is_attention_tensor(ti['name']):
                     will_quant = 'ATTN_Q4'  # Promote attention to Q4_0 HPC
+                    total_attn += 1
+                elif tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
+                    will_quant = 'ATTN_Q4'  # Promote tied embedding to Q4_0
                     total_attn += 1
                 else:
                     will_quant = True
