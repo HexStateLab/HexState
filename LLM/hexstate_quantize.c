@@ -1282,7 +1282,9 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
     if (n_blocks >= 2) {
         float temperature = 0.5f;
-        int64_t n_sites = n_blocks;  /* 1 quhit per block */
+        int64_t graph_blocks = (n_blocks > 200) ? 200 : n_blocks;
+        int64_t stride = n_blocks / graph_blocks;
+        int64_t n_sites = graph_blocks;  /* 1 quhit per block */
 
         HPCGraph *graph = hpc_create(n_sites);
         if (graph) {
@@ -1290,8 +1292,8 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                 triality_dft(&graph->locals[i]);
 
             /* Encode candidate errors as Boltzmann amplitudes */
-            for (int64_t i = 0; i < n_blocks; i++) {
-                int64_t blk = i;
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int64_t blk = i * stride;
                 float min_err = 1e30f;
                 for (int c = 0; c < Q4_N_CAND; c++)
                     if (cand_errors[blk][c] < min_err)
@@ -1323,16 +1325,16 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             }
 
             /* Neighbor edges */
-            for (int64_t i = 0; i < n_blocks - 1; i++)
+            for (int64_t i = 0; i < graph_blocks - 1; i++)
                 hpc_cz(graph, i, i + 1);
 
             /* Ensemble BP with triality marginals */
             MobiusAmplitudeSheet *mobius = mobius_create(graph);
-            double (*marg)[6] = (double (*)[6])calloc(n_blocks, sizeof(double[6]));
+            double (*marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
 
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
-                for (int64_t i = 0; i < n_blocks; i++) {
+                for (int64_t i = 0; i < graph_blocks; i++) {
                     /* Triality 3-view marginal */
                     double edge_prob[6], vert_re[6], vert_im[6], vert_prob[6], diag_prob[6];
                     for (int v = 0; v < 6; v++) {
@@ -1381,12 +1383,12 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                 beams[b].history_idx = -1;
             }
 
-            for (int64_t i = 0; i < n_blocks; i++) {
+            for (int64_t i = 0; i < graph_blocks; i++) {
                 double m_total = 0.0;
                 for (int v = 0; v < 6; v++) m_total += marg[i][v];
 
                 double cand_score[Q4_N_CAND];
-                int64_t blk = i;
+                int64_t blk = i * stride;
                 /* Count candidates per quhit bin for normalization */
                 int q4_bin_count[6] = {0};
                 for (int ci = 0; ci < Q4_N_CAND; ci++)
@@ -1442,12 +1444,15 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             }
 
             int curr_hist = beams[0].history_idx;
-            for (int64_t i = n_blocks - 1; i >= 0; i--) {
+            for (int64_t i = graph_blocks - 1; i >= 0; i--) {
                 if (curr_hist >= 0) {
-                    best_candidate[i] = history[curr_hist].cand_idx;
+                    int cidx = history[curr_hist].cand_idx;
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = cidx;
                     curr_hist = history[curr_hist].parent_idx;
                 } else {
-                    best_candidate[i] = 10;
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = 10;
                 }
             }
             free(history);
@@ -1486,7 +1491,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                     memcpy(shot_assignment, best_candidate,
                            n_blocks * sizeof(int));
 
-                    for (int64_t gi = 0; gi < n_blocks; gi++) {
+                    for (int64_t gi = 0; gi < graph_blocks; gi++) {
                         /* Normalize marginals to CDF */
                         double m_total = 0.0;
                         for (int v = 0; v < 6; v++) m_total += marg[gi][v];
@@ -1503,7 +1508,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                         }
 
                         /* Find the best candidate WITHIN this quhit bin */
-                        int64_t blk = gi;
+                        int64_t blk = gi * stride;
                         float best_bin_err = 1e30f;
                         int best_bin_cand = 10; /* default */
                         for (int ci = 0; ci < Q4_N_CAND; ci++) {
@@ -1810,8 +1815,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         best_candidate[i] = 10 * N_CAND_M + 10;  /* NEIGHBOR_MULTS_D[10]=1.00, _M[10]=1.00 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
+        int64_t graph_blocks = (n_blocks > 200) ? 200 : n_blocks;
+        int64_t stride = n_blocks / graph_blocks;
         float temperature = 0.5f;
-        int64_t n_sites = n_blocks * QUHITS_PER_BLOCK;
+        int64_t n_sites = graph_blocks * QUHITS_PER_BLOCK;
 
         HPCGraph *graph = hpc_create(n_sites);
         if (graph) {
@@ -1819,7 +1826,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 triality_dft(&graph->locals[i]);
 
             /* Encode each block's 36 candidate errors as dual-quhit amplitudes */
-            for (int64_t blk = 0; blk < n_blocks; blk++) {
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                int64_t blk = i * stride;
                 float min_err = 1e30f;
                 for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++)
                     if (candidate_errors[blk][c] < min_err)
@@ -1864,7 +1872,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
 
                 /* Write quhits */
-                int64_t s0 = 2 * blk, s1 = 2 * blk + 1;
+                int64_t s0 = 2 * i, s1 = 2 * i + 1;
                 for (int v = 0; v < 6; v++) {
                     graph->locals[s0].edge_re[v] = coarse_re[v];
                     graph->locals[s0].edge_im[v] = 0.0;
@@ -1882,9 +1890,9 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
 
             /* Build edges */
-            for (int64_t i = 0; i < n_blocks; i++) {
+            for (int64_t i = 0; i < graph_blocks; i++) {
                 hpc_cz(graph, 2 * i, 2 * i + 1);  /* intra-block: d ↔ dmin */
-                if (i + 1 < n_blocks) {
+                if (i + 1 < graph_blocks) {
                     hpc_cz(graph, 2 * i, 2 * (i + 1));         /* d ↔ d neighbor */
                     hpc_cz(graph, 2 * i + 1, 2 * (i + 1) + 1); /* dmin ↔ dmin    */
                 }
@@ -1895,15 +1903,15 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
              * edge (computational), vertex (Fourier), diagonal (conj-Fourier).
              * A candidate must score well in all three bases to be selected. */
             MobiusAmplitudeSheet *mobius = mobius_create(graph);
-            double (*coarse_marg)[6] = (double (*)[6])calloc(n_blocks, sizeof(double[6]));
-            double (*fine_marg)[6]   = (double (*)[6])calloc(n_blocks, sizeof(double[6]));
+            double (*coarse_marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+            double (*fine_marg)[6]   = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
 
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
 
                 /* After BP, graph->locals[s] has dressed amplitudes in edge view.
                  * Compute vertex and diagonal views via DFT₆ triality. */
-                for (int64_t i = 0; i < n_blocks; i++) {
+                for (int64_t i = 0; i < graph_blocks; i++) {
                     for (int qbit = 0; qbit < 2; qbit++) {
                         int64_t s = 2 * i + qbit;
                         double (*marg)[6] = (qbit == 0) ? &coarse_marg[i] : &fine_marg[i];
@@ -1985,7 +1993,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
 
             /* Process blocks sequentially with beam search */
-            for (int64_t i = 0; i < n_blocks; i++) {
+            for (int64_t i = 0; i < graph_blocks; i++) {
                 double c_total = 0.0, f_total = 0.0;
                 for (int v = 0; v < 6; v++) {
                     c_total += coarse_marg[i][v];
@@ -1994,7 +2002,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 
                 /* Candidate scores for this block: triality prob × (1/error) */
                 double cand_score[TOTAL_SCALE_CANDIDATES];
-                int64_t blk = i;
+                int64_t blk = i * stride;
                 int d_bin_count[6] = {0}, m_bin_count[6] = {0};
                 for (int k = 0; k < N_CAND_D; k++) d_bin_count[CAND_TO_QUHIT[k]]++;
                 for (int k = 0; k < N_CAND_M; k++) m_bin_count[CAND_TO_QUHIT[k]]++;
@@ -2067,12 +2075,15 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 
             /* Trace back the best beam's selections */
             int curr_hist = beams[0].history_idx;
-            for (int64_t i = n_blocks - 1; i >= 0; i--) {
+            for (int64_t i = graph_blocks - 1; i >= 0; i--) {
                 if (curr_hist >= 0) {
-                    best_candidate[i] = history[curr_hist].cand_idx;
+                    int cidx = history[curr_hist].cand_idx;
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = cidx;
                     curr_hist = history[curr_hist].parent_idx;
                 } else {
-                    best_candidate[i] = 10 * N_CAND_M + 10;
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = 10 * N_CAND_M + 10;
                 }
             }
 
@@ -2102,7 +2113,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     memcpy(shot_assignment, best_candidate,
                            n_blocks * sizeof(int));
 
-                    for (int64_t gi = 0; gi < n_blocks; gi++) {
+                    for (int64_t gi = 0; gi < graph_blocks; gi++) {
                         /* Born sample coarse (d) quhit */
                         double c_total = 0.0;
                         for (int v = 0; v < 6; v++) c_total += coarse_marg[gi][v];
@@ -2130,7 +2141,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         }
 
                         /* Find best candidate within the sampled (d_bin, m_bin) */
-                        int64_t blk = gi;
+                        int64_t blk = gi * stride;
                         float best_bin_err = 1e30f;
                         int best_bin_cand = 10 * N_CAND_M + 10;
                         for (int di = 0; di < N_CAND_D; di++) {
