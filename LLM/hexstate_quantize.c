@@ -1420,11 +1420,18 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                 int q4_bin_count[6] = {0};
                 for (int ci = 0; ci < Q4_N_CAND; ci++)
                     q4_bin_count[Q4_CAND_TO_QUHIT[ci]]++;
+                /* Per-block error normalization: divide by block mean error
+                 * so small-weight blocks don't dominate beam selection */
+                float blk_mean_err = 0.0f;
+                for (int ci = 0; ci < Q4_N_CAND; ci++)
+                    blk_mean_err += cand_errors[blk][ci];
+                blk_mean_err /= (float)Q4_N_CAND;
+                if (blk_mean_err < 1e-30f) blk_mean_err = 1e-30f;
                 for (int ci = 0; ci < Q4_N_CAND; ci++) {
                     int qi = Q4_CAND_TO_QUHIT[ci];
                     double p = (m_total > 1e-30) ? marg[i][qi] / m_total : 1.0/6.0;
                     p /= (double)q4_bin_count[qi];  /* normalize by bin occupancy */
-                    cand_score[ci] = p / (cand_errors[blk][ci] + 1e-15);
+                    cand_score[ci] = p / (cand_errors[blk][ci] / blk_mean_err + 1e-15);
                 }
 
                 typedef struct { double score; int beam_idx; int cand_idx; } Q4Ext;
@@ -1631,24 +1638,157 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             }
         }
 
+        /* ── FP16 ULP neighborhood search + sign-flip exploration ──
+         * The WLS solve found the continuous-optimal d. But FP16 truncation
+         * may shift the optimum. Try ±4 ULP around d in FP16 space, plus
+         * the negated scale, and pick the one with minimum reconstruction error. */
+        {
+            uint16_t base_d16 = gguf_fp32_to_fp16(d_current);
+            uint16_t best_d16 = base_d16;
+            float best_ulp_err = 1e30f;
+
+            /* Try ±4 ULP neighborhood + sign flip = up to 17 candidates */
+            uint16_t ulp_candidates[17];
+            int n_ulp = 0;
+            for (int delta = -4; delta <= 4; delta++) {
+                int cand16 = (int)base_d16 + delta;
+                if (cand16 >= 0 && cand16 <= 0x7BFF) /* valid positive FP16 */
+                    ulp_candidates[n_ulp++] = (uint16_t)cand16;
+            }
+            /* Sign-flipped d: negate and try ±0 ULP */
+            {
+                float neg_d = -d_current;
+                uint16_t neg_d16 = gguf_fp32_to_fp16(neg_d);
+                ulp_candidates[n_ulp++] = neg_d16;
+            }
+
+            for (int ui = 0; ui < n_ulp; ui++) {
+                float trial_d = gguf_fp16_to_fp32(ulp_candidates[ui]);
+                float trial_id = (fabsf(trial_d) > 1e-15f) ? 1.0f / trial_d : 0.0f;
+                float err = 0.0f;
+                for (int j = 0; j < QK4_0; j++) {
+                    int q = (int)(bw[j] * trial_id + 8.5f);
+                    if (q < 0) q = 0; if (q > 15) q = 15;
+                    float deq = ((float)q - 8.0f) * trial_d;
+                    float w = (imat_importance) ? imat_importance[blk * QK4_0 + j] : 1.0f;
+                    err += (bw[j] - deq) * (bw[j] - deq) * w;
+                }
+                if (err < best_ulp_err) {
+                    best_ulp_err = err;
+                    best_d16 = ulp_candidates[ui];
+                }
+            }
+            d_current = gguf_fp16_to_fp32(best_d16);
+        }
+
         /* Store the extracted optimal FP16 scale */
         output[blk].d = gguf_fp32_to_fp16(d_current);
         float actual_d = d_current;
-        float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
+        float id = (fabsf(actual_d) > 1e-15f) ? 1.0f / actual_d : 0.0f;
+
+        /* ── D₆ Hadamard Error Shaping for Q4_0 ──
+         * 32 elements per block = 5 full D₆ groups of 6 + 2 tail.
+         * Apply the same antipodal fold as Q2_K: minimize vesica energy
+         * to push quantization noise into wave (high-frequency) modes
+         * that cancel in dot products. */
+
+        /* Step 1: Standard nearest-rounding as baseline */
+        int q_base[QK4_0], q_shaped[QK4_0];
+        float q_cont[QK4_0];
+        for (int j = 0; j < QK4_0; j++) {
+            q_cont[j] = bw[j] * id + 8.0f;
+            q_base[j] = (int)(q_cont[j] + 0.5f);
+            if (q_base[j] < 0) q_base[j] = 0;
+            if (q_base[j] > 15) q_base[j] = 15;
+        }
+        memcpy(q_shaped, q_base, QK4_0 * sizeof(int));
+
+        /* Step 2: D₆ greedy flipping on 5 groups of 6 */
+        for (int g = 0; g < 5; g++) {
+            int g_off = g * 6;
+
+            for (int pass = 0; pass < 6; pass++) {
+                int best_k = -1;
+                int best_q_alt = 0;
+                float best_delta = 0.0f;
+
+                /* Current group errors */
+                float e_cur[6];
+                for (int kk = 0; kk < 6; kk++) {
+                    float deq = ((float)q_shaped[g_off+kk] - 8.0f) * actual_d;
+                    e_cur[kk] = bw[g_off+kk] - deq;
+                }
+
+                /* Current D₆ metric: vesica energy + DC² */
+                float vesica_cur = 0.0f, dc_cur = 0.0f;
+                for (int p = 0; p < 3; p++) {
+                    float v = e_cur[p] + e_cur[p+3];
+                    vesica_cur += v * v;
+                }
+                for (int kk = 0; kk < 6; kk++) dc_cur += e_cur[kk];
+                float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
+
+                /* Try flipping each element */
+                for (int k = 0; k < 6; k++) {
+                    int idx = g_off + k;
+                    int q_cur = q_shaped[idx];
+
+                    int q_try;
+                    if (q_cont[idx] - (float)q_cur >= 0) {
+                        q_try = q_cur + 1;
+                    } else {
+                        q_try = q_cur - 1;
+                    }
+                    if (q_try < 0 || q_try > 15) continue;
+
+                    /* Alt errors */
+                    float e_alt[6];
+                    for (int kk = 0; kk < 6; kk++) e_alt[kk] = e_cur[kk];
+                    float deq_try = ((float)q_try - 8.0f) * actual_d;
+                    e_alt[k] = bw[idx] - deq_try;
+
+                    /* Alt D₆ metric */
+                    float vesica_alt = 0.0f, dc_alt = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        float v = e_alt[p] + e_alt[p+3];
+                        vesica_alt += v * v;
+                    }
+                    for (int kk = 0; kk < 6; kk++) dc_alt += e_alt[kk];
+                    float metric_alt = 4.0f * vesica_alt + dc_alt * dc_alt;
+
+                    float delta = metric_cur - metric_alt;
+                    if (delta > best_delta) {
+                        best_delta = delta;
+                        best_k = k;
+                        best_q_alt = q_try;
+                    }
+                }
+
+                if (best_k < 0) break;
+                q_shaped[g_off + best_k] = best_q_alt;
+            }
+        }
+
+        /* Step 3: Error comparison — keep shaped only if MSE doesn't worsen >5% */
+        float err_base = 0.0f, err_shaped = 0.0f;
+        for (int j = 0; j < QK4_0; j++) {
+            float w = (imat_importance) ? imat_importance[blk * QK4_0 + j] : 1.0f;
+            float deq_b = ((float)q_base[j] - 8.0f) * actual_d;
+            float deq_s = ((float)q_shaped[j] - 8.0f) * actual_d;
+            err_base += (bw[j] - deq_b) * (bw[j] - deq_b) * w;
+            err_shaped += (bw[j] - deq_s) * (bw[j] - deq_s) * w;
+        }
+        int *q_final = (err_shaped <= err_base * 1.05f) ? q_shaped : q_base;
 
         /* Pack nibbles and compute error */
         for (int j = 0; j < QK4_0 / 2; j++) {
-            float x0 = bw[j];
-            float x1 = bw[j + QK4_0/2];
-            int q0 = (int)(x0 * id + 8.5f);
-            int q1 = (int)(x1 * id + 8.5f);
-            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-            if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+            int q0 = q_final[j];
+            int q1 = q_final[j + QK4_0/2];
             output[blk].qs[j] = (uint8_t)(q0 | (q1 << 4));
 
             float deq0 = ((float)q0 - 8.0f) * actual_d;
             float deq1 = ((float)q1 - 8.0f) * actual_d;
-            total_err += (x0 - deq0) * (x0 - deq0) + (x1 - deq1) * (x1 - deq1);
+            total_err += (bw[j] - deq0) * (bw[j] - deq0) + (bw[j + QK4_0/2] - deq1) * (bw[j + QK4_0/2] - deq1);
         }
     }
 
@@ -2101,12 +2241,19 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     f_total += fine_marg[i][v];
                 }
 
-                /* Candidate scores for this block: triality prob × (1/error) */
+                /* Candidate scores for this block: triality prob × (1/normalized_error) */
                 double cand_score[TOTAL_SCALE_CANDIDATES];
                 int64_t blk = i * stride;
                 int d_bin_count[6] = {0}, m_bin_count[6] = {0};
                 for (int k = 0; k < N_CAND_D; k++) d_bin_count[CAND_TO_QUHIT[k]]++;
                 for (int k = 0; k < N_CAND_M; k++) m_bin_count[CAND_TO_QUHIT[k]]++;
+                /* Per-block error normalization: divide by block mean error
+                 * so small-weight blocks don't dominate beam selection */
+                float blk_mean_err = 0.0f;
+                for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++)
+                    blk_mean_err += candidate_errors[blk][c];
+                blk_mean_err /= (float)TOTAL_SCALE_CANDIDATES;
+                if (blk_mean_err < 1e-30f) blk_mean_err = 1e-30f;
                 for (int di = 0; di < N_CAND_D; di++) {
                     int qi_d = CAND_TO_QUHIT[di];
                     double p_d = (c_total > 1e-30) ? coarse_marg[i][qi_d] / c_total : 1.0/6.0;
@@ -2116,7 +2263,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         double p_m = (f_total > 1e-30) ? fine_marg[i][qi_m] / f_total : 1.0/6.0;
                         p_m /= (double)m_bin_count[qi_m];
                         int cidx = di * N_CAND_M + mi;
-                        cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] + 1e-15);
+                        cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] / blk_mean_err + 1e-15);
                     }
                 }
 
@@ -2425,16 +2572,119 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
         }
 
+        /* ── FP16 ULP neighborhood search for (d, dmin) ──
+         * The WLS solve found continuous-optimal (d, dmin). But FP16
+         * truncation may shift the optimum. Try ±4 ULP around both
+         * d and dmin, pick the pair with minimum reconstruction error. */
+        {
+            uint16_t base_d16 = gguf_fp32_to_fp16(dm);
+            uint16_t base_m16 = gguf_fp32_to_fp16(mm);
+            uint16_t best_d16 = base_d16, best_m16 = base_m16;
+            float best_ulp_err = 1e30f;
+
+            for (int dd = -4; dd <= 4; dd++) {
+                int cd16 = (int)base_d16 + dd;
+                if (cd16 < 0 || cd16 > 0x7BFF) continue;
+                float trial_dm = gguf_fp16_to_fp32((uint16_t)cd16);
+
+                for (int dm_delta = -4; dm_delta <= 4; dm_delta++) {
+                    int cm16 = (int)base_m16 + dm_delta;
+                    if (cm16 < 0 || cm16 > 0x7BFF) continue;
+                    float trial_mm = gguf_fp16_to_fp32((uint16_t)cm16);
+
+                    float err = 0.0f;
+                    for (int j = 0; j < N_SUB; j++) {
+                        float d_sub = trial_dm * (float)Ls_blk[j];
+                        float m_sub = trial_mm * (float)Lm_blk[j];
+                        for (int k = 0; k < 16; k++) {
+                            float x = block_x[16*j+k];
+                            float w = (imat_importance) ?
+                                      imat_importance[blk * QK_K + 16*j+k] : 1.0f;
+                            int q;
+                            if (d_sub < 1e-15f) { q = 0; }
+                            else {
+                                q = gguf_nearest_int((x + m_sub) / d_sub);
+                                if (q < 0) q = 0; if (q > 3) q = 3;
+                            }
+                            float deq = d_sub * (float)q - m_sub;
+                            float diff = x - deq;
+                            err += diff * diff * w;
+                        }
+                    }
+                    if (err < best_ulp_err) {
+                        best_ulp_err = err;
+                        best_d16 = (uint16_t)cd16;
+                        best_m16 = (uint16_t)cm16;
+                    }
+                }
+            }
+            dm = gguf_fp16_to_fp32(best_d16);
+            mm = gguf_fp16_to_fp32(best_m16);
+        }
+
+        /* ── Final Ls/Lm re-optimization at committed FP16 (d, dmin) ──
+         * The WLS solve may have shifted (d, dmin) after the last Step A,
+         * invalidating the Ls/Lm choices. One final exhaustive pass at the
+         * EXACT FP16-truncated scales ensures every sub-block is optimal. */
+        for (int j = 0; j < N_SUB; j++) {
+            const float *sx = block_x + 16 * j;
+            float best_sub_err = 1e30f;
+            uint8_t best_ls = Ls_blk[j], best_lm = Lm_blk[j];
+            for (int try_ls = 0; try_ls <= 15; try_ls++) {
+                float d_sub = dm * (float)try_ls;
+                for (int try_lm = 0; try_lm <= 15; try_lm++) {
+                    float m_sub = mm * (float)try_lm;
+                    float sub_err = 0.0f;
+                    for (int k = 0; k < 16; k++) {
+                        float x = sx[k];
+                        float w = (imat_importance) ?
+                                  imat_importance[blk * QK_K + 16*j + k] : 1.0f;
+                        int q;
+                        if (d_sub < 1e-15f) { q = 0; }
+                        else {
+                            q = gguf_nearest_int((x + m_sub) / d_sub);
+                            if (q < 0) q = 0; if (q > 3) q = 3;
+                        }
+                        float deq = d_sub * (float)q - m_sub;
+                        float diff = x - deq;
+                        sub_err += diff * diff * w;
+                    }
+                    if (sub_err < best_sub_err) {
+                        best_sub_err = sub_err;
+                        best_ls = (uint8_t)try_ls;
+                        best_lm = (uint8_t)try_lm;
+                    }
+                }
+            }
+            Ls_blk[j] = best_ls;
+            Lm_blk[j] = best_lm;
+        }
+
         /* Store the extracted optimal FP16 (d, dmin) */
         output[blk].d    = gguf_fp32_to_fp16(dm);
         output[blk].dmin = gguf_fp32_to_fp16(mm);
-        dm = gguf_fp16_to_fp32(output[blk].d);
-        mm = gguf_fp16_to_fp32(output[blk].dmin);
 
         for (int j = 0; j < N_SUB; j++)
             output[blk].scales[j] = Ls_blk[j] | (Lm_blk[j] << 4);
 
-        /* Final quantization and nibble packing with extracted scales */
+        /* ── Final quantization with D₆ Hadamard Error Shaping ──
+         *
+         * Standard Q2_K rounds each weight independently: q = round((x+m)/d).
+         * But within a sub-block, weights share (d, m), so their quantization
+         * errors are CORRELATED. Independent rounding is suboptimal.
+         *
+         * The D₆ fold (antipodal Hadamard from the triality quhit) decomposes
+         * the error vector into vesica (sum) and wave (difference) components:
+         *   vesica[k] = (e[k] + e[k+3]) / √2    — DC-like, accumulates in dot products
+         *   wave[k]   = (e[k] - e[k+3]) / √2    — noise-like, cancels in dot products
+         *
+         * We WANT large wave error and small vesica error. So we greedily
+         * flip rounding decisions (floor↔ceil) to minimize vesica energy,
+         * even if total element-wise error increases slightly.
+         *
+         * Process: 16 elements per sub-block, treat as 2 groups of 6 + 4 tail.
+         * Apply DFT₆-fold to each group of 6, minimize vesica component.
+         */
         uint8_t L[QK_K];
         for (int j = 0; j < N_SUB; j++) {
             float d = dm * (float)(output[blk].scales[j] & 0xF);
@@ -2443,12 +2693,117 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 continue;
             }
             float m = mm * (float)(output[blk].scales[j] >> 4);
+            float id = 1.0f / d;
+
+            /* Step 1: Standard nearest-rounding as baseline */
+            int q_base[16];
+            float q_cont[16];  /* continuous q values before rounding */
             for (int k = 0; k < 16; k++) {
-                int q = gguf_nearest_int((block_x[16 * j + k] + m) / d);
-                if (q < 0) q = 0;
-                if (q > 3) q = 3;
-                L[16 * j + k] = (uint8_t)q;
+                q_cont[k] = (block_x[16*j+k] + m) * id;
+                q_base[k] = gguf_nearest_int(q_cont[k]);
+                if (q_base[k] < 0) q_base[k] = 0;
+                if (q_base[k] > 3) q_base[k] = 3;
             }
+
+            /* Step 2: D₆ Hadamard Error Shaping
+             * For each 6-element group, greedily flip the rounding decision
+             * that most reduces the D₆-folded vesica error component.
+             *
+             * D₆ fold on 6-element groups: antipodal pairs (0,3), (1,4), (2,5)
+             * vesica[k] = e[k] + e[k+3]  (k=0,1,2) — DC-like, propagates
+             * wave[k]   = e[k] - e[k+3]  (k=0,1,2) — noise-like, cancels
+             *
+             * Weight vesica 4× over wave + penalize DC (sum of all 6 errors) */
+            int q_shaped[16];
+            memcpy(q_shaped, q_base, 16 * sizeof(int));
+
+            /* Process groups: [0..5], [6..11], tail [12..15] handled by D₆ metric on available pairs */
+            for (int g = 0; g < 2; g++) {
+                int g_off = g * 6;
+                if (g_off + 5 >= 16) break;
+
+                /* Multiple greedy passes — each pass finds the single best flip */
+                for (int pass = 0; pass < 6; pass++) {
+                    int best_k = -1;
+                    int best_q_alt = 0;
+                    float best_delta = 0.0f;  /* improvement = current_metric - alt_metric */
+
+                    /* Compute current group errors */
+                    float e_cur[6];
+                    for (int kk = 0; kk < 6; kk++) {
+                        int ii = g_off + kk;
+                        float deq = d * (float)q_shaped[ii] - m;
+                        e_cur[kk] = block_x[16*j+ii] - deq;
+                    }
+
+                    /* Current D₆ metric: vesica energy + DC² */
+                    float vesica_cur = 0.0f, dc_cur = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        float v = e_cur[p] + e_cur[p+3];
+                        vesica_cur += v * v;
+                    }
+                    for (int kk = 0; kk < 6; kk++) dc_cur += e_cur[kk];
+                    float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
+
+                    /* Try flipping each element */
+                    for (int k = 0; k < 6; k++) {
+                        int idx = g_off + k;
+                        int q_cur = q_shaped[idx];
+
+                        /* Try the alternative rounding */
+                        int q_try;
+                        if (q_cont[idx] - (float)q_cur >= 0) {
+                            q_try = q_cur + 1;
+                        } else {
+                            q_try = q_cur - 1;
+                        }
+                        if (q_try < 0 || q_try > 3) continue;
+
+                        /* Compute alt errors (only element k changes) */
+                        float e_alt[6];
+                        for (int kk = 0; kk < 6; kk++) e_alt[kk] = e_cur[kk];
+                        float deq_try = d * (float)q_try - m;
+                        e_alt[k] = block_x[16*j+idx] - deq_try;
+
+                        /* Alt D₆ metric */
+                        float vesica_alt = 0.0f, dc_alt = 0.0f;
+                        for (int p = 0; p < 3; p++) {
+                            float v = e_alt[p] + e_alt[p+3];
+                            vesica_alt += v * v;
+                        }
+                        for (int kk = 0; kk < 6; kk++) dc_alt += e_alt[kk];
+                        float metric_alt = 4.0f * vesica_alt + dc_alt * dc_alt;
+
+                        float delta = metric_cur - metric_alt;
+                        if (delta > best_delta) {
+                            best_delta = delta;
+                            best_k = k;
+                            best_q_alt = q_try;
+                        }
+                    }
+
+                    if (best_k < 0) break;  /* no improvement found */
+                    q_shaped[g_off + best_k] = best_q_alt;  /* commit the flip */
+                }
+            }
+
+            /* Step 3: Final error comparison — only keep shaped if it improves
+             * or is within 5% of baseline (vesica shaping trades element MSE
+             * for better spectral distribution of error) */
+            float err_base = 0.0f, err_shaped = 0.0f;
+            for (int k = 0; k < 16; k++) {
+                float x = block_x[16*j+k];
+                float w = (imat_importance) ?
+                          imat_importance[blk * QK_K + 16*j + k] : 1.0f;
+                float deq_b = d * (float)q_base[k] - m;
+                float deq_s = d * (float)q_shaped[k] - m;
+                err_base += (x - deq_b) * (x - deq_b) * w;
+                err_shaped += (x - deq_s) * (x - deq_s) * w;
+            }
+
+            int *q_final = (err_shaped <= err_base * 1.05f) ? q_shaped : q_base;
+            for (int k = 0; k < 16; k++)
+                L[16 * j + k] = (uint8_t)q_final[k];
         }
 
         for (int j = 0; j < QK_K; j += 128) {
