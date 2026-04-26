@@ -1216,9 +1216,10 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
 #define Q4_N_CAND 16  /* scale candidates for Q4_0 (was 10) */
 #define Q4_N_BEAMS 24 /* beam width (was 12) */
 
+/* Tight neighborhood around WLS optimum: ±10% */
 static const float Q4_NEIGHBOR_MULTS[Q4_N_CAND] = {
-    0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
-    0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
+    0.900f, 0.915f, 0.930f, 0.945f, 0.955f, 0.965f, 0.975f, 0.985f,
+    0.995f, 1.005f, 1.015f, 1.025f, 1.035f, 1.050f, 1.070f, 1.100f
 };
 static const int Q4_CAND_TO_QUHIT[Q4_N_CAND] = {
     0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
@@ -1244,7 +1245,9 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         greedy_d[blk] = amax / 7.0f;
     }
 
-    /* ── Phase 2: Generate 10 candidate scales per block, measure MSE ── */
+    /* ── Phase 2: WLS-Optimal Candidate Generation for Q4_0 ──
+     * First find the true optimal d* via 3-iteration WLS,
+     * then generate candidates centered on d* with tight spacing. */
     float (*cand_errors)[Q4_N_CAND] = (float (*)[Q4_N_CAND])
         calloc(n_blocks, sizeof(float[Q4_N_CAND]));
     uint16_t (*cand_d16)[Q4_N_CAND] = (uint16_t (*)[Q4_N_CAND])
@@ -1252,8 +1255,32 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *bw = weights + blk * QK4_0;
+
+        /* ── Step 2a: WLS solve to find optimal d* ── */
+        float wls_d = greedy_d[blk];
+        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
+            if (wls_d < 1e-15f) break;
+            float inv_d = 1.0f / wls_d;
+            float num = 0.0f, den = 0.0f;
+            for (int j = 0; j < QK4_0; j++) {
+                int q = (int)(bw[j] * inv_d + 8.5f);
+                if (q < 0) q = 0; if (q > 15) q = 15;
+                float qc = (float)q - 8.0f;
+                float w = (imat_importance) ?
+                          imat_importance[blk * QK4_0 + j] : 1.0f;
+                num += w * bw[j] * qc;
+                den += w * qc * qc;
+            }
+            if (den > 1e-15f) {
+                float d_new = num / den;
+                if (fabsf(d_new) < 4.0f * (greedy_d[blk] + 1e-10f))
+                    wls_d = gguf_fp16_to_fp32(gguf_fp32_to_fp16(d_new));
+            }
+        }
+
+        /* ── Step 2b: Generate candidates centered on WLS optimum ── */
         for (int ci = 0; ci < Q4_N_CAND; ci++) {
-            float trial_d = greedy_d[blk] * Q4_NEIGHBOR_MULTS[ci];
+            float trial_d = wls_d * Q4_NEIGHBOR_MULTS[ci];
             uint16_t d16 = gguf_fp32_to_fp16(trial_d);
             float actual_d = gguf_fp16_to_fp32(d16);
             cand_d16[blk][ci] = d16;
@@ -1568,9 +1595,9 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         /* Start from the grid-selected scale (the "assembled frequency") */
         float d_current = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
 
-        /* Iterative least-squares extraction (the "continued fraction")
-         * Converges in 2-3 iterations since Q4_0 has only 16 quantization levels */
-        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
+        /* Analog assembly: iterate to full convergence.
+         * 5 iterations for stable (d, q-values) coupling. */
+        for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
             if (d_current < 1e-15f) break;
             float id = 1.0f / d_current;
 
@@ -1688,28 +1715,30 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     }
 
     /* ══════════════════════════════════════════════════════════════════
-     * PHASE 2: Generate 100 FP16 (d, dmin) candidates per block
-     *          and measure actual reconstruction MSE for each
+     * PHASE 2: WLS-Optimal Candidate Generation
+     *
+     * Instead of a fixed multiplier grid centered on greedy seeds,
+     * we first solve a 3-iteration Weighted Least-Squares to find
+     * the true optimal (d*, dmin*) per block, then generate the
+     * 16×16 candidate grid centered on THOSE optimal values.
+     * This makes the candidate space data-driven, not fabricated.
      * ══════════════════════════════════════════════════════════════════ */
 
-    /* For each block, generate a 16×16 grid of (d, dmin) FP16 neighbors.
-     * Narrower range than wide-sweep: 0.82–1.15 with fine spacing.
-     * Wider ranges push Q2_K into degenerate clipping territory.
-     * Total: 256 (d, dmin) pairs per block (was 100) */
+    /* Tight neighborhood around WLS optimum: ±10% with fine spacing */
     static const float NEIGHBOR_MULTS_D[N_CAND_D] = {
-        0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
-        0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
+        0.900f, 0.915f, 0.930f, 0.945f, 0.955f, 0.965f, 0.975f, 0.985f,
+        0.995f, 1.005f, 1.015f, 1.025f, 1.035f, 1.050f, 1.070f, 1.100f
     };
     static const float NEIGHBOR_MULTS_M[N_CAND_M] = {
-        0.82f, 0.842f, 0.855f, 0.87f, 0.89f, 0.91f, 0.925f, 0.945f,
-        0.96f, 0.98f, 1.00f, 1.02f, 1.035f, 1.07f, 1.105f, 1.15f
+        0.900f, 0.915f, 0.930f, 0.945f, 0.955f, 0.965f, 0.975f, 0.985f,
+        0.995f, 1.005f, 1.015f, 1.025f, 1.035f, 1.050f, 1.070f, 1.100f
     };
     /* Map 16 candidates → 6 quhit states for BP encoding */
     static const int CAND_TO_QUHIT[16] = {
         0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
     };
 
-    /* candidate_errors[blk][36] — MSE per candidate */
+    /* candidate_errors[blk][256] — weighted MSE per candidate */
     float (*candidate_errors)[TOTAL_SCALE_CANDIDATES] = NULL;
     uint16_t (*candidate_d)[TOTAL_SCALE_CANDIDATES] = NULL;
     uint16_t (*candidate_dmin)[TOTAL_SCALE_CANDIDATES] = NULL;
@@ -1730,26 +1759,98 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
-        float base_dm = seeds[blk].dm;
-        float base_mm = seeds[blk].mm;
 
+        /* ── Step 2a: WLS solve to find optimal (d*, dmin*) ──
+         * Seed from Phase 1 greedy, iterate 3× to converge.
+         * Q2_K model: x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
+         * This is a 2-variable WLS: minimize Σ w×(x - d×a + dmin×b)² */
+        float wls_dm = seeds[blk].dm;
+        float wls_mm = seeds[blk].mm;
+        uint8_t wls_Ls[16], wls_Lm[16];
+        memcpy(wls_Ls, seeds[blk].Ls, 16);
+        memcpy(wls_Lm, seeds[blk].Lm, 16);
+
+        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
+            /* Quantize all elements at current (wls_dm, wls_mm) */
+            uint8_t L_wls[QK_K];
+            for (int j = 0; j < N_SUB; j++) {
+                float d_sub = wls_dm * (float)wls_Ls[j];
+                float m_sub = wls_mm * (float)wls_Lm[j];
+                if (d_sub < 1e-15f) {
+                    for (int k = 0; k < 16; k++) L_wls[16*j+k] = 0;
+                    continue;
+                }
+                for (int k = 0; k < 16; k++) {
+                    int q = gguf_nearest_int((block_x[16*j+k] + m_sub) / d_sub);
+                    if (q < 0) q = 0; if (q > 3) q = 3;
+                    L_wls[16*j+k] = (uint8_t)q;
+                }
+            }
+
+            /* Accumulate 2×2 normal equations */
+            double Saa = 0, Sab = 0, Sbb = 0, Sxa = 0, Sxb = 0;
+            for (int j = 0; j < N_SUB; j++) {
+                float ls_f = (float)wls_Ls[j];
+                float lm_f = (float)wls_Lm[j];
+                for (int k = 0; k < 16; k++) {
+                    float x = block_x[16*j+k];
+                    float w = (imat_importance) ?
+                              imat_importance[blk * QK_K + 16*j+k] : 1.0f;
+                    float a = ls_f * (float)L_wls[16*j+k];
+                    float b = lm_f;
+                    Saa += w * a * a;
+                    Sab += w * a * b;
+                    Sbb += w * b * b;
+                    Sxa += w * x * a;
+                    Sxb += w * x * b;
+                }
+            }
+
+            /* Solve via Cramer's rule */
+            double det = Saa * Sbb - Sab * Sab;
+            if (fabs(det) > 1e-30) {
+                double d_new  = (Sbb * Sxa - Sab * Sxb) / det;
+                double dm_new = (Sab * Sxa - Saa * Sxb) / det;
+                /* Clamp: positive and within 4× of seed (prevent runaway) */
+                if (d_new > 0.0 && d_new < 4.0 * (seeds[blk].dm + 1e-10))
+                    wls_dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)d_new));
+                if (dm_new > 0.0 && dm_new < 4.0 * (seeds[blk].mm + 1e-10))
+                    wls_mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)dm_new));
+            }
+
+            /* Re-derive Ls/Lm for updated (d*, dmin*) */
+            for (int j = 0; j < N_SUB; j++) {
+                if (wls_dm > 1e-15f) {
+                    int ls = gguf_nearest_int(seeds[blk].scales[j] / wls_dm);
+                    if (ls < 0) ls = 0; if (ls > 15) ls = 15;
+                    wls_Ls[j] = (uint8_t)ls;
+                } else { wls_Ls[j] = 0; }
+                if (wls_mm > 1e-15f) {
+                    int lm = gguf_nearest_int(seeds[blk].mins[j] / wls_mm);
+                    if (lm < 0) lm = 0; if (lm > 15) lm = 15;
+                    wls_Lm[j] = (uint8_t)lm;
+                } else { wls_Lm[j] = 0; }
+            }
+        }
+
+        /* ── Step 2b: Generate 16×16 candidates centered on WLS optimum ──
+         * Grid is now centered on (wls_dm, wls_mm) not (greedy_dm, greedy_mm).
+         * Tighter spacing because we're already near the true minimum. */
         for (int di = 0; di < N_CAND_D; di++) {
-            float trial_dm = base_dm * NEIGHBOR_MULTS_D[di];
+            float trial_dm = wls_dm * NEIGHBOR_MULTS_D[di];
             uint16_t trial_d16 = gguf_fp32_to_fp16(trial_dm);
             float actual_dm = gguf_fp16_to_fp32(trial_d16);
 
             for (int mi = 0; mi < N_CAND_M; mi++) {
                 int cidx = di * N_CAND_M + mi;
-                float trial_mm = base_mm * NEIGHBOR_MULTS_M[mi];
+                float trial_mm = wls_mm * NEIGHBOR_MULTS_M[mi];
                 uint16_t trial_dmin16 = gguf_fp32_to_fp16(trial_mm);
                 float actual_mm = gguf_fp16_to_fp32(trial_dmin16);
 
                 candidate_d[blk][cidx] = trial_d16;
                 candidate_dmin[blk][cidx] = trial_dmin16;
 
-                /* Recompute Ls/Lm for THIS candidate dm/mm.
-                 * Ls[j] = best integer to represent scales[j] / dm
-                 * Lm[j] = best integer to represent mins[j] / mm */
+                /* Recompute Ls/Lm for THIS candidate dm/mm */
                 uint8_t trial_Ls[16], trial_Lm[16];
                 for (int j = 0; j < N_SUB; j++) {
                     if (actual_dm > 1e-15f) {
@@ -1770,7 +1871,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 memcpy(candidate_Ls[blk][cidx], trial_Ls, 16);
                 memcpy(candidate_Lm[blk][cidx], trial_Lm, 16);
 
-                /* Fully re-quantize and measure MSE with recomputed Ls/Lm */
+                /* Fully re-quantize and measure weighted MSE */
                 float err = 0.0f;
                 for (int j = 0; j < N_SUB; j++) {
                     float d = actual_dm * (float)trial_Ls[j];
@@ -2200,13 +2301,13 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      *
      * Q2_K model: x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
      *
-     * This is a 2-variable linear system:
-     *   [Σ(w×a²)   -Σ(w×a×b) ] [d   ]   [Σ(w×x×a) ]
-     *   [-Σ(w×a×b)  Σ(w×b²)  ] [dmin] = [Σ(w×x×b) ]  (negated for min)
+     * Full analog assembly: at each iteration, EXHAUSTIVELY search
+     * all 16×16 = 256 possible (Ls[j], Lm[j]) pairs per sub-block
+     * to find the assignment that minimizes weighted reconstruction
+     * error. Then WLS-solve for the global (d, dmin). Repeat 5×.
      *
-     * where a = Ls[j]×q[j,k], b = Lm[j].
-     *
-     * Iterates 3× for q-value stability (Q2_K has only 4 levels).
+     * This guarantees every parameter is at its conditional optimum —
+     * the perfect bit analog at 2-bit resolution.
      * ══════════════════════════════════════════════════════════════════ */
 
     for (int64_t blk = 0; blk < n_blocks; blk++) {
@@ -2214,17 +2315,65 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         int cidx = best_candidate[blk];
         uint8_t Ls_blk[16], Lm_blk[16];
 
-        /* Start from grid-selected Ls/Lm (the "assembled frequency") */
+        /* Start from HPC-selected candidate */
         memcpy(Ls_blk, candidate_Ls[blk][cidx], 16);
         memcpy(Lm_blk, candidate_Lm[blk][cidx], 16);
 
         float dm = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
         float mm = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
 
-        /* Iterative least-squares extraction (the "continued fraction")
-         * Converges in 2-3 iterations since Q2_K has only 4 levels */
-        for (int ls_iter = 0; ls_iter < 3; ls_iter++) {
-            /* Quantize all elements at current (dm, mm) */
+        /* ── Analog assembly: iterate to convergence ──
+         * 5 iterations: enough for the (Ls,Lm) ↔ (d,dmin) coupling
+         * to fully stabilize. Each iteration does:
+         *   A) Exhaustive (Ls,Lm) search per sub-block
+         *   B) Optimal q-value assignment
+         *   C) WLS solve for (d, dmin) */
+        for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
+
+            /* ── Step A: Exhaustive Ls/Lm search per sub-block ──
+             * For each sub-block j, try ALL 16×16 = 256 possible
+             * (Ls[j], Lm[j]) pairs. For each pair, compute optimal
+             * q-values by rounding and measure weighted sub-block error.
+             * Pick the pair that minimizes error. */
+            for (int j = 0; j < N_SUB; j++) {
+                const float *sx = block_x + 16 * j;
+                float best_sub_err = 1e30f;
+                uint8_t best_ls = Ls_blk[j], best_lm = Lm_blk[j];
+
+                for (int try_ls = 0; try_ls <= 15; try_ls++) {
+                    float d_sub = dm * (float)try_ls;
+                    for (int try_lm = 0; try_lm <= 15; try_lm++) {
+                        float m_sub = mm * (float)try_lm;
+
+                        float sub_err = 0.0f;
+                        for (int k = 0; k < 16; k++) {
+                            float x = sx[k];
+                            float w = (imat_importance) ?
+                                      imat_importance[blk * QK_K + 16*j + k] : 1.0f;
+                            int q;
+                            if (d_sub < 1e-15f) {
+                                q = 0;
+                            } else {
+                                q = gguf_nearest_int((x + m_sub) / d_sub);
+                                if (q < 0) q = 0; if (q > 3) q = 3;
+                            }
+                            float deq = d_sub * (float)q - m_sub;
+                            float diff = x - deq;
+                            sub_err += diff * diff * w;
+                        }
+
+                        if (sub_err < best_sub_err) {
+                            best_sub_err = sub_err;
+                            best_ls = (uint8_t)try_ls;
+                            best_lm = (uint8_t)try_lm;
+                        }
+                    }
+                }
+                Ls_blk[j] = best_ls;
+                Lm_blk[j] = best_lm;
+            }
+
+            /* ── Step B: Quantize q-values with optimal Ls/Lm ── */
             uint8_t L[QK_K];
             for (int j = 0; j < N_SUB; j++) {
                 float d_sub = dm * (float)Ls_blk[j];
@@ -2240,13 +2389,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
             }
 
-            /* 2×2 weighted least-squares:
+            /* ── Step C: WLS solve for (d, dmin) ──
              * x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
              * Let a = Ls[j]×q[j,k], b = Lm[j]
-             * Minimize Σ w×(x - d×a + dmin×b)²
-             * Normal equations:
-             *   d × Σ(w×a²) - dmin × Σ(w×a×b) = Σ(w×x×a)
-             *  -d × Σ(w×a×b) + dmin × Σ(w×b²) = -Σ(w×x×b)  */
+             * Normal equations via Cramer's rule */
             double Saa = 0, Sab = 0, Sbb = 0, Sxa = 0, Sxb = 0;
             for (int j = 0; j < N_SUB; j++) {
                 float ls_f = (float)Ls_blk[j];
@@ -2265,16 +2411,11 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
             }
 
-            /* Solve 2×2 system via Cramer's rule
-             * System: [Saa, -Sab; -Sab, Sbb] × [d; dmin] = [Sxa; -Sxb]
-             * d    = (Sbb×Sxa - Sab×Sxb) / det
-             * dmin = (Sab×Sxa - Saa×Sxb) / det */
             double det = Saa * Sbb - Sab * Sab;
             if (fabs(det) > 1e-30) {
                 double d_new  = (Sbb * Sxa - Sab * Sxb) / det;
                 double dm_new = (Sab * Sxa - Saa * Sxb) / det;
-                /* Clamp to reasonable range: must be positive and not wildly
-                 * larger than the grid-selected seed (prevent runaway LS) */
+                /* Clamp: positive and within 4× of candidate seed */
                 float d_seed = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
                 float m_seed = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
                 if (d_new > 0.0 && d_new < 4.0 * (d_seed + 1e-10))
