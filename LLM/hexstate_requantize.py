@@ -527,6 +527,49 @@ def quantize_tensor_q2k(f32_data):
     return result.tobytes(), n_blocks
 
 
+def dequant_q2k_fast(q2k_bytes, n_blocks):
+    """Vectorized Q2_K dequantization for RMSE computation.
+
+    Block layout (84 bytes) — same for both C struct and Python writer:
+        scales[16] (bytes 0-15) | qs[64] (bytes 16-79) | d(fp16, bytes 80-81) | dmin(fp16, bytes 82-83)
+
+    The C struct BlockQ2K in gguf_format.h is:
+        { uint8_t scales[16]; uint8_t qs[64]; uint16_t d; uint16_t dmin; }
+    """
+    data = np.frombuffer(q2k_bytes, dtype=np.uint8).reshape(n_blocks, 84)
+
+    # Extract fields
+    scales_packed = data[:, 0:16]     # [n_blocks, 16]
+    qs = data[:, 16:80]              # [n_blocks, 64]
+    d_fp16 = data[:, 80:82].copy().view(np.float16).astype(np.float32).reshape(n_blocks)
+    dmin_fp16 = data[:, 82:84].copy().view(np.float16).astype(np.float32).reshape(n_blocks)
+
+    # Extract scale (low 4 bits) and min (high 4 bits) per sub-block
+    sc = (scales_packed & 0xF).astype(np.float32)   # [n_blocks, 16]
+    mn = (scales_packed >> 4).astype(np.float32)     # [n_blocks, 16]
+
+    # Compute per-sub-block d_sub and m_sub
+    d_sub = d_fp16[:, np.newaxis] * sc               # [n_blocks, 16]
+    m_sub = dmin_fp16[:, np.newaxis] * mn             # [n_blocks, 16]
+
+    # Unpack 2-bit quants from qs[64] into 256 values per block
+    # Layout: 2 groups of 128. Each group uses 32 bytes of qs.
+    # Within each group: 4 sub-blocks of 32 weights, packed at bit shifts 0,2,4,6
+    result = np.zeros((n_blocks, QK_K), dtype=np.float32)
+    for half in range(2):
+        qs_half = qs[:, half * 32:(half + 1) * 32]  # [n_blocks, 32]
+        for sub in range(4):
+            j = half * 8 + sub
+            # Extract 2-bit quants at this shift position
+            q_vals = ((qs_half >> (sub * 2)) & 3).astype(np.float32)  # [n_blocks, 32]
+            # Reconstruct: d_sub[j] * q - m_sub[j]
+            base_idx = half * 128 + sub * 32
+            result[:, base_idx:base_idx + 32] = (
+                d_sub[:, j:j+1] * q_vals - m_sub[:, j:j+1]
+            )
+    return result.reshape(-1)
+
+
 def is_attention_tensor(name):
     """Detect attention Q/K/V/O projection tensors.
     These are the most sensitive to quantization and get promoted to Q4_0."""
@@ -899,6 +942,8 @@ def main():
             total_quant_bytes = 0
             total_keep_bytes = 0
             total_rmse = 0.0
+            q2k_rmse_sum = 0.0
+            q2k_tensor_count = 0
 
             for i, ti in enumerate(tensor_infos):
                 # Progress bar
@@ -1059,6 +1104,27 @@ def main():
                         n_blocks = n_el // QK_K
                     fout.write(q2k_data)
 
+                    # ── Compute and report exact per-tensor RMSE ──
+                    try:
+                        CHUNK_BLK = 100_000  # blocks per chunk to bound memory
+                        total_se = 0.0
+                        total_n = 0
+                        for ci in range(0, n_blocks, CHUNK_BLK):
+                            ce = min(ci + CHUNK_BLK, n_blocks)
+                            chunk_q = q2k_data[ci*84:ce*84]
+                            deq_chunk = dequant_q2k_fast(chunk_q, ce - ci)
+                            orig_chunk = f32[ci*QK_K:ce*QK_K]
+                            n_valid = min(len(orig_chunk), len(deq_chunk))
+                            diff = orig_chunk[:n_valid] - deq_chunk[:n_valid]
+                            total_se += np.sum(diff ** 2)
+                            total_n += n_valid
+                        tensor_rmse = np.sqrt(total_se / max(total_n, 1))
+                        q2k_rmse_sum += tensor_rmse
+                        q2k_tensor_count += 1
+                        print(f"\n  [Q2_K] {ti['name'][:55]}  RMSE={tensor_rmse:.6e}")
+                    except Exception as e:
+                        print(f"\n  [Q2_K] {ti['name'][:55]}  RMSE=err({e})")
+
                     quant_count += 1
                     total_quant_bytes += len(q2k_data)
                 else:
@@ -1091,6 +1157,9 @@ def main():
     print(f"  ║  Original size:     {file_size:>12,} bytes ({file_size/1024**3:>7.2f} GB) ║")
     print(f"  ║  Output size:       {final_size:>12,} bytes ({final_size/1024**3:>7.2f} GB) ║")
     print(f"  ║  Compression:       {compression:>42.1f}x ║")
+    if q2k_tensor_count > 0:
+        mean_rmse = q2k_rmse_sum / q2k_tensor_count
+        print(f"  ║  Mean Q2_K RMSE:                            {mean_rmse:>12.6e} ║")
     print(f"  ║  Total time:        {elapsed:>39.1f} sec ║")
     print("  ╚════════════════════════════════════════════════════════════════╝")
     print()
