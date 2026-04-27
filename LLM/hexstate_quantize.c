@@ -44,6 +44,9 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -1235,6 +1238,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
     /* ── Phase 1: Greedy seed — compute scale per block ── */
     float *greedy_d = (float *)calloc(n_blocks, sizeof(float));
 
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *bw = weights + blk * QK4_0;
         float amax = 0.0f;
@@ -1595,6 +1599,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
      * The grid gave us 16 possible scales. This gives us 65,536 (all FP16).
      * ══════════════════════════════════════════════════════════════════ */
 
+    #pragma omp parallel for schedule(dynamic, 64) reduction(+:total_err)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *bw = weights + blk * QK4_0;
         int cidx = best_candidate[blk];
@@ -1825,6 +1830,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
 
     BlockSeed *seeds = (BlockSeed *)calloc(n_blocks, sizeof(BlockSeed));
 
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
         uint8_t L[QK_K], Laux[16];
@@ -1897,6 +1903,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     candidate_Lm = (uint8_t (*)[TOTAL_SCALE_CANDIDATES][16])calloc(n_blocks,
                             sizeof(uint8_t[TOTAL_SCALE_CANDIDATES][16]));
 
+    #pragma omp parallel for schedule(dynamic, 16)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
 
@@ -2457,6 +2464,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      * the perfect bit analog at 2-bit resolution.
      * ══════════════════════════════════════════════════════════════════ */
 
+    #pragma omp parallel for schedule(dynamic, 64) reduction(+:total_err)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
         int cidx = best_candidate[blk];
@@ -2475,7 +2483,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
          *   A) Exhaustive (Ls,Lm) search per sub-block
          *   B) Optimal q-value assignment
          *   C) WLS solve for (d, dmin) */
-        for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
+        for (int ls_iter = 0; ls_iter < 2; ls_iter++) {
 
             /* ── Step A: Exhaustive Ls/Lm search per sub-block ──
              * For each sub-block j, try ALL 16×16 = 256 possible
@@ -2513,9 +2521,11 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             best_sub_err = sub_err;
                             best_ls = (uint8_t)try_ls;
                             best_lm = (uint8_t)try_lm;
+                            if (sub_err < 1e-10f) goto done_sub;
                         }
                     }
                 }
+                done_sub:;
                 Ls_blk[j] = best_ls;
                 Lm_blk[j] = best_lm;
             }
@@ -2582,12 +2592,12 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             uint16_t best_d16 = base_d16, best_m16 = base_m16;
             float best_ulp_err = 1e30f;
 
-            for (int dd = -4; dd <= 4; dd++) {
+            for (int dd = -2; dd <= 2; dd++) {
                 int cd16 = (int)base_d16 + dd;
                 if (cd16 < 0 || cd16 > 0x7BFF) continue;
                 float trial_dm = gguf_fp16_to_fp32((uint16_t)cd16);
 
-                for (int dm_delta = -4; dm_delta <= 4; dm_delta++) {
+                for (int dm_delta = -2; dm_delta <= 2; dm_delta++) {
                     int cm16 = (int)base_m16 + dm_delta;
                     if (cm16 < 0 || cm16 > 0x7BFF) continue;
                     float trial_mm = gguf_fp16_to_fp32((uint16_t)cm16);
