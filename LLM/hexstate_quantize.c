@@ -1313,7 +1313,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
     if (n_blocks >= 2) {
         float temperature = 0.5f;
-        int64_t graph_blocks = (n_blocks > 2000) ? 2000 : n_blocks;
+        int64_t graph_blocks = (n_blocks > 200) ? 200 : n_blocks;
         int64_t stride = n_blocks / graph_blocks;
         int64_t n_sites = graph_blocks;  /* 1 quhit per block */
 
@@ -1712,7 +1712,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         for (int g = 0; g < 5; g++) {
             int g_off = g * 6;
 
-            for (int pass = 0; pass < 64; pass++) {  /* run until convergence */
+            for (int pass = 0; pass < 6; pass++) {
                 int best_k = -1;
                 int best_q_alt = 0;
                 float best_delta = 0.0f;
@@ -1783,7 +1783,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             err_base += (bw[j] - deq_b) * (bw[j] - deq_b) * w;
             err_shaped += (bw[j] - deq_s) * (bw[j] - deq_s) * w;
         }
-        int *q_final = (err_shaped <= err_base) ? q_shaped : q_base;
+        int *q_final = (err_shaped <= err_base * 1.05f) ? q_shaped : q_base;
 
         /* Pack nibbles and compute error */
         for (int j = 0; j < QK4_0 / 2; j++) {
@@ -2692,8 +2692,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
          * flip rounding decisions (floor↔ceil) to minimize vesica energy,
          * even if total element-wise error increases slightly.
          *
-         * Process: 16 elements per sub-block, treat as 2 groups of 6 + 1 tail group of 4.
-         * Apply D₆-fold to each group of 6, paired shaping to tail group of 4.
+         * Process: 16 elements per sub-block, treat as 2 groups of 6 + 4 tail.
+         * Apply DFT₆-fold to each group of 6, minimize vesica component.
          */
         uint8_t L[QK_K];
         for (int j = 0; j < N_SUB; j++) {
@@ -2715,45 +2715,30 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 if (q_base[k] > 3) q_base[k] = 3;
             }
 
-            /* Step 2: Triality D₆ Hadamard Error Shaping (Importance-Weighted)
+            /* Step 2: D₆ Hadamard Error Shaping
+             * For each 6-element group, greedily flip the rounding decision
+             * that most reduces the D₆-folded vesica error component.
              *
-             * Instead of a single-view vesica metric (edge pairs only),
-             * compute fold energy in ALL THREE triality views:
+             * D₆ fold on 6-element groups: antipodal pairs (0,3), (1,4), (2,5)
+             * vesica[k] = e[k] + e[k+3]  (k=0,1,2) — DC-like, propagates
+             * wave[k]   = e[k] - e[k+3]  (k=0,1,2) — noise-like, cancels
              *
-             *   Edge view:     pairs (0,3), (1,4), (2,5)  — antipodal
-             *   Vertex view:   pairs (0,2), (1,3), (4,5)  — DFT₆ frequency coupling
-             *   Diagonal view: pairs (0,4), (1,5), (2,3)  — conjugate frequency coupling
-             *
-             * Combined metric = ∛(edge_metric × vertex_metric × diagonal_metric)
-             * This ensures error is shaped away from ALL Fourier channels,
-             * not just the antipodal one. */
+             * Weight vesica 4× over wave + penalize DC (sum of all 6 errors) */
             int q_shaped[16];
             memcpy(q_shaped, q_base, 16 * sizeof(int));
 
-            /* Triality pairing tables:
-             * Each view defines 3 antipodal pairs from the 6-element group */
-            static const int TRI_PAIRS[3][3][2] = {
-                {{0,3}, {1,4}, {2,5}},  /* Edge:     (k, k+3) */
-                {{0,2}, {1,3}, {4,5}},  /* Vertex:   DFT₆ frequency pairs */
-                {{0,4}, {1,5}, {2,3}}   /* Diagonal: conjugate pairs */
-            };
-
+            /* Process groups: [0..5], [6..11], tail [12..15] handled by D₆ metric on available pairs */
             for (int g = 0; g < 2; g++) {
                 int g_off = g * 6;
                 if (g_off + 5 >= 16) break;
 
-                /* Precompute importance weights for this group */
-                float imp[6];
-                for (int kk = 0; kk < 6; kk++) {
-                    imp[kk] = (imat_importance) ?
-                              imat_importance[blk * QK_K + 16*j + g_off + kk] : 1.0f;
-                }
-
-                for (int pass = 0; pass < 64; pass++) {  /* run until convergence */
+                /* Multiple greedy passes — each pass finds the single best flip */
+                for (int pass = 0; pass < 6; pass++) {
                     int best_k = -1;
                     int best_q_alt = 0;
-                    float best_delta = 0.0f;
+                    float best_delta = 0.0f;  /* improvement = current_metric - alt_metric */
 
+                    /* Compute current group errors */
                     float e_cur[6];
                     for (int kk = 0; kk < 6; kk++) {
                         int ii = g_off + kk;
@@ -2761,30 +2746,21 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         e_cur[kk] = block_x[16*j+ii] - deq;
                     }
 
-                    /* Triality metric: geometric mean of 3 view metrics */
-                    float dc_cur = 0.0f;
-                    for (int kk = 0; kk < 6; kk++) dc_cur += imp[kk] * e_cur[kk];
-                    float dc2_cur = dc_cur * dc_cur;
-
-                    float view_metrics_cur[3];
-                    for (int view = 0; view < 3; view++) {
-                        float vesica = 0.0f;
-                        for (int p = 0; p < 3; p++) {
-                            int a = TRI_PAIRS[view][p][0];
-                            int b = TRI_PAIRS[view][p][1];
-                            float v = imp[a]*e_cur[a] + imp[b]*e_cur[b];
-                            vesica += v * v;
-                        }
-                        view_metrics_cur[view] = 4.0f * vesica + dc2_cur;
+                    /* Current D₆ metric: vesica energy + DC² */
+                    float vesica_cur = 0.0f, dc_cur = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        float v = e_cur[p] + e_cur[p+3];
+                        vesica_cur += v * v;
                     }
-                    float metric_cur = cbrtf(view_metrics_cur[0] *
-                                             view_metrics_cur[1] *
-                                             view_metrics_cur[2]);
+                    for (int kk = 0; kk < 6; kk++) dc_cur += e_cur[kk];
+                    float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
 
+                    /* Try flipping each element */
                     for (int k = 0; k < 6; k++) {
                         int idx = g_off + k;
                         int q_cur = q_shaped[idx];
 
+                        /* Try the alternative rounding */
                         int q_try;
                         if (q_cont[idx] - (float)q_cur >= 0) {
                             q_try = q_cur + 1;
@@ -2793,98 +2769,19 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         }
                         if (q_try < 0 || q_try > 3) continue;
 
+                        /* Compute alt errors (only element k changes) */
                         float e_alt[6];
                         for (int kk = 0; kk < 6; kk++) e_alt[kk] = e_cur[kk];
                         float deq_try = d * (float)q_try - m;
                         e_alt[k] = block_x[16*j+idx] - deq_try;
 
-                        float dc_alt = 0.0f;
-                        for (int kk = 0; kk < 6; kk++) dc_alt += imp[kk] * e_alt[kk];
-                        float dc2_alt = dc_alt * dc_alt;
-
-                        float view_metrics_alt[3];
-                        for (int view = 0; view < 3; view++) {
-                            float vesica = 0.0f;
-                            for (int p = 0; p < 3; p++) {
-                                int a = TRI_PAIRS[view][p][0];
-                                int b = TRI_PAIRS[view][p][1];
-                                float v = imp[a]*e_alt[a] + imp[b]*e_alt[b];
-                                vesica += v * v;
-                            }
-                            view_metrics_alt[view] = 4.0f * vesica + dc2_alt;
-                        }
-                        float metric_alt = cbrtf(view_metrics_alt[0] *
-                                                 view_metrics_alt[1] *
-                                                 view_metrics_alt[2]);
-
-                        float delta = metric_cur - metric_alt;
-                        if (delta > best_delta) {
-                            best_delta = delta;
-                            best_k = k;
-                            best_q_alt = q_try;
-                        }
-                    }
-
-                    if (best_k < 0) break;
-                    q_shaped[g_off + best_k] = best_q_alt;
-                }
-            }
-
-            /* ── Tail group: elements 12-15 (4 elements) ──
-             * Can't do full D₆ fold on 4 elements, but we can do
-             * paired antipodal shaping: pairs (12,14) and (13,15).
-             * Minimize sum-error (vesica-like) for each pair. */
-            {
-                int tail_off = 12;
-                float imp_tail[4];
-                for (int kk = 0; kk < 4; kk++) {
-                    imp_tail[kk] = (imat_importance) ?
-                                   imat_importance[blk * QK_K + 16*j + tail_off + kk] : 1.0f;
-                }
-
-                for (int pass = 0; pass < 64; pass++) {  /* run until convergence */
-                    int best_k = -1;
-                    int best_q_alt = 0;
-                    float best_delta = 0.0f;
-
-                    float e_tail[4];
-                    for (int kk = 0; kk < 4; kk++) {
-                        int ii = tail_off + kk;
-                        float deq = d * (float)q_shaped[ii] - m;
-                        e_tail[kk] = block_x[16*j+ii] - deq;
-                    }
-
-                    /* Paired vesica: (0,2) and (1,3) */
-                    float vesica_cur = 0.0f, dc_cur = 0.0f;
-                    for (int p = 0; p < 2; p++) {
-                        float v = imp_tail[p]*e_tail[p] + imp_tail[p+2]*e_tail[p+2];
-                        vesica_cur += v * v;
-                    }
-                    for (int kk = 0; kk < 4; kk++) dc_cur += imp_tail[kk] * e_tail[kk];
-                    float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
-
-                    for (int k = 0; k < 4; k++) {
-                        int idx = tail_off + k;
-                        int q_cur = q_shaped[idx];
-                        int q_try;
-                        if (q_cont[idx] - (float)q_cur >= 0) {
-                            q_try = q_cur + 1;
-                        } else {
-                            q_try = q_cur - 1;
-                        }
-                        if (q_try < 0 || q_try > 3) continue;
-
-                        float e_alt[4];
-                        for (int kk = 0; kk < 4; kk++) e_alt[kk] = e_tail[kk];
-                        float deq_try = d * (float)q_try - m;
-                        e_alt[k] = block_x[16*j+idx] - deq_try;
-
+                        /* Alt D₆ metric */
                         float vesica_alt = 0.0f, dc_alt = 0.0f;
-                        for (int p = 0; p < 2; p++) {
-                            float v = imp_tail[p]*e_alt[p] + imp_tail[p+2]*e_alt[p+2];
+                        for (int p = 0; p < 3; p++) {
+                            float v = e_alt[p] + e_alt[p+3];
                             vesica_alt += v * v;
                         }
-                        for (int kk = 0; kk < 4; kk++) dc_alt += imp_tail[kk] * e_alt[kk];
+                        for (int kk = 0; kk < 6; kk++) dc_alt += e_alt[kk];
                         float metric_alt = 4.0f * vesica_alt + dc_alt * dc_alt;
 
                         float delta = metric_cur - metric_alt;
@@ -2895,8 +2792,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         }
                     }
 
-                    if (best_k < 0) break;
-                    q_shaped[tail_off + best_k] = best_q_alt;
+                    if (best_k < 0) break;  /* no improvement found */
+                    q_shaped[g_off + best_k] = best_q_alt;  /* commit the flip */
                 }
             }
 
