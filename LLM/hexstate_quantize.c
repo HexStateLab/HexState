@@ -1292,15 +1292,33 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
             float err = 0.0f;
 
-            for (int j = 0; j < QK4_0; j++) {
-                float x = bw[j];
-                int q = (int)(x * id + 8.5f);
-                if (q < 0) q = 0; if (q > 15) q = 15;
-                float deq = ((float)q - 8.0f) * actual_d;
-                float diff = x - deq;
-                float w = (imat_importance) ?
-                          imat_importance[blk * QK4_0 + j] : 1.0f;
-                err += diff * diff * w;
+            for (int j = 0; j < QK4_0; j += 6) {
+                int g_len = (j + 6 <= QK4_0) ? 6 : (QK4_0 - j);
+                int half_g = g_len / 2;
+                float e_cur[6], w_cur[6];
+                
+                for (int kk = 0; kk < g_len; kk++) {
+                    int idx = j + kk;
+                    float x = bw[idx];
+                    int q = (int)(x * id + 8.5f);
+                    if (q < 0) q = 0; if (q > 15) q = 15;
+                    float deq = ((float)q - 8.0f) * actual_d;
+                    e_cur[kk] = x - deq;
+                    w_cur[kk] = (imat_importance) ? imat_importance[blk * QK4_0 + idx] : 1.0f;
+                }
+                
+                /* Decompose into vesica (DC) and wave (AC) components */
+                float vesica_err = 0.0f, wave_err = 0.0f;
+                for (int p = 0; p < half_g; p++) {
+                    float v = e_cur[p] + e_cur[p + half_g];
+                    float w_wave = e_cur[p] - e_cur[p + half_g];
+                    float w_avg = (w_cur[p] + w_cur[p + half_g]) * 0.5f;
+                    vesica_err += v * v * w_avg;
+                    wave_err += w_wave * w_wave * w_avg;
+                }
+                /* Triality weighting: penalize vesica 4×, wave 1×.
+                 * Factor of 0.5 keeps scale consistent with standard MSE. */
+                err += 0.5f * (4.0f * vesica_err + 1.0f * wave_err);
             }
             cand_errors[blk][ci] = err;
         }
@@ -2032,15 +2050,32 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         }
                         continue;
                     }
-                    for (int k = 0; k < 16; k++) {
-                        float x = block_x[16 * j + k];
-                        int q = gguf_nearest_int((x + m) / d);
-                        if (q < 0) q = 0; if (q > 3) q = 3;
-                        float deq = d * (float)q - m;
-                        float diff = x - deq;
-                        float w = (imat_importance) ?
-                                  imat_importance[blk * QK_K + 16 * j + k] : 1.0f;
-                        err += diff * diff * w;
+                    for (int k = 0; k < 16; k += 6) {
+                        int g_len = (k + 6 <= 16) ? 6 : (16 - k);
+                        int half_g = g_len / 2;
+                        float e_cur[6], w_cur[6];
+                        
+                        for (int kk = 0; kk < g_len; kk++) {
+                            int idx = 16 * j + k + kk;
+                            float x = block_x[idx];
+                            int q = gguf_nearest_int((x + m) / d);
+                            if (q < 0) q = 0; if (q > 3) q = 3;
+                            float deq = d * (float)q - m;
+                            e_cur[kk] = x - deq;
+                            w_cur[kk] = (imat_importance) ? imat_importance[blk * QK_K + idx] : 1.0f;
+                        }
+                        
+                        /* Decompose into vesica and wave */
+                        float vesica_err = 0.0f, wave_err = 0.0f;
+                        for (int p = 0; p < half_g; p++) {
+                            float v = e_cur[p] + e_cur[p + half_g];
+                            float w_wave = e_cur[p] - e_cur[p + half_g];
+                            float w_avg = (w_cur[p] + w_cur[p + half_g]) * 0.5f;
+                            vesica_err += v * v * w_avg;
+                            wave_err += w_wave * w_wave * w_avg;
+                        }
+                        /* Triality weighting: penalize vesica 4×, wave 1× */
+                        err += 0.5f * (4.0f * vesica_err + 1.0f * wave_err);
                     }
                 }
                 candidate_errors[blk][cidx] = err;
