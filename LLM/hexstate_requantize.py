@@ -82,6 +82,17 @@ def _load_hexstate_lib():
                 ctypes.c_int,                     # verbose
             ]
 
+        # Weight analog export
+        if hasattr(lib, 'hexstate_weight_analog'):
+            lib.hexstate_weight_analog.restype = ctypes.c_int
+            lib.hexstate_weight_analog.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # raw_weights
+                ctypes.POINTER(ctypes.c_float),  # alt_weights (output)
+                ctypes.c_int,                    # n_weights
+                ctypes.c_int,                    # group_size
+                ctypes.c_int,                    # bp_iters
+            ]
+
         lib.hexstate_init()
         _HEXSTATE_LIB = lib
         return lib
@@ -1018,7 +1029,26 @@ def main():
                             ctypes.c_int(0),  # verbose
                         )
                         fout.write(output_buf.tobytes())
-                        print(f"\n  [Q4_0·HPC] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e}")
+
+                        # Analog self-consistency RMSE
+                        try:
+                            alt_w = np.zeros(n_el, dtype=np.float32)
+                            _HEXSTATE_LIB.hexstate_weight_analog(
+                                f32_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                alt_w.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                ctypes.c_int(n_el), ctypes.c_int(6), ctypes.c_int(30),
+                            )
+                            deq = np.frombuffer(output_buf, dtype=np.uint8).reshape(-1, 18)
+                            d_fp16 = deq[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1, 1)
+                            qs = deq[:, 2:]
+                            q_lo = (qs & 0xF).astype(np.float32)
+                            q_hi = (qs >> 4).astype(np.float32)
+                            deq_f32 = ((np.concatenate([q_lo, q_hi], axis=1) - 8.0) * d_fp16).reshape(-1)
+                            analog_rmse = np.sqrt(np.mean((alt_w[:len(deq_f32)] - deq_f32) ** 2))
+                            orig_rmse = np.sqrt(error.value / ti['n_elements'])
+                            print(f"\n  [Q4_0·HPC] {ti['name']} RMSE(orig)={orig_rmse:.6e} RMSE(analog)={analog_rmse:.6e}")
+                        except Exception as e:
+                            print(f"\n  [Q4_0·HPC] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e} (analog err: {e})")
                     else:
                         # Vectorized Q4_0: process all blocks at once
                         blocks = f32.reshape(-1, 32)
@@ -1113,10 +1143,11 @@ def main():
                         n_blocks = n_el // QK_K
                     fout.write(q2k_data)
 
-                    # ── Compute and report exact per-tensor RMSE ──
+                    # ── Compute and report RMSE (both orig and analog) ──
                     try:
-                        CHUNK_BLK = 100_000  # blocks per chunk to bound memory
-                        total_se = 0.0
+                        CHUNK_BLK = 100_000
+                        total_se_orig = 0.0
+                        total_se_analog = 0.0
                         total_n = 0
                         for ci in range(0, n_blocks, CHUNK_BLK):
                             ce = min(ci + CHUNK_BLK, n_blocks)
@@ -1124,15 +1155,31 @@ def main():
                             deq_chunk = dequant_q2k_fast(chunk_q, ce - ci)
                             orig_chunk = f32[ci*QK_K:ce*QK_K]
                             n_valid = min(len(orig_chunk), len(deq_chunk))
-                            diff = orig_chunk[:n_valid] - deq_chunk[:n_valid]
-                            total_se += np.sum(diff ** 2)
+
+                            # Orig RMSE
+                            diff_orig = orig_chunk[:n_valid] - deq_chunk[:n_valid]
+                            total_se_orig += np.sum(diff_orig ** 2)
+
+                            # Analog RMSE
+                            alt_chunk = np.zeros(n_valid, dtype=np.float32)
+                            f32_seg = np.ascontiguousarray(orig_chunk[:n_valid], dtype=np.float32)
+                            _HEXSTATE_LIB.hexstate_weight_analog(
+                                f32_seg.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                alt_chunk.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                ctypes.c_int(n_valid), ctypes.c_int(6), ctypes.c_int(30),
+                            )
+                            diff_analog = alt_chunk - deq_chunk[:n_valid]
+                            total_se_analog += np.sum(diff_analog ** 2)
                             total_n += n_valid
-                        tensor_rmse = np.sqrt(total_se / max(total_n, 1))
-                        q2k_rmse_sum += tensor_rmse
+
+                        rmse_orig = np.sqrt(total_se_orig / max(total_n, 1))
+                        rmse_analog = np.sqrt(total_se_analog / max(total_n, 1))
+                        q2k_rmse_sum += rmse_orig
                         q2k_tensor_count += 1
-                        print(f"\n  [Q2_K] {ti['name'][:55]}  RMSE={tensor_rmse:.6e}")
+                        print(f"\n  [Q2_K] {ti['name'][:55]}  RMSE(orig)={rmse_orig:.6e} RMSE(analog)={rmse_analog:.6e}")
                     except Exception as e:
                         print(f"\n  [Q2_K] {ti['name'][:55]}  RMSE=err({e})")
+
 
                     quant_count += 1
                     total_quant_bytes += len(q2k_data)
