@@ -1257,6 +1257,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
     uint16_t (*cand_d16)[Q4_N_CAND] = (uint16_t (*)[Q4_N_CAND])
         calloc(n_blocks, sizeof(uint16_t[Q4_N_CAND]));
 
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *bw = weights + blk * QK4_0;
 
@@ -1313,7 +1314,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
     if (n_blocks >= 2) {
         float temperature = 0.5f;
-        int64_t graph_blocks = (n_blocks > 200) ? 200 : n_blocks;
+        int64_t graph_blocks = (n_blocks > 2000) ? 2000 : n_blocks;
         int64_t stride = n_blocks / graph_blocks;
         int64_t n_sites = graph_blocks;  /* 1 quhit per block */
 
@@ -1451,17 +1452,36 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                     }
                 }
 
+                /* Partial sort: partition to find top-K in O(N) average.
+                 * Use a single partitioning pass: maintain a min-heap of
+                 * size K, then any element > heap-min gets swapped in. */
                 int top_k = (n_ext < Q4_N_BEAMS) ? n_ext : Q4_N_BEAMS;
                 int top_indices[Q4_N_BEAMS];
-                for (int k = 0; k < top_k; k++) {
-                    int best = -1; double best_s = -1e30;
-                    for (int e = 0; e < n_ext; e++) {
-                        if (extensions[e].score > best_s) {
-                            best_s = extensions[e].score; best = e;
+                /* Seed heap with first top_k elements */
+                for (int k = 0; k < top_k; k++) top_indices[k] = k;
+                /* Find the minimum score in top_indices (heap-min) */
+                int heap_min_pos = 0;
+                double heap_min_s = extensions[top_indices[0]].score;
+                for (int k = 1; k < top_k; k++) {
+                    if (extensions[top_indices[k]].score < heap_min_s) {
+                        heap_min_s = extensions[top_indices[k]].score;
+                        heap_min_pos = k;
+                    }
+                }
+                /* Scan remaining: replace heap-min if current > heap-min */
+                for (int e = top_k; e < n_ext; e++) {
+                    if (extensions[e].score > heap_min_s) {
+                        top_indices[heap_min_pos] = e;
+                        /* Recompute heap min */
+                        heap_min_s = extensions[top_indices[0]].score;
+                        heap_min_pos = 0;
+                        for (int k = 1; k < top_k; k++) {
+                            if (extensions[top_indices[k]].score < heap_min_s) {
+                                heap_min_s = extensions[top_indices[k]].score;
+                                heap_min_pos = k;
+                            }
                         }
                     }
-                    top_indices[k] = best;
-                    extensions[best].score = -2e30;
                 }
 
                 Q4Beam new_beams[Q4_N_BEAMS];
@@ -1558,8 +1578,8 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                             }
                         }
 
-                        shot_assignment[gi] = best_bin_cand;
-                        shot_err += cand_errors[gi][best_bin_cand];
+                        shot_assignment[blk] = best_bin_cand;
+                        shot_err += cand_errors[blk][best_bin_cand];
                     }
 
                     /* Metropolis acceptance: adopt if better than current best */
@@ -1785,7 +1805,7 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         }
         int *q_final = (err_shaped <= err_base * 1.05f) ? q_shaped : q_base;
 
-        /* Pack nibbles and compute error */
+        /* Pack nibbles and compute importance-weighted error */
         for (int j = 0; j < QK4_0 / 2; j++) {
             int q0 = q_final[j];
             int q1 = q_final[j + QK4_0/2];
@@ -1793,7 +1813,10 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
             float deq0 = ((float)q0 - 8.0f) * actual_d;
             float deq1 = ((float)q1 - 8.0f) * actual_d;
-            total_err += (bw[j] - deq0) * (bw[j] - deq0) + (bw[j + QK4_0/2] - deq1) * (bw[j + QK4_0/2] - deq1);
+            float w0 = (imat_importance) ? imat_importance[blk * QK4_0 + j] : 1.0f;
+            float w1 = (imat_importance) ? imat_importance[blk * QK4_0 + j + QK4_0/2] : 1.0f;
+            total_err += (bw[j] - deq0) * (bw[j] - deq0) * w0
+                       + (bw[j + QK4_0/2] - deq1) * (bw[j + QK4_0/2] - deq1) * w1;
         }
     }
 
@@ -2057,13 +2080,13 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
      * (d, dmin) per block.
      * ══════════════════════════════════════════════════════════════════ */
 
-    /* Default: use greedy candidate (index 5*10+5 = 55, mult 1.00×1.00) */
+    /* Default: use nearest-to-1.0 candidate (NEIGHBOR_MULTS[8]=0.995, [9]=1.005) */
     int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
     for (int64_t i = 0; i < n_blocks; i++)
-        best_candidate[i] = 10 * N_CAND_M + 10;  /* NEIGHBOR_MULTS_D[10]=1.00, _M[10]=1.00 */
+        best_candidate[i] = 8 * N_CAND_M + 8;  /* NEIGHBOR_MULTS_D[8]=0.995, _M[8]=0.995 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
-        int64_t graph_blocks = (n_blocks > 2000) ? 2000 : n_blocks;
+        int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
         int64_t stride = n_blocks / graph_blocks;
         float temperature = 0.5f;
         int64_t n_sites = graph_blocks * QUHITS_PER_BLOCK;
@@ -2274,7 +2297,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     }
                 }
 
-                /* Extend beams × 36 candidates, keep top K */
+                /* Extend beams × 256 candidates, keep top K */
                 typedef struct { double score; int beam_idx; int cand_idx; } BeamExt;
                 BeamExt extensions[N_BEAMS * TOTAL_SCALE_CANDIDATES];
                 int n_ext = 0;
@@ -2291,20 +2314,32 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     }
                 }
 
-                /* Top-K selection */
+                /* Partial-sort top-K selection: O(N) average via min-tracking.
+                 * Maintain the K best indices; scan once, replacing the
+                 * current minimum whenever a better candidate appears. */
                 int top_k = (n_ext < N_BEAMS) ? n_ext : N_BEAMS;
                 int top_indices[N_BEAMS];
-                for (int k = 0; k < top_k; k++) {
-                    int best = -1;
-                    double best_s = -1e30;
-                    for (int e = 0; e < n_ext; e++) {
-                        if (extensions[e].score > best_s) {
-                            best_s = extensions[e].score;
-                            best = e;
+                for (int k = 0; k < top_k; k++) top_indices[k] = k;
+                int heap_min_pos = 0;
+                double heap_min_s = extensions[top_indices[0]].score;
+                for (int k = 1; k < top_k; k++) {
+                    if (extensions[top_indices[k]].score < heap_min_s) {
+                        heap_min_s = extensions[top_indices[k]].score;
+                        heap_min_pos = k;
+                    }
+                }
+                for (int e = top_k; e < n_ext; e++) {
+                    if (extensions[e].score > heap_min_s) {
+                        top_indices[heap_min_pos] = e;
+                        heap_min_s = extensions[top_indices[0]].score;
+                        heap_min_pos = 0;
+                        for (int k = 1; k < top_k; k++) {
+                            if (extensions[top_indices[k]].score < heap_min_s) {
+                                heap_min_s = extensions[top_indices[k]].score;
+                                heap_min_pos = k;
+                            }
                         }
                     }
-                    top_indices[k] = best;
-                    extensions[best].score = -2e30;  /* poison */
                 }
 
                 /* Build new beams from top-K extensions using backpointers */
@@ -2338,7 +2373,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     curr_hist = history[curr_hist].parent_idx;
                 } else {
                     for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
-                        best_candidate[b] = 10 * N_CAND_M + 10;
+                        best_candidate[b] = 8 * N_CAND_M + 8;
                 }
             }
 
@@ -2411,8 +2446,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             }
                         }
 
-                        shot_assignment[gi] = best_bin_cand;
-                        shot_err += candidate_errors[gi][best_bin_cand];
+                        shot_assignment[blk] = best_bin_cand;
+                        shot_err += candidate_errors[blk][best_bin_cand];
                     }
 
                     if (shot_err < beam_total_err) {
@@ -2515,6 +2550,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             float deq = d_sub * (float)q - m_sub;
                             float diff = x - deq;
                             sub_err += diff * diff * w;
+                            if (sub_err >= best_sub_err) goto next_lm_iter;
                         }
 
                         if (sub_err < best_sub_err) {
@@ -2523,6 +2559,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             best_lm = (uint8_t)try_lm;
                             if (sub_err < 1e-10f) goto done_sub;
                         }
+                        next_lm_iter:;
                     }
                 }
                 done_sub:;
@@ -2658,12 +2695,14 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                         float deq = d_sub * (float)q - m_sub;
                         float diff = x - deq;
                         sub_err += diff * diff * w;
+                        if (sub_err >= best_sub_err) goto next_lm_final;
                     }
                     if (sub_err < best_sub_err) {
                         best_sub_err = sub_err;
                         best_ls = (uint8_t)try_ls;
                         best_lm = (uint8_t)try_lm;
                     }
+                    next_lm_final:;
                 }
             }
             Ls_blk[j] = best_ls;
