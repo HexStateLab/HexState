@@ -2086,7 +2086,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         best_candidate[i] = 8 * N_CAND_M + 8;  /* NEIGHBOR_MULTS_D[8]=0.995, _M[8]=0.995 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
-        int64_t graph_blocks = (n_blocks > 8192) ? 8192 : n_blocks;
+        int64_t graph_blocks = (n_blocks > 2000) ? 2000 : n_blocks;
         int64_t stride = n_blocks / graph_blocks;
         float temperature = 0.5f;
         int64_t n_sites = graph_blocks * QUHITS_PER_BLOCK;
