@@ -1039,136 +1039,6 @@ static float hpc_make_qp_quants(int n, int nmax, const float *x,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * HPC WEIGHT ANALOG — Alternate Weight Derivation via Möbius BP
- *
- * The HPC graph derives ALTERNATE weight values from the originals.
- * These alternates preserve structural correlations (CZ phase coherence)
- * but may land closer to quantization grid points, producing lower RMSE.
- *
- * Architecture:
- *   1. Encode groups of weights as D=6 site amplitudes (normalized)
- *   2. Connect adjacent groups with CZ edges (vesica correlation)
- *   3. Run Möbius BP → dressed amplitudes incorporate cross-group coherence
- *   4. Rescale dressed amplitudes to original magnitude → alternate weights
- *   5. Quantize the alternates with nearest_int()
- *
- * The vesica fold structure is baked into the graph topology — no post-hoc
- * greedy flipping needed. The "parallel reality" weights ARE the targets.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Forward declaration — defined below */
-static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int seed, int max_iter);
-
-/**
- * hpc_weight_analog() — Derive alternate weight values via HPC reconstruction.
- *
- * Groups of 6 weights → D=6 site amplitudes.  CZ edges between adjacent
- * groups encode vesica correlation structure.  BP dressed amplitudes =
- * the "parallel reality" weights — structurally coherent alternates.
- *
- * Extraction: |dressed[v]| × sign(original[v]) × norm_scale.
- */
-static int hpc_weight_analog(const float *raw_weights, float *alt_weights,
-                             int n_weights, int group_size, int bp_iters)
-{
-    int n_full = n_weights / group_size;
-    int tail   = n_weights % group_size;
-    int n_sites = n_full + (tail > 0 ? 1 : 0);
-
-    if (n_sites < 2) {
-        for (int k = 0; k < n_weights; k++)
-            alt_weights[k] = raw_weights[k];
-        return 0;
-    }
-
-    HPCGraph *wg = hpc_create(n_sites);
-    if (!wg) {
-        for (int k = 0; k < n_weights; k++)
-            alt_weights[k] = raw_weights[k];
-        return 0;
-    }
-
-    double site_orig_norm[16];
-
-    for (int s = 0; s < n_sites; s++) {
-        int offset = s * group_size;
-        int n_vals = (s < n_full) ? group_size : tail;
-        double norm_sq = 0.0;
-
-        triality_dft(&wg->locals[s]);
-
-        for (int v = 0; v < 6; v++) {
-            if (v < n_vals) {
-                wg->locals[s].edge_re[v] = (double)raw_weights[offset + v];
-                wg->locals[s].edge_im[v] = 0.0;
-                norm_sq += (double)raw_weights[offset + v] *
-                           (double)raw_weights[offset + v];
-            } else {
-                wg->locals[s].edge_re[v] = 0.0;
-                wg->locals[s].edge_im[v] = 0.0;
-            }
-        }
-
-        site_orig_norm[s] = norm_sq;
-
-        if (norm_sq > 1e-30) {
-            double inv = 1.0 / sqrt(norm_sq);
-            for (int v = 0; v < 6; v++) {
-                wg->locals[s].edge_re[v] *= inv;
-                wg->locals[s].edge_im[v] *= inv;
-            }
-        }
-
-        wg->locals[s].primary = VIEW_EDGE;
-        wg->locals[s].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
-        wg->locals[s].delta_valid = 0;
-        triality_update_mask(&wg->locals[s]);
-    }
-
-    for (int s = 0; s < n_sites - 1; s++)
-        hpc_cz(wg, s, s + 1);
-
-    MobiusAmplitudeSheet *wmob = mobius_create(wg);
-    if (!wmob) {
-        hpc_destroy(wg);
-        for (int k = 0; k < n_weights; k++)
-            alt_weights[k] = raw_weights[k];
-        return 0;
-    }
-
-    z6_complex_amplitude_bp(wmob, 0, bp_iters);
-
-    for (int s = 0; s < n_sites; s++) {
-        int offset = s * group_size;
-        int n_vals = (s < n_full) ? group_size : tail;
-
-        double d_norm_sq = 0.0;
-        for (int v = 0; v < n_vals; v++) {
-            double re = wmob->sheets[s].dressed_re[v];
-            double im = wmob->sheets[s].dressed_im[v];
-            d_norm_sq += re * re + im * im;
-        }
-
-        double scale = (d_norm_sq > 1e-30)
-                      ? sqrt(site_orig_norm[s] / d_norm_sq)
-                      : 0.0;
-
-        for (int v = 0; v < n_vals; v++) {
-            double re = wmob->sheets[s].dressed_re[v];
-            double im = wmob->sheets[s].dressed_im[v];
-            double mag = sqrt(re * re + im * im) * scale;
-            double sign = (raw_weights[offset + v] >= 0.0f) ? 1.0 : -1.0;
-            alt_weights[offset + v] = (float)(mag * sign);
-        }
-    }
-
-    mobius_destroy(wmob);
-    hpc_destroy(wg);
-    return 1;
-}
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * COMPLEX AMPLITUDE BELIEF PROPAGATION
  * (Ported from tesseract_factor.c for cross-block scale optimization)
  *
@@ -1755,11 +1625,14 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         /* Start from the grid-selected scale (the "assembled frequency") */
         float d_current = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
 
-        /* Analog assembly: iterate to full convergence.
-         * 5 iterations for stable (d, q-values) coupling. */
-        for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
-            if (d_current < 1e-15f) break;
-            float id = 1.0f / d_current;
+        /* WLS iterate: stay in FP32 throughout all iterations to avoid
+         * a stable FP16 cycle that prevents converging to the true minimum.
+         * Only snap to FP16 once after all iterations complete. */
+        float d_fp32 = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
+        float d_seed = d_fp32;
+        for (int ls_iter = 0; ls_iter < 8; ls_iter++) {
+            if (d_fp32 < 1e-15f) break;
+            float id = 1.0f / d_fp32;
 
             /* Quantize at current scale */
             int qs_tmp[QK4_0];
@@ -1782,14 +1655,13 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
 
             if (den > 1e-15f) {
                 float d_new = num / den;
-                /* Clamp magnitude to prevent runaway (Q4_0 d can be negative) */
-                float d_seed = gguf_fp16_to_fp32(cand_d16[blk][cidx]);
-                if (fabsf(d_new) < 4.0f * (fabsf(d_seed) + 1e-10f)) {
-                    uint16_t d16 = gguf_fp32_to_fp16(d_new);
-                    d_current = gguf_fp16_to_fp32(d16);
-                }
+                /* Clamp magnitude to prevent runaway */
+                if (fabsf(d_new) < 4.0f * (fabsf(d_seed) + 1e-10f))
+                    d_fp32 = d_new;  /* stay FP32 — no round-trip each iter */
             }
         }
+        /* Single FP16 snap after convergence */
+        d_current = gguf_fp16_to_fp32(gguf_fp32_to_fp16(d_fp32));
 
         /* ── FP16 ULP neighborhood search + sign-flip exploration ──
          * The WLS solve found the continuous-optimal d. But FP16 truncation
@@ -1839,50 +1711,100 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
         float actual_d = d_current;
         float id = (fabsf(actual_d) > 1e-15f) ? 1.0f / actual_d : 0.0f;
 
-        /* ── HPC Weight Analog for Q4_0 ──
-         * 32 elements per block → 5 full D₆ sites (6 each) + 1 tail (2).
-         * CZ edges between adjacent sites. BP dressed amplitudes =
-         * alternate weights. Quantize alternates with nearest_int(). */
+        /* ── D₆ Hadamard Error Shaping for Q4_0 ──
+         * 32 elements per block = 5 full D₆ groups of 6 + 2 tail.
+         * Apply the same antipodal fold as Q2_K: minimize vesica energy
+         * to push quantization noise into wave (high-frequency) modes
+         * that cancel in dot products. */
 
         /* Step 1: Standard nearest-rounding as baseline */
-        int q_base[QK4_0], q_analog[QK4_0];
+        int q_base[QK4_0], q_shaped[QK4_0];
+        float q_cont[QK4_0];
         for (int j = 0; j < QK4_0; j++) {
-            float q_cont = bw[j] * id + 8.0f;
-            q_base[j] = (int)(q_cont + 0.5f);
+            q_cont[j] = bw[j] * id + 8.0f;
+            q_base[j] = (int)(q_cont[j] + 0.5f);
             if (q_base[j] < 0) q_base[j] = 0;
             if (q_base[j] > 15) q_base[j] = 15;
         }
+        memcpy(q_shaped, q_base, QK4_0 * sizeof(int));
 
-        /* Step 2: HPC Weight Analog — derive alternate weights */
-        float alt_weights[QK4_0];
-        int analog_ok = hpc_weight_analog(bw, alt_weights, QK4_0, 6, 30);
+        /* Step 2: D₆ greedy flipping on 5 groups of 6 */
+        for (int g = 0; g < 5; g++) {
+            int g_off = g * 6;
 
-        if (analog_ok) {
-            for (int j = 0; j < QK4_0; j++) {
-                float q_cont = alt_weights[j] * id + 8.0f;
-                q_analog[j] = (int)(q_cont + 0.5f);
-                if (q_analog[j] < 0) q_analog[j] = 0;
-                if (q_analog[j] > 15) q_analog[j] = 15;
+            for (int pass = 0; pass < 6; pass++) {
+                int best_k = -1;
+                int best_q_alt = 0;
+                float best_delta = 0.0f;
+
+                /* Current group errors */
+                float e_cur[6];
+                for (int kk = 0; kk < 6; kk++) {
+                    float deq = ((float)q_shaped[g_off+kk] - 8.0f) * actual_d;
+                    e_cur[kk] = bw[g_off+kk] - deq;
+                }
+
+                /* Current D₆ metric: vesica energy + DC² */
+                float vesica_cur = 0.0f, dc_cur = 0.0f;
+                for (int p = 0; p < 3; p++) {
+                    float v = e_cur[p] + e_cur[p+3];
+                    vesica_cur += v * v;
+                }
+                for (int kk = 0; kk < 6; kk++) dc_cur += e_cur[kk];
+                float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
+
+                /* Try flipping each element */
+                for (int k = 0; k < 6; k++) {
+                    int idx = g_off + k;
+                    int q_cur = q_shaped[idx];
+
+                    int q_try;
+                    if (q_cont[idx] - (float)q_cur >= 0) {
+                        q_try = q_cur + 1;
+                    } else {
+                        q_try = q_cur - 1;
+                    }
+                    if (q_try < 0 || q_try > 15) continue;
+
+                    /* Alt errors */
+                    float e_alt[6];
+                    for (int kk = 0; kk < 6; kk++) e_alt[kk] = e_cur[kk];
+                    float deq_try = ((float)q_try - 8.0f) * actual_d;
+                    e_alt[k] = bw[idx] - deq_try;
+
+                    /* Alt D₆ metric */
+                    float vesica_alt = 0.0f, dc_alt = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        float v = e_alt[p] + e_alt[p+3];
+                        vesica_alt += v * v;
+                    }
+                    for (int kk = 0; kk < 6; kk++) dc_alt += e_alt[kk];
+                    float metric_alt = 4.0f * vesica_alt + dc_alt * dc_alt;
+
+                    float delta = metric_cur - metric_alt;
+                    if (delta > best_delta) {
+                        best_delta = delta;
+                        best_k = k;
+                        best_q_alt = q_try;
+                    }
+                }
+
+                if (best_k < 0) break;
+                q_shaped[g_off + best_k] = best_q_alt;
             }
         }
 
-        /* Step 3: Each path measures error relative to its OWN reality.
-         * Baseline: |raw - dequant(quantize(raw))|²
-         * Analog:   |analog - dequant(quantize(analog))|²
-         * The analog is a parallel weight system — its error is self-referential. */
-        float err_base = 0.0f, err_analog = 0.0f;
+        /* Step 3: Error comparison — keep shaped only if it strictly improves MSE.
+         * Both paths measured against raw weights (bw), same ground truth. */
+        float err_base = 0.0f, err_shaped = 0.0f;
         for (int j = 0; j < QK4_0; j++) {
             float w = (imat_importance) ? imat_importance[blk * QK4_0 + j] : 1.0f;
             float deq_b = ((float)q_base[j] - 8.0f) * actual_d;
+            float deq_s = ((float)q_shaped[j] - 8.0f) * actual_d;
             err_base += (bw[j] - deq_b) * (bw[j] - deq_b) * w;
-            if (analog_ok) {
-                float deq_a = ((float)q_analog[j] - 8.0f) * actual_d;
-                err_analog += (alt_weights[j] - deq_a) * (alt_weights[j] - deq_a) * w;
-            }
+            err_shaped += (bw[j] - deq_s) * (bw[j] - deq_s) * w;
         }
-        int *q_final = q_base;
-        if (analog_ok && err_analog < err_base)
-            q_final = q_analog;
+        int *q_final = (err_shaped < err_base) ? q_shaped : q_base;
 
         /* Pack nibbles and compute error */
         for (int j = 0; j < QK4_0 / 2; j++) {
@@ -2905,49 +2827,102 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 if (q_base[k] > 3) q_base[k] = 3;
             }
 
-            /* Step 2: HPC Weight Analog — Derive alternate weights via BP
+            /* Step 2: D₆ Hadamard Error Shaping
+             * For each 6-element group, greedily flip the rounding decision
+             * that most reduces the D₆-folded vesica error component.
              *
-             * Build an HPC graph where each group of 6 weights is a site.
-             * CZ edges encode vesica correlation structure between groups.
-             * BP dressed amplitudes = alternate weights that are structurally
-             * coherent and may quantize with lower RMSE.
+             * D₆ fold on 6-element groups: antipodal pairs (0,3), (1,4), (2,5)
+             * vesica[k] = e[k] + e[k+3]  (k=0,1,2) — DC-like, propagates
+             * wave[k]   = e[k] - e[k+3]  (k=0,1,2) — noise-like, cancels
              *
-             * The vesica fold is now the graph TOPOLOGY, not a post-hoc fix. */
-            float alt_weights[16];
-            int q_analog[16];
-            int analog_ok = hpc_weight_analog(block_x + 16*j, alt_weights, 16, 6, 30);
+             * Weight vesica 4× over wave + penalize DC (sum of all 6 errors) */
+            int q_shaped[16];
+            memcpy(q_shaped, q_base, 16 * sizeof(int));
 
-            if (analog_ok) {
-                /* Quantize the alternate weights */
-                for (int k = 0; k < 16; k++) {
-                    float q_alt_cont = (alt_weights[k] + m) * id;
-                    q_analog[k] = gguf_nearest_int(q_alt_cont);
-                    if (q_analog[k] < 0) q_analog[k] = 0;
-                    if (q_analog[k] > 3) q_analog[k] = 3;
+            /* Process groups: [0..5], [6..11], tail [12..15] handled by D₆ metric on available pairs */
+            for (int g = 0; g < 2; g++) {
+                int g_off = g * 6;
+                if (g_off + 5 >= 16) break;
+
+                /* Multiple greedy passes — each pass finds the single best flip */
+                for (int pass = 0; pass < 6; pass++) {
+                    int best_k = -1;
+                    int best_q_alt = 0;
+                    float best_delta = 0.0f;  /* improvement = current_metric - alt_metric */
+
+                    /* Compute current group errors */
+                    float e_cur[6];
+                    for (int kk = 0; kk < 6; kk++) {
+                        int ii = g_off + kk;
+                        float deq = d * (float)q_shaped[ii] - m;
+                        e_cur[kk] = block_x[16*j+ii] - deq;
+                    }
+
+                    /* Current D₆ metric: vesica energy + DC² */
+                    float vesica_cur = 0.0f, dc_cur = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        float v = e_cur[p] + e_cur[p+3];
+                        vesica_cur += v * v;
+                    }
+                    for (int kk = 0; kk < 6; kk++) dc_cur += e_cur[kk];
+                    float metric_cur = 4.0f * vesica_cur + dc_cur * dc_cur;
+
+                    /* Try flipping each element */
+                    for (int k = 0; k < 6; k++) {
+                        int idx = g_off + k;
+                        int q_cur = q_shaped[idx];
+
+                        /* Try the alternative rounding */
+                        int q_try;
+                        if (q_cont[idx] - (float)q_cur >= 0) {
+                            q_try = q_cur + 1;
+                        } else {
+                            q_try = q_cur - 1;
+                        }
+                        if (q_try < 0 || q_try > 3) continue;
+
+                        /* Compute alt errors (only element k changes) */
+                        float e_alt[6];
+                        for (int kk = 0; kk < 6; kk++) e_alt[kk] = e_cur[kk];
+                        float deq_try = d * (float)q_try - m;
+                        e_alt[k] = block_x[16*j+idx] - deq_try;
+
+                        /* Alt D₆ metric */
+                        float vesica_alt = 0.0f, dc_alt = 0.0f;
+                        for (int p = 0; p < 3; p++) {
+                            float v = e_alt[p] + e_alt[p+3];
+                            vesica_alt += v * v;
+                        }
+                        for (int kk = 0; kk < 6; kk++) dc_alt += e_alt[kk];
+                        float metric_alt = 4.0f * vesica_alt + dc_alt * dc_alt;
+
+                        float delta = metric_cur - metric_alt;
+                        if (delta > best_delta) {
+                            best_delta = delta;
+                            best_k = k;
+                            best_q_alt = q_try;
+                        }
+                    }
+
+                    if (best_k < 0) break;  /* no improvement found */
+                    q_shaped[g_off + best_k] = best_q_alt;  /* commit the flip */
                 }
             }
 
-            /* Step 3: Each path measures error relative to its OWN reality.
-             * Baseline: |raw - dequant(quantize(raw))|²
-             * Analog:   |analog - dequant(quantize(analog))|²
-             * The analog is a parallel weight system — error is self-referential. */
-            float err_base = 0.0f, err_analog = 0.0f;
+            /* Step 3: Final error comparison — keep shaped only if it strictly
+             * improves MSE against the original raw weights. */
+            float err_base = 0.0f, err_shaped = 0.0f;
             for (int k = 0; k < 16; k++) {
                 float x = block_x[16*j+k];
                 float w = (imat_importance) ?
                           imat_importance[blk * QK_K + 16*j + k] : 1.0f;
                 float deq_b = d * (float)q_base[k] - m;
+                float deq_s = d * (float)q_shaped[k] - m;
                 err_base += (x - deq_b) * (x - deq_b) * w;
-                if (analog_ok) {
-                    float deq_a = d * (float)q_analog[k] - m;
-                    err_analog += (alt_weights[k] - deq_a) * (alt_weights[k] - deq_a) * w;
-                }
+                err_shaped += (x - deq_s) * (x - deq_s) * w;
             }
 
-            int *q_final = q_base;
-            if (analog_ok && err_analog < err_base)
-                q_final = q_analog;
-
+            int *q_final = (err_shaped < err_base) ? q_shaped : q_base;
             for (int k = 0; k < 16; k++)
                 L[16 * j + k] = (uint8_t)q_final[k];
         }
@@ -3533,23 +3508,6 @@ void hexstate_quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                                (BlockQ4_0 *)output, &err,
                                imat_importance, verbose);
     if (out_error) *out_error = err;
-}
-
-/**
- * hexstate_weight_analog() — Export HPC weight analog derivation to Python.
- *
- * @param raw_weights   Input float32 array [n_weights]
- * @param alt_weights   Output float32 array [n_weights] (pre-allocated)
- * @param n_weights     Number of weights
- * @param group_size    Elements per HPC site (6 for D₆)
- * @param bp_iters      BP iterations
- * @return              1 if analog derived, 0 if fallback
- */
-int hexstate_weight_analog(const float *raw_weights, float *alt_weights,
-                           int n_weights, int group_size, int bp_iters)
-{
-    hexstate_init();
-    return hpc_weight_analog(raw_weights, alt_weights, n_weights, group_size, bp_iters);
 }
 
 #ifndef HEXSTATE_LIBRARY
