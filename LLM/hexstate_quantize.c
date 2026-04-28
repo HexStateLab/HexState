@@ -2480,35 +2480,35 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         /* ── Analog assembly: iterate to convergence ──
          * 5 iterations: enough for the (Ls,Lm) ↔ (d,dmin) coupling
          * to fully stabilize. Each iteration does:
-         *   A) Exhaustive (Ls,Lm) search per sub-block
+         *   A) Sub-block Quhit BP to find coupled (Ls,Lm) states
          *   B) Optimal q-value assignment
          *   C) WLS solve for (d, dmin) */
-        for (int ls_iter = 0; ls_iter < 2; ls_iter++) {
+        for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
 
-            /* ── Step A: Exhaustive Ls/Lm search per sub-block ──
-             * For each sub-block j, try ALL 16×16 = 256 possible
-             * (Ls[j], Lm[j]) pairs. For each pair, compute optimal
-             * q-values by rounding and measure weighted sub-block error.
-             * Pick the pair that minimizes error. */
+            /* ── Step A: Sub-block Quhit BP (Strategy 1) ──
+             * For each sub-block j, evaluate all 256 (Ls, Lm) pairs.
+             * Keep the 6 best pairs as quhit states for a 16-node graph.
+             * Run BP to jointly select the globally optimal (Ls, Lm). */
+            uint8_t state_ls[N_SUB][6];
+            uint8_t state_lm[N_SUB][6];
+            float state_err[N_SUB][6];
+
             for (int j = 0; j < N_SUB; j++) {
                 const float *sx = block_x + 16 * j;
-                float best_sub_err = 1e30f;
-                uint8_t best_ls = Ls_blk[j], best_lm = Lm_blk[j];
+                for (int v = 0; v < 6; v++) state_err[j][v] = 1e30f;
 
                 for (int try_ls = 0; try_ls <= 15; try_ls++) {
                     float d_sub = dm * (float)try_ls;
                     for (int try_lm = 0; try_lm <= 15; try_lm++) {
                         float m_sub = mm * (float)try_lm;
-
                         float sub_err = 0.0f;
+
                         for (int k = 0; k < 16; k++) {
                             float x = sx[k];
                             float w = (imat_importance) ?
                                       imat_importance[blk * QK_K + 16*j + k] : 1.0f;
-                            int q;
-                            if (d_sub < 1e-15f) {
-                                q = 0;
-                            } else {
+                            int q = 0;
+                            if (d_sub >= 1e-15f) {
                                 q = gguf_nearest_int((x + m_sub) / d_sub);
                                 if (q < 0) q = 0; if (q > 3) q = 3;
                             }
@@ -2517,17 +2517,87 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             sub_err += diff * diff * w;
                         }
 
-                        if (sub_err < best_sub_err) {
-                            best_sub_err = sub_err;
-                            best_ls = (uint8_t)try_ls;
-                            best_lm = (uint8_t)try_lm;
-                            if (sub_err < 1e-10f) goto done_sub;
+                        /* Insert into top 6 */
+                        for (int v = 0; v < 6; v++) {
+                            if (sub_err < state_err[j][v]) {
+                                for (int u = 5; u > v; u--) {
+                                    state_err[j][u] = state_err[j][u-1];
+                                    state_ls[j][u] = state_ls[j][u-1];
+                                    state_lm[j][u] = state_lm[j][u-1];
+                                }
+                                state_err[j][v] = sub_err;
+                                state_ls[j][v] = (uint8_t)try_ls;
+                                state_lm[j][v] = (uint8_t)try_lm;
+                                break;
+                            }
                         }
                     }
                 }
-                done_sub:;
-                Ls_blk[j] = best_ls;
-                Lm_blk[j] = best_lm;
+            }
+
+            /* Build 16-node sub-block graph and run BP */
+            HPCGraph *sg = hpc_create(N_SUB);
+            if (sg) {
+                float min_sub_err[N_SUB];
+                for (int j = 0; j < N_SUB; j++) min_sub_err[j] = state_err[j][0];
+
+                /* Initialize unary potentials from local errors */
+                for (int j = 0; j < N_SUB; j++) {
+                    triality_dft(&sg->locals[j]);
+                    double amp_re[6];
+                    double amp_norm = 0.0;
+                    for (int v = 0; v < 6; v++) {
+                        /* Temperature = 0.1 for sharp sub-block coupling */
+                        amp_re[v] = exp(-(double)(state_err[j][v] - min_sub_err[j]) / 0.1);
+                        amp_norm += amp_re[v] * amp_re[v];
+                    }
+                    if (amp_norm > 1e-30) {
+                        double inv = 1.0 / sqrt(amp_norm);
+                        for (int v = 0; v < 6; v++) amp_re[v] *= inv;
+                    }
+                    for (int v = 0; v < 6; v++) {
+                        sg->locals[j].edge_re[v] = amp_re[v];
+                        sg->locals[j].edge_im[v] = 0.0;
+                    }
+                    sg->locals[j].primary = VIEW_EDGE;
+                    sg->locals[j].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+                    sg->locals[j].delta_valid = 0;
+                    triality_update_mask(&sg->locals[j]);
+                }
+
+                /* Add coupling edges between adjacent sub-blocks */
+                for (int j = 0; j < N_SUB - 1; j++)
+                    hpc_cz(sg, j, j + 1);
+
+                MobiusAmplitudeSheet *smob = mobius_create(sg);
+                /* 50 BP iterations is plenty for a 16-node chain */
+                z6_complex_amplitude_bp(smob, 0, 50);
+
+                /* Extract optimal Ls/Lm from BP marginals */
+                for (int j = 0; j < N_SUB; j++) {
+                    double best_prob = -1.0;
+                    int best_v = 0;
+                    for (int v = 0; v < 6; v++) {
+                        double re = smob->sheets[j].dressed_re[v];
+                        double im = smob->sheets[j].dressed_im[v];
+                        double prob = re*re + im*im;
+                        if (prob > best_prob) {
+                            best_prob = prob;
+                            best_v = v;
+                        }
+                    }
+                    Ls_blk[j] = state_ls[j][best_v];
+                    Lm_blk[j] = state_lm[j][best_v];
+                }
+
+                mobius_destroy(smob);
+                hpc_destroy(sg);
+            } else {
+                /* Fallback to independent local optima if malloc fails */
+                for (int j = 0; j < N_SUB; j++) {
+                    Ls_blk[j] = state_ls[j][0];
+                    Lm_blk[j] = state_lm[j][0];
+                }
             }
 
             /* ── Step B: Quantize q-values with optimal Ls/Lm ── */
@@ -2579,6 +2649,10 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)d_new));
                 if (dm_new > 0.0 && dm_new < 4.0 * (m_seed + 1e-10))
                     mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)dm_new));
+            }
+            if (isnan(dm) || isnan(mm)) {
+                printf("NaN detected before ULP: dm=%f mm=%f det=%f\n", dm, mm, det);
+                exit(1);
             }
         }
 
@@ -2825,7 +2899,13 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
         }
 
-        total_err += gguf_q2_k_block_error(block_x, &output[blk]);
+        float berr = gguf_q2_k_block_error(block_x, &output[blk]);
+        if (isnan(berr)) {
+            printf("NaN block error at blk %ld! dm=%f mm=%f\n", (long)blk, dm, mm);
+            for (int j=0; j<16; j++) printf("Ls[%d]=%d Lm[%d]=%d\n", j, Ls_blk[j], j, Lm_blk[j]);
+            exit(1);
+        }
+        total_err += berr;
     }
 
     free(seeds);
