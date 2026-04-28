@@ -559,13 +559,22 @@ def dequant_q2k_fast(q2k_bytes, n_blocks):
     for half in range(2):
         qs_half = qs[:, half * 32:(half + 1) * 32]  # [n_blocks, 32]
         for sub in range(4):
-            j = half * 8 + sub
             # Extract 2-bit quants at this shift position
             q_vals = ((qs_half >> (sub * 2)) & 3).astype(np.float32)  # [n_blocks, 32]
-            # Reconstruct: d_sub[j] * q - m_sub[j]
+            
+            # The 32 weights correspond to two 16-weight sub-blocks
+            j0 = half * 8 + sub * 2
+            j1 = half * 8 + sub * 2 + 1
+            
             base_idx = half * 128 + sub * 32
-            result[:, base_idx:base_idx + 32] = (
-                d_sub[:, j:j+1] * q_vals - m_sub[:, j:j+1]
+            
+            # First 16 elements use scale j0
+            result[:, base_idx:base_idx + 16] = (
+                d_sub[:, j0:j0+1] * q_vals[:, :16] - m_sub[:, j0:j0+1]
+            )
+            # Next 16 elements use scale j1
+            result[:, base_idx + 16:base_idx + 32] = (
+                d_sub[:, j1:j1+1] * q_vals[:, 16:] - m_sub[:, j1:j1+1]
             )
     return result.reshape(-1)
 
