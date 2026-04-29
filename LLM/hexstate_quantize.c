@@ -58,8 +58,6 @@
 #include "quhit_triality.h"
 #include "hpc_graph.h"
 #include "hpc_mobius.h"
-#include "hpc_amplitude.h"
-#include "hpc_z6_codes.h"
 #include "s6_exotic.h"
 
 /* Quantization-specific headers */
@@ -1294,33 +1292,15 @@ static void quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
             float id = (actual_d > 1e-15f) ? 1.0f / actual_d : 0.0f;
             float err = 0.0f;
 
-            for (int j = 0; j < QK4_0; j += 6) {
-                int g_len = (j + 6 <= QK4_0) ? 6 : (QK4_0 - j);
-                int half_g = g_len / 2;
-                float e_cur[6], w_cur[6];
-                
-                for (int kk = 0; kk < g_len; kk++) {
-                    int idx = j + kk;
-                    float x = bw[idx];
-                    int q = (int)(x * id + 8.5f);
-                    if (q < 0) q = 0; if (q > 15) q = 15;
-                    float deq = ((float)q - 8.0f) * actual_d;
-                    e_cur[kk] = x - deq;
-                    w_cur[kk] = (imat_importance) ? imat_importance[blk * QK4_0 + idx] : 1.0f;
-                }
-                
-                /* Decompose into vesica (DC) and wave (AC) components */
-                float vesica_err = 0.0f, wave_err = 0.0f;
-                for (int p = 0; p < half_g; p++) {
-                    float v = e_cur[p] + e_cur[p + half_g];
-                    float w_wave = e_cur[p] - e_cur[p + half_g];
-                    float w_avg = (w_cur[p] + w_cur[p + half_g]) * 0.5f;
-                    vesica_err += v * v * w_avg;
-                    wave_err += w_wave * w_wave * w_avg;
-                }
-                /* Triality weighting: penalize vesica 4×, wave 1×.
-                 * Factor of 0.5 keeps scale consistent with standard MSE. */
-                err += 0.5f * (4.0f * vesica_err + 1.0f * wave_err);
+            for (int j = 0; j < QK4_0; j++) {
+                float x = bw[j];
+                int q = (int)(x * id + 8.5f);
+                if (q < 0) q = 0; if (q > 15) q = 15;
+                float deq = ((float)q - 8.0f) * actual_d;
+                float diff = x - deq;
+                float w = (imat_importance) ?
+                          imat_importance[blk * QK4_0 + j] : 1.0f;
+                err += diff * diff * w;
             }
             cand_errors[blk][ci] = err;
         }
@@ -1904,34 +1884,33 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
     };
 
-    /* ══════════════════════════════════════════════════════════════════
-     * Per-block winner storage — replaces massive candidate arrays.
-     * Like tesseract_factor stores the assembled period, we store
-     * the assembled (d, dmin, Ls, Lm) directly. No candidate grid.
-     *
-     * Memory: 36 bytes/block vs 9,216 bytes/block (256× reduction)
-     * ══════════════════════════════════════════════════════════════════ */
-    uint16_t *winner_d    = (uint16_t *)calloc(n_blocks, sizeof(uint16_t));
-    uint16_t *winner_dmin = (uint16_t *)calloc(n_blocks, sizeof(uint16_t));
-    uint8_t (*winner_Ls)[16] = (uint8_t (*)[16])calloc(n_blocks, sizeof(uint8_t[16]));
-    uint8_t (*winner_Lm)[16] = (uint8_t (*)[16])calloc(n_blocks, sizeof(uint8_t[16]));
+    /* candidate_errors[blk][256] — weighted MSE per candidate */
+    float (*candidate_errors)[TOTAL_SCALE_CANDIDATES] = NULL;
+    uint16_t (*candidate_d)[TOTAL_SCALE_CANDIDATES] = NULL;
+    uint16_t (*candidate_dmin)[TOTAL_SCALE_CANDIDATES] = NULL;
+    /* Per-candidate Ls/Lm — must recompute for each (d, dmin) */
+    uint8_t (*candidate_Ls)[TOTAL_SCALE_CANDIDATES][16] = NULL;
+    uint8_t (*candidate_Lm)[TOTAL_SCALE_CANDIDATES][16] = NULL;
 
-    /* ── Phase 2a: WLS solve — find optimal (d*, dmin*) per block ── */
-    typedef struct { float dm, mm; uint8_t Ls[16], Lm[16]; } BlockWLS;
-    BlockWLS *wls_results = (BlockWLS *)calloc(n_blocks, sizeof(BlockWLS));
-
-    /* Per-block bin-level errors for graph encoding (6 d-bins × 6 m-bins) */
-    float (*bin_errors)[6][6] = (float (*)[6][6])calloc(n_blocks, sizeof(float[6][6]));
-
-    /* Bin-center multipliers (average of NEIGHBOR_MULTS within each bin) */
-    static const float BIN_CENTER_D[6] = { 0.915f, 0.955f, 0.980f, 1.005f, 1.037f, 1.085f };
-    static const float BIN_CENTER_M[6] = { 0.915f, 0.955f, 0.980f, 1.005f, 1.037f, 1.085f };
+    candidate_errors = (float (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(float[TOTAL_SCALE_CANDIDATES]));
+    candidate_d = (uint16_t (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(uint16_t[TOTAL_SCALE_CANDIDATES]));
+    candidate_dmin = (uint16_t (*)[TOTAL_SCALE_CANDIDATES])calloc(n_blocks,
+                            sizeof(uint16_t[TOTAL_SCALE_CANDIDATES]));
+    candidate_Ls = (uint8_t (*)[TOTAL_SCALE_CANDIDATES][16])calloc(n_blocks,
+                            sizeof(uint8_t[TOTAL_SCALE_CANDIDATES][16]));
+    candidate_Lm = (uint8_t (*)[TOTAL_SCALE_CANDIDATES][16])calloc(n_blocks,
+                            sizeof(uint8_t[TOTAL_SCALE_CANDIDATES][16]));
 
     #pragma omp parallel for schedule(dynamic, 16)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
 
-        /* ── WLS solve (same as before) ── */
+        /* ── Step 2a: WLS solve to find optimal (d*, dmin*) ──
+         * Seed from Phase 1 greedy, iterate 3× to converge.
+         * Q2_K model: x[j,k] ≈ d × Ls[j] × q[j,k] - dmin × Lm[j]
+         * This is a 2-variable WLS: minimize Σ w×(x - d×a + dmin×b)² */
         float wls_dm = seeds[blk].dm;
         float wls_mm = seeds[blk].mm;
         uint8_t wls_Ls[16], wls_Lm[16];
@@ -1939,6 +1918,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
         memcpy(wls_Lm, seeds[blk].Lm, 16);
 
         for (int ls_iter = 0; ls_iter < 5; ls_iter++) {
+            /* Quantize all elements at current (wls_dm, wls_mm) */
             uint8_t L_wls[QK_K];
             for (int j = 0; j < N_SUB; j++) {
                 float d_sub = wls_dm * (float)wls_Ls[j];
@@ -1953,6 +1933,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                     L_wls[16*j+k] = (uint8_t)q;
                 }
             }
+
+            /* Accumulate 2×2 normal equations */
             double Saa = 0, Sab = 0, Sbb = 0, Sxa = 0, Sxb = 0;
             for (int j = 0; j < N_SUB; j++) {
                 float ls_f = (float)wls_Ls[j];
@@ -1963,20 +1945,27 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                               imat_importance[blk * QK_K + 16*j+k] : 1.0f;
                     float a = ls_f * (float)L_wls[16*j+k];
                     float b = lm_f;
-                    Saa += w * a * a; Sab += w * a * b;
-                    Sbb += w * b * b; Sxa += w * x * a;
+                    Saa += w * a * a;
+                    Sab += w * a * b;
+                    Sbb += w * b * b;
+                    Sxa += w * x * a;
                     Sxb += w * x * b;
                 }
             }
+
+            /* Solve via Cramer's rule */
             double det = Saa * Sbb - Sab * Sab;
             if (fabs(det) > 1e-30) {
                 double d_new  = (Sbb * Sxa - Sab * Sxb) / det;
                 double dm_new = (Sab * Sxa - Saa * Sxb) / det;
+                /* Clamp: positive and within 4× of seed (prevent runaway) */
                 if (d_new > 0.0 && d_new < 4.0 * (seeds[blk].dm + 1e-10))
                     wls_dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)d_new));
                 if (dm_new > 0.0 && dm_new < 4.0 * (seeds[blk].mm + 1e-10))
                     wls_mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)dm_new));
             }
+
+            /* Re-derive Ls/Lm for updated (d*, dmin*) */
             for (int j = 0; j < N_SUB; j++) {
                 if (wls_dm > 1e-15f) {
                     int ls = gguf_nearest_int(seeds[blk].scales[j] / wls_dm);
@@ -1991,97 +1980,87 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
         }
 
-        /* Save WLS results */
-        wls_results[blk].dm = wls_dm;
-        wls_results[blk].mm = wls_mm;
-        memcpy(wls_results[blk].Ls, wls_Ls, 16);
-        memcpy(wls_results[blk].Lm, wls_Lm, 16);
+        /* ── Step 2b: Generate 16×16 candidates centered on WLS optimum ──
+         * Grid is now centered on (wls_dm, wls_mm) not (greedy_dm, greedy_mm).
+         * Tighter spacing because we're already near the true minimum. */
+        for (int di = 0; di < N_CAND_D; di++) {
+            float trial_dm = wls_dm * NEIGHBOR_MULTS_D[di];
+            uint16_t trial_d16 = gguf_fp32_to_fp16(trial_dm);
+            float actual_dm = gguf_fp16_to_fp32(trial_d16);
 
-        /* ── Bin-level error computation (36 evals vs 256) ──
-         * Like tesseract encodes a^(d·6^k) mod N into phase amplitudes,
-         * we encode the error landscape at each (d_bin, m_bin) center.
-         * This gives the graph the full 2D error surface to work with. */
-        for (int dbin = 0; dbin < 6; dbin++) {
-            float trial_dm = wls_dm * BIN_CENTER_D[dbin];
-            float actual_dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16(trial_dm));
-            uint8_t trial_Ls[16];
-            for (int j = 0; j < N_SUB; j++) {
-                if (actual_dm > 1e-15f) {
-                    int ls = gguf_nearest_int(seeds[blk].scales[j] / actual_dm);
-                    if (ls < 0) ls = 0; if (ls > 15) ls = 15;
-                    trial_Ls[j] = (uint8_t)ls;
-                } else { trial_Ls[j] = 0; }
-            }
+            for (int mi = 0; mi < N_CAND_M; mi++) {
+                int cidx = di * N_CAND_M + mi;
+                float trial_mm = wls_mm * NEIGHBOR_MULTS_M[mi];
+                uint16_t trial_dmin16 = gguf_fp32_to_fp16(trial_mm);
+                float actual_mm = gguf_fp16_to_fp32(trial_dmin16);
 
-            for (int mbin = 0; mbin < 6; mbin++) {
-                float trial_mm = wls_mm * BIN_CENTER_M[mbin];
-                float actual_mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16(trial_mm));
-                uint8_t trial_Lm[16];
+                candidate_d[blk][cidx] = trial_d16;
+                candidate_dmin[blk][cidx] = trial_dmin16;
+
+                /* Recompute Ls/Lm for THIS candidate dm/mm */
+                uint8_t trial_Ls[16], trial_Lm[16];
                 for (int j = 0; j < N_SUB; j++) {
+                    if (actual_dm > 1e-15f) {
+                        int ls = gguf_nearest_int(seeds[blk].scales[j] / actual_dm);
+                        if (ls < 0) ls = 0; if (ls > 15) ls = 15;
+                        trial_Ls[j] = (uint8_t)ls;
+                    } else {
+                        trial_Ls[j] = 0;
+                    }
                     if (actual_mm > 1e-15f) {
                         int lm = gguf_nearest_int(seeds[blk].mins[j] / actual_mm);
                         if (lm < 0) lm = 0; if (lm > 15) lm = 15;
                         trial_Lm[j] = (uint8_t)lm;
-                    } else { trial_Lm[j] = 0; }
+                    } else {
+                        trial_Lm[j] = 0;
+                    }
                 }
+                memcpy(candidate_Ls[blk][cidx], trial_Ls, 16);
+                memcpy(candidate_Lm[blk][cidx], trial_Lm, 16);
 
-                /* Weighted MSE with triality decomposition */
+                /* Fully re-quantize and measure weighted MSE */
                 float err = 0.0f;
                 for (int j = 0; j < N_SUB; j++) {
                     float d = actual_dm * (float)trial_Ls[j];
                     float m = actual_mm * (float)trial_Lm[j];
                     if (d < 1e-15f) {
                         for (int k = 0; k < 16; k++) {
-                            float x = block_x[16*j+k];
+                            float x = block_x[16 * j + k];
                             float w = (imat_importance) ?
-                                      imat_importance[blk * QK_K + 16*j+k] : 1.0f;
+                                      imat_importance[blk * QK_K + 16 * j + k] : 1.0f;
                             err += x * x * w;
                         }
                         continue;
                     }
-                    for (int k = 0; k < 16; k += 6) {
-                        int g_len = (k + 6 <= 16) ? 6 : (16 - k);
-                        int half_g = g_len / 2;
-                        float e_cur[6], w_cur[6];
-                        for (int kk = 0; kk < g_len; kk++) {
-                            int idx = 16*j + k + kk;
-                            float x = block_x[idx];
-                            int q = gguf_nearest_int((x + m) / d);
-                            if (q < 0) q = 0; if (q > 3) q = 3;
-                            float deq = d * (float)q - m;
-                            e_cur[kk] = x - deq;
-                            w_cur[kk] = (imat_importance) ?
-                                        imat_importance[blk * QK_K + idx] : 1.0f;
-                        }
-                        float vesica_err = 0.0f, wave_err = 0.0f;
-                        for (int p = 0; p < half_g; p++) {
-                            float v = e_cur[p] + e_cur[p + half_g];
-                            float w_wave = e_cur[p] - e_cur[p + half_g];
-                            float w_avg = (w_cur[p] + w_cur[p + half_g]) * 0.5f;
-                            vesica_err += v * v * w_avg;
-                            wave_err += w_wave * w_wave * w_avg;
-                        }
-                        err += 0.5f * (4.0f * vesica_err + 1.0f * wave_err);
+                    for (int k = 0; k < 16; k++) {
+                        float x = block_x[16 * j + k];
+                        int q = gguf_nearest_int((x + m) / d);
+                        if (q < 0) q = 0; if (q > 3) q = 3;
+                        float deq = d * (float)q - m;
+                        float diff = x - deq;
+                        float w = (imat_importance) ?
+                                  imat_importance[blk * QK_K + 16 * j + k] : 1.0f;
+                        err += diff * diff * w;
                     }
                 }
-                bin_errors[blk][dbin][mbin] = err;
+                candidate_errors[blk][cidx] = err;
             }
         }
     }
 
     /* ══════════════════════════════════════════════════════════════════
-     * PHASE 3: Tesseract-Style Marginal Assembly
+     * PHASE 3: HPC Graph — Direct (d, dmin) Selection via BP
      *
-     * Like tesseract_factor assembles a period from digit marginals
-     *   period = Σ_k  P(digit[k]=v) × v × 6^k
-     * we assemble (d, dmin) from scale-bin marginals:
-     *   d_mult = Σ_v  P(d_bin=v) × BIN_CENTER_D[v]
-     *   m_mult = Σ_v  P(m_bin=v) × BIN_CENTER_M[v]
-     *
-     * The graph propagates cross-block interference through CZ edges.
-     * BP converges to marginals that reflect the joint optimal surface.
-     * We read off the answer directly — no candidate grid, no search.
+     * Build a multi-quhit graph where each block has 2 quhits
+     * encoding the 36 candidate errors. BP propagates cross-block
+     * interference. Dressed marginals directly select the optimal
+     * (d, dmin) per block.
      * ══════════════════════════════════════════════════════════════════ */
+
+    /* Default: use greedy candidate (index 5*10+5 = 55, mult 1.00×1.00) */
+    int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
+    for (int64_t i = 0; i < n_blocks; i++)
+        best_candidate[i] = 10 * N_CAND_M + 10;  /* NEIGHBOR_MULTS_D[10]=1.00, _M[10]=1.00 */
 
     if (opt_mode != OPT_MSE && n_blocks >= 2) {
         int64_t graph_blocks = (n_blocks > 2000) ? 2000 : n_blocks;
@@ -2094,44 +2073,47 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             for (int64_t i = 0; i < n_sites; i++)
                 triality_dft(&graph->locals[i]);
 
-            /* Encode bin-level errors as quhit amplitudes.
-             * bin_errors[blk][6][6] → coarse quhit (marginalize over m)
-             *                       → fine quhit (marginalize over d) */
+            /* Encode each block's 36 candidate errors as dual-quhit amplitudes */
             for (int64_t i = 0; i < graph_blocks; i++) {
                 int64_t blk = i * stride;
                 float min_err = 1e30f;
-                for (int dbin = 0; dbin < 6; dbin++)
-                    for (int mbin = 0; mbin < 6; mbin++)
-                        if (bin_errors[blk][dbin][mbin] < min_err)
-                            min_err = bin_errors[blk][dbin][mbin];
+                for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++)
+                    if (candidate_errors[blk][c] < min_err)
+                        min_err = candidate_errors[blk][c];
 
-                /* Coarse quhit: marginalize over m-bins */
+                /* Quhit 0 (coarse = d dimension): marginalize over dmin */
                 double coarse_re[6];
                 double coarse_norm = 0.0;
-                for (int dbin = 0; dbin < 6; dbin++) {
-                    coarse_re[dbin] = 0.0;
-                    for (int mbin = 0; mbin < 6; mbin++)
-                        coarse_re[dbin] += exp(-(double)(bin_errors[blk][dbin][mbin] - min_err) /
-                                                (2.0 * (double)temperature));
+                for (int qi = 0; qi < 6; qi++) coarse_re[qi] = 0.0;
+                for (int di = 0; di < N_CAND_D; di++) {
+                    int qi = CAND_TO_QUHIT[di];
+                    for (int mi = 0; mi < N_CAND_M; mi++) {
+                        int cidx = di * N_CAND_M + mi;
+                        coarse_re[qi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                                              (2.0 * (double)temperature));
+                    }
                 }
-                for (int v = 0; v < 6; v++)
-                    coarse_norm += coarse_re[v] * coarse_re[v];
+                for (int qi = 0; qi < 6; qi++)
+                    coarse_norm += coarse_re[qi] * coarse_re[qi];
                 if (coarse_norm > 1e-30) {
                     double inv = 1.0 / sqrt(coarse_norm);
                     for (int v = 0; v < 6; v++) coarse_re[v] *= inv;
                 }
 
-                /* Fine quhit: marginalize over d-bins */
+                /* Quhit 1 (fine = dmin dimension): marginalize over d */
                 double fine_re[6];
                 double fine_norm = 0.0;
-                for (int mbin = 0; mbin < 6; mbin++) {
-                    fine_re[mbin] = 0.0;
-                    for (int dbin = 0; dbin < 6; dbin++)
-                        fine_re[mbin] += exp(-(double)(bin_errors[blk][dbin][mbin] - min_err) /
-                                              (2.0 * (double)temperature));
+                for (int qi = 0; qi < 6; qi++) fine_re[qi] = 0.0;
+                for (int mi = 0; mi < N_CAND_M; mi++) {
+                    int qi = CAND_TO_QUHIT[mi];
+                    for (int di = 0; di < N_CAND_D; di++) {
+                        int cidx = di * N_CAND_M + mi;
+                        fine_re[qi] += exp(-(double)(candidate_errors[blk][cidx] - min_err) /
+                                            (2.0 * (double)temperature));
+                    }
                 }
-                for (int v = 0; v < 6; v++)
-                    fine_norm += fine_re[v] * fine_re[v];
+                for (int qi = 0; qi < 6; qi++)
+                    fine_norm += fine_re[qi] * fine_re[qi];
                 if (fine_norm > 1e-30) {
                     double inv = 1.0 / sqrt(fine_norm);
                     for (int v = 0; v < 6; v++) fine_re[v] *= inv;
@@ -2155,16 +2137,19 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 triality_update_mask(&graph->locals[s1]);
             }
 
-            /* Build edges (same topology) */
+            /* Build edges */
             for (int64_t i = 0; i < graph_blocks; i++) {
-                hpc_cz(graph, 2 * i, 2 * i + 1);
+                hpc_cz(graph, 2 * i, 2 * i + 1);  /* intra-block: d ↔ dmin */
                 if (i + 1 < graph_blocks) {
-                    hpc_cz(graph, 2 * i, 2 * (i + 1));
-                    hpc_cz(graph, 2 * i + 1, 2 * (i + 1) + 1);
+                    hpc_cz(graph, 2 * i, 2 * (i + 1));         /* d ↔ d neighbor */
+                    hpc_cz(graph, 2 * i + 1, 2 * (i + 1) + 1); /* dmin ↔ dmin    */
                 }
             }
 
-            /* Triality-enhanced BP ensemble */
+            /* Run ensemble BP with TRIALITY-enhanced marginals.
+             * After BP converges, compute marginals in ALL THREE views:
+             * edge (computational), vertex (Fourier), diagonal (conj-Fourier).
+             * A candidate must score well in all three bases to be selected. */
             MobiusAmplitudeSheet *mobius = mobius_create(graph);
             double (*coarse_marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
             double (*fine_marg)[6]   = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
@@ -2172,12 +2157,14 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             for (int start = 0; start < 3; start++) {
                 z6_complex_amplitude_bp(mobius, (unsigned int)start, 200);
 
+                /* After BP, graph->locals[s] has dressed amplitudes in edge view.
+                 * Compute vertex and diagonal views via DFT₆ triality. */
                 for (int64_t i = 0; i < graph_blocks; i++) {
                     for (int qbit = 0; qbit < 2; qbit++) {
                         int64_t s = 2 * i + qbit;
                         double (*marg)[6] = (qbit == 0) ? &coarse_marg[i] : &fine_marg[i];
 
-                        /* Edge view */
+                        /* Edge view marginals (standard) */
                         double edge_prob[6];
                         for (int v = 0; v < 6; v++) {
                             double re = mobius->sheets[s].dressed_re[v];
@@ -2185,7 +2172,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             edge_prob[v] = re * re + im * im;
                         }
 
-                        /* Vertex view: DFT₆ */
+                        /* Vertex view: DFT₆ of dressed edge amplitudes */
                         double vert_re[6], vert_im[6], vert_prob[6];
                         for (int j = 0; j < 6; j++) {
                             double sr = 0, si = 0;
@@ -2201,7 +2188,7 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             vert_prob[j] = vert_re[j]*vert_re[j] + vert_im[j]*vert_im[j];
                         }
 
-                        /* Diagonal view: DFT₆² */
+                        /* Diagonal view: DFT₆ of vertex = DFT₆² of edge */
                         double diag_prob[6];
                         for (int j = 0; j < 6; j++) {
                             double sr = 0, si = 0;
@@ -2214,7 +2201,8 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             diag_prob[j] = dr*dr + di*di;
                         }
 
-                        /* Triality-consistent marginal */
+                        /* Triality-consistent marginal: geometric mean of all 3 views.
+                         * Suppresses spurious peaks that only appear in one basis. */
                         for (int v = 0; v < 6; v++) {
                             double tri_prob = cbrt(edge_prob[v] * vert_prob[v] * diag_prob[v]);
                             (*marg)[v] += tri_prob;
@@ -2223,66 +2211,218 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                 }
             }
 
+            /* ══ Hensel-Inspired Beam Search Constraint Propagation ══
+             * Like tesseract_factor's Hensel lift: process blocks sequentially,
+             * maintain K best configurations, prune by accumulated error.
+             *
+             * The constraint: blocks are selected JOINTLY. */
+
+            #define N_BEAMS 24  /* K beams — widened for 31B (was 12) */
+
+            typedef struct {
+                double acc_error;
+                int history_idx;  /* index into the backpointer array */
+            } QuantBeam;
+
+            typedef struct {
+                int cand_idx;
+                int parent_idx;
+            } BeamHistory;
+
+            QuantBeam beams[N_BEAMS];
+            int active_beams = 1;
+
+            /* Pre-allocate history to avoid O(N^2) memory copies */
+            BeamHistory *history = (BeamHistory *)malloc(n_blocks * N_BEAMS * sizeof(BeamHistory));
+
+            for (int b = 0; b < N_BEAMS; b++) {
+                beams[b].acc_error = 0.0;
+                beams[b].history_idx = -1;
+            }
+
+            /* Process blocks sequentially with beam search */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                double c_total = 0.0, f_total = 0.0;
+                for (int v = 0; v < 6; v++) {
+                    c_total += coarse_marg[i][v];
+                    f_total += fine_marg[i][v];
+                }
+
+                /* Candidate scores for this block: triality prob × (1/normalized_error) */
+                double cand_score[TOTAL_SCALE_CANDIDATES];
+                int64_t blk = i * stride;
+                int d_bin_count[6] = {0}, m_bin_count[6] = {0};
+                for (int k = 0; k < N_CAND_D; k++) d_bin_count[CAND_TO_QUHIT[k]]++;
+                for (int k = 0; k < N_CAND_M; k++) m_bin_count[CAND_TO_QUHIT[k]]++;
+                /* Per-block error normalization: divide by block mean error
+                 * so small-weight blocks don't dominate beam selection */
+                float blk_mean_err = 0.0f;
+                for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++)
+                    blk_mean_err += candidate_errors[blk][c];
+                blk_mean_err /= (float)TOTAL_SCALE_CANDIDATES;
+                if (blk_mean_err < 1e-30f) blk_mean_err = 1e-30f;
+                for (int di = 0; di < N_CAND_D; di++) {
+                    int qi_d = CAND_TO_QUHIT[di];
+                    double p_d = (c_total > 1e-30) ? coarse_marg[i][qi_d] / c_total : 1.0/6.0;
+                    p_d /= (double)d_bin_count[qi_d];
+                    for (int mi = 0; mi < N_CAND_M; mi++) {
+                        int qi_m = CAND_TO_QUHIT[mi];
+                        double p_m = (f_total > 1e-30) ? fine_marg[i][qi_m] / f_total : 1.0/6.0;
+                        p_m /= (double)m_bin_count[qi_m];
+                        int cidx = di * N_CAND_M + mi;
+                        cand_score[cidx] = p_d * p_m / (candidate_errors[blk][cidx] / blk_mean_err + 1e-15);
+                    }
+                }
+
+                /* Extend beams × 36 candidates, keep top K */
+                typedef struct { double score; int beam_idx; int cand_idx; } BeamExt;
+                BeamExt extensions[N_BEAMS * TOTAL_SCALE_CANDIDATES];
+                int n_ext = 0;
+
+                for (int b = 0; b < active_beams; b++) {
+                    for (int c = 0; c < TOTAL_SCALE_CANDIDATES; c++) {
+                        /* Score = -(accumulated_error + this_block_error) × triality_prob */
+                        double ext_err = beams[b].acc_error + candidate_errors[blk][c];
+                        double ext_score = cand_score[c] / (ext_err + 1e-15);
+                        extensions[n_ext].score = ext_score;
+                        extensions[n_ext].beam_idx = b;
+                        extensions[n_ext].cand_idx = c;
+                        n_ext++;
+                    }
+                }
+
+                /* Top-K selection */
+                int top_k = (n_ext < N_BEAMS) ? n_ext : N_BEAMS;
+                int top_indices[N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int best = -1;
+                    double best_s = -1e30;
+                    for (int e = 0; e < n_ext; e++) {
+                        if (extensions[e].score > best_s) {
+                            best_s = extensions[e].score;
+                            best = e;
+                        }
+                    }
+                    top_indices[k] = best;
+                    extensions[best].score = -2e30;  /* poison */
+                }
+
+                /* Build new beams from top-K extensions using backpointers */
+                QuantBeam new_beams[N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int ext_idx = top_indices[k];
+                    int src_beam = extensions[ext_idx].beam_idx;
+                    int cand = extensions[ext_idx].cand_idx;
+
+                    int hist_idx = i * N_BEAMS + k;
+                    history[hist_idx].cand_idx = cand;
+                    history[hist_idx].parent_idx = beams[src_beam].history_idx;
+
+                    new_beams[k].history_idx = hist_idx;
+                    new_beams[k].acc_error = beams[src_beam].acc_error
+                                            + candidate_errors[blk][cand];
+                }
+
+                for (int k = 0; k < top_k; k++)
+                    beams[k] = new_beams[k];
+                active_beams = top_k;
+            }
+
+            /* Trace back the best beam's selections */
+            int curr_hist = beams[0].history_idx;
+            for (int64_t i = graph_blocks - 1; i >= 0; i--) {
+                if (curr_hist >= 0) {
+                    int cidx = history[curr_hist].cand_idx;
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = cidx;
+                    curr_hist = history[curr_hist].parent_idx;
+                } else {
+                    for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++)
+                        best_candidate[b] = 10 * N_CAND_M + 10;
+                }
+            }
+
+            free(history);
+
             /* ══════════════════════════════════════════════════════════════
-             * Marginal-Weighted Assembly (the tesseract shortcut)
+             * Phase 3.5: Born-Rule Multi-Shot Scale Refinement (Q2_K)
              *
-             * period = Σ digit[k] × 6^k  (tesseract_factor)
-             * d_opt  = wls_dm × Σ P(v) × BIN_CENTER_D[v]  (here)
-             *
-             * The marginals weight each bin's contribution. This is a
-             * continuous interpolation — NOT a discrete selection.
-             * BP's cross-block correlations shape the weights so that
-             * blocks that should use similar scales DO use similar scales.
+             * 2D Born sampling: sample coarse quhit (d dimension) and
+             * fine quhit (dmin dimension) jointly from triality marginals.
+             * Each shot produces a (d_idx, dmin_idx) pair per block.
              * ══════════════════════════════════════════════════════════════ */
-            for (int64_t gi = 0; gi < graph_blocks; gi++) {
-                int64_t blk = gi * stride;
+            {
+                #define Q2K_BORN_SHOTS 64
 
-                /* Normalize marginals to probabilities */
-                double c_sum = 0.0, f_sum = 0.0;
-                for (int v = 0; v < 6; v++) {
-                    c_sum += coarse_marg[gi][v];
-                    f_sum += fine_marg[gi][v];
+                float beam_total_err = 0.0f;
+                for (int64_t bi = 0; bi < n_blocks; bi++)
+                    beam_total_err += candidate_errors[bi][best_candidate[bi]];
+
+                unsigned int born_rng_q2 = 271828;
+                int *shot_assignment = (int *)malloc(n_blocks * sizeof(int));
+
+                for (int shot = 0; shot < Q2K_BORN_SHOTS; shot++) {
+                    float shot_err = 0.0f;
+                    /* Init from beam result so tail blocks beyond
+                     * graph_blocks*stride keep valid indices */
+                    memcpy(shot_assignment, best_candidate,
+                           n_blocks * sizeof(int));
+
+                    for (int64_t gi = 0; gi < graph_blocks; gi++) {
+                        /* Born sample coarse (d) quhit */
+                        double c_total = 0.0;
+                        for (int v = 0; v < 6; v++) c_total += coarse_marg[gi][v];
+                        born_rng_q2 = born_rng_q2 * 1664525u + 1013904223u;
+                        double rnd_c = (double)(born_rng_q2 >> 8) / 16777216.0;
+                        double target_c = rnd_c * c_total;
+                        double cum_c = 0.0;
+                        int qi_d = 5;
+                        for (int v = 0; v < 6; v++) {
+                            cum_c += coarse_marg[gi][v];
+                            if (cum_c > target_c) { qi_d = v; break; }
+                        }
+
+                        /* Born sample fine (dmin) quhit */
+                        double f_total = 0.0;
+                        for (int v = 0; v < 6; v++) f_total += fine_marg[gi][v];
+                        born_rng_q2 = born_rng_q2 * 1664525u + 1013904223u;
+                        double rnd_f = (double)(born_rng_q2 >> 8) / 16777216.0;
+                        double target_f = rnd_f * f_total;
+                        double cum_f = 0.0;
+                        int qi_m = 5;
+                        for (int v = 0; v < 6; v++) {
+                            cum_f += fine_marg[gi][v];
+                            if (cum_f > target_f) { qi_m = v; break; }
+                        }
+
+                        /* Find best candidate within the sampled (d_bin, m_bin) */
+                        int64_t blk = gi * stride;
+                        float best_bin_err = 1e30f;
+                        int best_bin_cand = 10 * N_CAND_M + 10;
+                        for (int di = 0; di < N_CAND_D; di++) {
+                            if (CAND_TO_QUHIT[di] != qi_d) continue;
+                            for (int mi = 0; mi < N_CAND_M; mi++) {
+                                if (CAND_TO_QUHIT[mi] != qi_m) continue;
+                                int cidx = di * N_CAND_M + mi;
+                                if (candidate_errors[blk][cidx] < best_bin_err) {
+                                    best_bin_err = candidate_errors[blk][cidx];
+                                    best_bin_cand = cidx;
+                                }
+                            }
+                        }
+
+                        shot_assignment[blk] = best_bin_cand;
+                        shot_err += candidate_errors[blk][best_bin_cand];
+                    }
+
+                    if (shot_err < beam_total_err) {
+                        for (int64_t b = 0; b < n_blocks; b++)
+                            best_candidate[b] = shot_assignment[b];
+                        beam_total_err = shot_err;
+                    }
                 }
-                if (c_sum < 1e-30) c_sum = 1.0;
-                if (f_sum < 1e-30) f_sum = 1.0;
 
-                /* Assemble multipliers from marginal-weighted bin centers */
-                double d_mult = 0.0, m_mult = 0.0;
-                for (int v = 0; v < 6; v++) {
-                    d_mult += (coarse_marg[gi][v] / c_sum) * BIN_CENTER_D[v];
-                    m_mult += (fine_marg[gi][v]   / f_sum) * BIN_CENTER_M[v];
-                }
-
-                /* Assemble the (d, dmin) — FP16 round for GGUF compatibility */
-                float assembled_dm = wls_results[blk].dm * (float)d_mult;
-                float assembled_mm = wls_results[blk].mm * (float)m_mult;
-                uint16_t d16  = gguf_fp32_to_fp16(assembled_dm);
-                uint16_t m16  = gguf_fp32_to_fp16(assembled_mm);
-                float actual_dm = gguf_fp16_to_fp32(d16);
-                float actual_mm = gguf_fp16_to_fp32(m16);
-
-                /* Compute Ls/Lm for the assembled (d, dmin) */
-                uint8_t Ls[16], Lm[16];
-                for (int j = 0; j < N_SUB; j++) {
-                    if (actual_dm > 1e-15f) {
-                        int ls = gguf_nearest_int(seeds[blk].scales[j] / actual_dm);
-                        if (ls < 0) ls = 0; if (ls > 15) ls = 15;
-                        Ls[j] = (uint8_t)ls;
-                    } else { Ls[j] = 0; }
-                    if (actual_mm > 1e-15f) {
-                        int lm = gguf_nearest_int(seeds[blk].mins[j] / actual_mm);
-                        if (lm < 0) lm = 0; if (lm > 15) lm = 15;
-                        Lm[j] = (uint8_t)lm;
-                    } else { Lm[j] = 0; }
-                }
-
-                /* Store assembled winners for all blocks in this stride group */
-                for (int64_t b = blk; b < (gi+1) * stride && b < n_blocks; b++) {
-                    winner_d[b] = d16;
-                    winner_dmin[b] = m16;
-                    memcpy(winner_Ls[b], Ls, 16);
-                    memcpy(winner_Lm[b], Lm, 16);
-                }
+                free(shot_assignment);
             }
 
             free(coarse_marg);
@@ -2291,17 +2431,19 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             hpc_destroy(graph);
         }
     } else {
-        /* OPT_MSE or single block: use WLS solution directly */
+        /* OPT_MSE or single block: pick candidate with lowest raw error */
         for (int64_t blk = 0; blk < n_blocks; blk++) {
-            winner_d[blk]    = gguf_fp32_to_fp16(wls_results[blk].dm);
-            winner_dmin[blk] = gguf_fp32_to_fp16(wls_results[blk].mm);
-            memcpy(winner_Ls[blk], wls_results[blk].Ls, 16);
-            memcpy(winner_Lm[blk], wls_results[blk].Lm, 16);
+            float best_err = candidate_errors[blk][0];
+            int best_idx = 0;
+            for (int c = 1; c < TOTAL_SCALE_CANDIDATES; c++) {
+                if (candidate_errors[blk][c] < best_err) {
+                    best_err = candidate_errors[blk][c];
+                    best_idx = c;
+                }
+            }
+            best_candidate[blk] = best_idx;
         }
     }
-
-    free(bin_errors);
-    free(wls_results);
 
     /* ══════════════════════════════════════════════════════════════════
      * PHASE 4: Assemble blocks via least-squares (d, dmin) extraction
@@ -2325,53 +2467,48 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
     #pragma omp parallel for schedule(dynamic, 64) reduction(+:total_err)
     for (int64_t blk = 0; blk < n_blocks; blk++) {
         const float *block_x = weights + blk * QK_K;
+        int cidx = best_candidate[blk];
         uint8_t Ls_blk[16], Lm_blk[16];
 
-        /* Start from assembled winner */
-        memcpy(Ls_blk, winner_Ls[blk], 16);
-        memcpy(Lm_blk, winner_Lm[blk], 16);
+        /* Start from HPC-selected candidate */
+        memcpy(Ls_blk, candidate_Ls[blk][cidx], 16);
+        memcpy(Lm_blk, candidate_Lm[blk][cidx], 16);
 
-        float dm = gguf_fp16_to_fp32(winner_d[blk]);
-        float mm = gguf_fp16_to_fp32(winner_dmin[blk]);
+        float dm = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
+        float mm = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
 
         /* ── Analog assembly: iterate to convergence ──
          * 5 iterations: enough for the (Ls,Lm) ↔ (d,dmin) coupling
          * to fully stabilize. Each iteration does:
-         *   A) Sub-block Quhit BP to find coupled (Ls,Lm) states
+         *   A) Exhaustive (Ls,Lm) search per sub-block
          *   B) Optimal q-value assignment
          *   C) WLS solve for (d, dmin) */
         for (int ls_iter = 0; ls_iter < 2; ls_iter++) {
 
-            /* ── Step A: Sub-block Quhit BP (Strategy 1) ──
-             * For each sub-block j, evaluate all 256 (Ls, Lm) pairs.
-             * Keep the 6 best pairs as quhit states for a 16-node graph.
-             * Run BP to jointly select the globally optimal (Ls, Lm). */
-            uint8_t state_ls[N_SUB][6];
-            uint8_t state_lm[N_SUB][6];
-            float state_err[N_SUB][6];
-
+            /* ── Step A: Exhaustive Ls/Lm search per sub-block ──
+             * For each sub-block j, try ALL 16×16 = 256 possible
+             * (Ls[j], Lm[j]) pairs. For each pair, compute optimal
+             * q-values by rounding and measure weighted sub-block error.
+             * Pick the pair that minimizes error. */
             for (int j = 0; j < N_SUB; j++) {
                 const float *sx = block_x + 16 * j;
-                for (int v = 0; v < 6; v++) state_err[j][v] = 1e30f;
+                float best_sub_err = 1e30f;
+                uint8_t best_ls = Ls_blk[j], best_lm = Lm_blk[j];
 
-                /* Narrow search: ±3 around current assignment (49 vs 256 pairs) */
-                int ls_lo = (int)Ls_blk[j] - 3; if (ls_lo < 0) ls_lo = 0;
-                int ls_hi = (int)Ls_blk[j] + 3; if (ls_hi > 15) ls_hi = 15;
-                int lm_lo = (int)Lm_blk[j] - 3; if (lm_lo < 0) lm_lo = 0;
-                int lm_hi = (int)Lm_blk[j] + 3; if (lm_hi > 15) lm_hi = 15;
-
-                for (int try_ls = ls_lo; try_ls <= ls_hi; try_ls++) {
+                for (int try_ls = 0; try_ls <= 15; try_ls++) {
                     float d_sub = dm * (float)try_ls;
-                    for (int try_lm = lm_lo; try_lm <= lm_hi; try_lm++) {
+                    for (int try_lm = 0; try_lm <= 15; try_lm++) {
                         float m_sub = mm * (float)try_lm;
-                        float sub_err = 0.0f;
 
+                        float sub_err = 0.0f;
                         for (int k = 0; k < 16; k++) {
                             float x = sx[k];
                             float w = (imat_importance) ?
                                       imat_importance[blk * QK_K + 16*j + k] : 1.0f;
-                            int q = 0;
-                            if (d_sub >= 1e-15f) {
+                            int q;
+                            if (d_sub < 1e-15f) {
+                                q = 0;
+                            } else {
                                 q = gguf_nearest_int((x + m_sub) / d_sub);
                                 if (q < 0) q = 0; if (q > 3) q = 3;
                             }
@@ -2380,79 +2517,17 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
                             sub_err += diff * diff * w;
                         }
 
-                        /* Insert into top 6 */
-                        for (int v = 0; v < 6; v++) {
-                            if (sub_err < state_err[j][v]) {
-                                for (int u = 5; u > v; u--) {
-                                    state_err[j][u] = state_err[j][u-1];
-                                    state_ls[j][u] = state_ls[j][u-1];
-                                    state_lm[j][u] = state_lm[j][u-1];
-                                }
-                                state_err[j][v] = sub_err;
-                                state_ls[j][v] = (uint8_t)try_ls;
-                                state_lm[j][v] = (uint8_t)try_lm;
-                                break;
-                            }
+                        if (sub_err < best_sub_err) {
+                            best_sub_err = sub_err;
+                            best_ls = (uint8_t)try_ls;
+                            best_lm = (uint8_t)try_lm;
+                            if (sub_err < 1e-10f) goto done_sub;
                         }
                     }
                 }
-            }
-
-            /* Pick top-6 (Ls, Lm) per sub-block, then couple via HPC graph.
-             * Narrow search: ±3 around current Ls/Lm (max 49 vs 256 pairs).
-             * The graph preserves global error correction across sub-blocks. */
-            for (int j = 0; j < N_SUB; j++) {
-                Ls_blk[j] = state_ls[j][0];
-                Lm_blk[j] = state_lm[j][0];
-            }
-
-            HPCGraph *sg = hpc_create(N_SUB);
-            if (sg) {
-                float min_sub_err[N_SUB];
-                for (int j = 0; j < N_SUB; j++) min_sub_err[j] = state_err[j][0];
-
-                for (int j = 0; j < N_SUB; j++) {
-                    triality_dft(&sg->locals[j]);
-                    double amp_re[6], amp_norm = 0.0;
-                    for (int v = 0; v < 6; v++) {
-                        amp_re[v] = exp(-(double)(state_err[j][v] - min_sub_err[j]) / 0.1);
-                        amp_norm += amp_re[v] * amp_re[v];
-                    }
-                    if (amp_norm > 1e-30) {
-                        double inv = 1.0 / sqrt(amp_norm);
-                        for (int v = 0; v < 6; v++) amp_re[v] *= inv;
-                    }
-                    for (int v = 0; v < 6; v++) {
-                        sg->locals[j].edge_re[v] = amp_re[v];
-                        sg->locals[j].edge_im[v] = 0.0;
-                    }
-                    sg->locals[j].primary = VIEW_EDGE;
-                    sg->locals[j].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
-                    sg->locals[j].delta_valid = 0;
-                    triality_update_mask(&sg->locals[j]);
-                }
-
-                for (int j = 0; j < N_SUB - 1; j++)
-                    hpc_cz(sg, j, j + 1);
-
-                MobiusAmplitudeSheet *smob = mobius_create(sg);
-                z6_complex_amplitude_bp(smob, 0, 10);  /* 10 iters: chain converges in ~8 */
-
-                for (int j = 0; j < N_SUB; j++) {
-                    double best_prob = -1.0;
-                    int best_v = 0;
-                    for (int v = 0; v < 6; v++) {
-                        double re = smob->sheets[j].dressed_re[v];
-                        double im = smob->sheets[j].dressed_im[v];
-                        double prob = re*re + im*im;
-                        if (prob > best_prob) { best_prob = prob; best_v = v; }
-                    }
-                    Ls_blk[j] = state_ls[j][best_v];
-                    Lm_blk[j] = state_lm[j][best_v];
-                }
-
-                mobius_destroy(smob);
-                hpc_destroy(sg);
+                done_sub:;
+                Ls_blk[j] = best_ls;
+                Lm_blk[j] = best_lm;
             }
 
             /* ── Step B: Quantize q-values with optimal Ls/Lm ── */
@@ -2497,17 +2572,13 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             if (fabs(det) > 1e-30) {
                 double d_new  = (Sbb * Sxa - Sab * Sxb) / det;
                 double dm_new = (Sab * Sxa - Saa * Sxb) / det;
-                /* Clamp: positive and within 4× of assembled seed */
-                float d_seed = gguf_fp16_to_fp32(winner_d[blk]);
-                float m_seed = gguf_fp16_to_fp32(winner_dmin[blk]);
+                /* Clamp: positive and within 4× of candidate seed */
+                float d_seed = gguf_fp16_to_fp32(candidate_d[blk][cidx]);
+                float m_seed = gguf_fp16_to_fp32(candidate_dmin[blk][cidx]);
                 if (d_new > 0.0 && d_new < 4.0 * (d_seed + 1e-10))
                     dm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)d_new));
                 if (dm_new > 0.0 && dm_new < 4.0 * (m_seed + 1e-10))
                     mm = gguf_fp16_to_fp32(gguf_fp32_to_fp16((float)dm_new));
-            }
-            if (isnan(dm) || isnan(mm)) {
-                printf("NaN detected before ULP: dm=%f mm=%f det=%f\n", dm, mm, det);
-                exit(1);
             }
         }
 
@@ -2754,20 +2825,16 @@ static void quantize_tensor_q2k_hpc(const float *weights, int64_t n_elements,
             }
         }
 
-        float berr = gguf_q2_k_block_error(block_x, &output[blk]);
-        if (isnan(berr)) {
-            printf("NaN block error at blk %ld! dm=%f mm=%f\n", (long)blk, dm, mm);
-            for (int j=0; j<16; j++) printf("Ls[%d]=%d Lm[%d]=%d\n", j, Ls_blk[j], j, Lm_blk[j]);
-            exit(1);
-        }
-        total_err += berr;
+        total_err += gguf_q2_k_block_error(block_x, &output[blk]);
     }
 
     free(seeds);
-    free(winner_d);
-    free(winner_dmin);
-    free(winner_Ls);
-    free(winner_Lm);
+    free(candidate_errors);
+    free(candidate_d);
+    free(candidate_dmin);
+    free(candidate_Ls);
+    free(candidate_Lm);
+    free(best_candidate);
     if (out_total_error) *out_total_error = total_err;
     
     if (verbose) {
