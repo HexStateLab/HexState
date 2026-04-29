@@ -559,22 +559,13 @@ def dequant_q2k_fast(q2k_bytes, n_blocks):
     for half in range(2):
         qs_half = qs[:, half * 32:(half + 1) * 32]  # [n_blocks, 32]
         for sub in range(4):
+            j = half * 8 + sub
             # Extract 2-bit quants at this shift position
             q_vals = ((qs_half >> (sub * 2)) & 3).astype(np.float32)  # [n_blocks, 32]
-            
-            # The 32 weights correspond to two 16-weight sub-blocks
-            j0 = half * 8 + sub * 2
-            j1 = half * 8 + sub * 2 + 1
-            
+            # Reconstruct: d_sub[j] * q - m_sub[j]
             base_idx = half * 128 + sub * 32
-            
-            # First 16 elements use scale j0
-            result[:, base_idx:base_idx + 16] = (
-                d_sub[:, j0:j0+1] * q_vals[:, :16] - m_sub[:, j0:j0+1]
-            )
-            # Next 16 elements use scale j1
-            result[:, base_idx + 16:base_idx + 32] = (
-                d_sub[:, j1:j1+1] * q_vals[:, 16:] - m_sub[:, j1:j1+1]
+            result[:, base_idx:base_idx + 32] = (
+                d_sub[:, j:j+1] * q_vals - m_sub[:, j:j+1]
             )
     return result.reshape(-1)
 
@@ -644,7 +635,7 @@ def should_quantize(name, n_dims, dims, tied_embeddings=False):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf> [--keep-metadata] [--q2all]")
+        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf> [--keep-metadata]")
         sys.exit(1)
 
     input_path = sys.argv[1]
@@ -671,10 +662,7 @@ def main():
     print()
     print("  ╔════════════════════════════════════════════════════════════════╗")
     print("  ║  HExState GGUF Re-Quantizer                                  ║")
-    if q2all:
-        print("  ║  Mode: Q2_K ALL (every weight tensor → 2-bit)                ║")
-    else:
-        print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
+    print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
     if use_hpc and imatrix_data:
         print("  ║  Engine: HPC + iMatrix (calibrated sensitivity propagation)  ║")
     elif use_hpc:
@@ -760,19 +748,14 @@ def main():
             if quantize_none:
                 will_quant = False
             elif should_quantize(ti['name'], ti['n_dims'], ti['dims'], tied_embeddings):
-                if q2all:
-                    # --q2all: force everything to Q2_K except tied embeddings
-                    if tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
-                        will_quant = 'ATTN_Q4'  # Must keep as Q4_0 (serves as LM head)
-                        total_attn += 1
-                    else:
-                        will_quant = True
-                        total_quant += 1
+                if tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
+                    will_quant = 'ATTN_Q4'  # Promote tied embedding to Q4_0
+                    total_attn += 1
+                elif q2all:
+                    will_quant = True  # --q2all: everything to Q2_K
+                    total_quant += 1
                 elif is_attention_tensor(ti['name']):
                     will_quant = 'ATTN_Q4'  # Promote attention to Q4_0 HPC
-                    total_attn += 1
-                elif tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
-                    will_quant = 'ATTN_Q4'  # Promote tied embedding to Q4_0
                     total_attn += 1
                 else:
                     will_quant = True
@@ -783,10 +766,7 @@ def main():
             quant_plan.append(will_quant)
 
         print(f"  Tensors to quantize (Q2_K):     {total_quant}")
-        if not q2all:
-            print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
-        elif total_attn > 0:
-            print(f"  Tensors kept at Q4_0 (tied embd):{total_attn}")
+        print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
         print(f"  Tensors to keep as-is:          {total_keep}")
         print()
 
