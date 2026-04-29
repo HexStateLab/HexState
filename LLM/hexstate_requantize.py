@@ -644,13 +644,14 @@ def should_quantize(name, n_dims, dims, tied_embeddings=False):
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf> [--keep-metadata]")
+        print("Usage: python3 hexstate_requantize.py <input.gguf> <output.gguf> [--keep-metadata] [--q2all]")
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2]
     keep_metadata = '--keep-metadata' in sys.argv
     quantize_none = '--quantize-none' in sys.argv
+    q2all = '--q2all' in sys.argv
 
     # Check for imatrix
     imatrix_data = None
@@ -670,7 +671,10 @@ def main():
     print()
     print("  ╔════════════════════════════════════════════════════════════════╗")
     print("  ║  HExState GGUF Re-Quantizer                                  ║")
-    print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
+    if q2all:
+        print("  ║  Mode: Q2_K ALL (every weight tensor → 2-bit)                ║")
+    else:
+        print("  ║  GGUF → Q2_K GGUF with metadata passthrough                  ║")
     if use_hpc and imatrix_data:
         print("  ║  Engine: HPC + iMatrix (calibrated sensitivity propagation)  ║")
     elif use_hpc:
@@ -756,7 +760,15 @@ def main():
             if quantize_none:
                 will_quant = False
             elif should_quantize(ti['name'], ti['n_dims'], ti['dims'], tied_embeddings):
-                if is_attention_tensor(ti['name']):
+                if q2all:
+                    # --q2all: force everything to Q2_K except tied embeddings
+                    if tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
+                        will_quant = 'ATTN_Q4'  # Must keep as Q4_0 (serves as LM head)
+                        total_attn += 1
+                    else:
+                        will_quant = True
+                        total_quant += 1
+                elif is_attention_tensor(ti['name']):
                     will_quant = 'ATTN_Q4'  # Promote attention to Q4_0 HPC
                     total_attn += 1
                 elif tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
@@ -771,7 +783,10 @@ def main():
             quant_plan.append(will_quant)
 
         print(f"  Tensors to quantize (Q2_K):     {total_quant}")
-        print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
+        if not q2all:
+            print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
+        elif total_attn > 0:
+            print(f"  Tensors kept at Q4_0 (tied embd):{total_attn}")
         print(f"  Tensors to keep as-is:          {total_keep}")
         print()
 
