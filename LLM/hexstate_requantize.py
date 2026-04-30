@@ -535,6 +535,13 @@ def dequant_q2k_fast(q2k_bytes, n_blocks):
 
     The C struct BlockQ2K in gguf_format.h is:
         { uint8_t scales[16]; uint8_t qs[64]; uint16_t d; uint16_t dmin; }
+
+    Dequantization follows gguf_dequantize_q2_k_block() exactly:
+        For each half (0..1), qs_half = qs[half*32 : half*32+32]
+        For each shift j (0..3):
+            scale_idx = half*8 + j*2
+            elements [0..15]  use scales[scale_idx],   from qs_half[0..15]  >> (j*2)
+            elements [16..31] use scales[scale_idx+1], from qs_half[16..31] >> (j*2)
     """
     data = np.frombuffer(q2k_bytes, dtype=np.uint8).reshape(n_blocks, 84)
 
@@ -552,20 +559,28 @@ def dequant_q2k_fast(q2k_bytes, n_blocks):
     d_sub = d_fp16[:, np.newaxis] * sc               # [n_blocks, 16]
     m_sub = dmin_fp16[:, np.newaxis] * mn             # [n_blocks, 16]
 
-    # Unpack 2-bit quants from qs[64] into 256 values per block
-    # Layout: 2 groups of 128. Each group uses 32 bytes of qs.
-    # Within each group: 4 sub-blocks of 32 weights, packed at bit shifts 0,2,4,6
+    # Unpack 2-bit quants from qs[64] into 256 values per block.
+    # Matches C reference: two scales per 32-byte extraction (16 elements each).
+    #   half=0: qs[0..31],  half=1: qs[32..63]
+    #   shift j=0..3: scale_idx = half*8 + j*2 (first 16), +1 (second 16)
     result = np.zeros((n_blocks, QK_K), dtype=np.float32)
     for half in range(2):
         qs_half = qs[:, half * 32:(half + 1) * 32]  # [n_blocks, 32]
         for sub in range(4):
-            j = half * 8 + sub
             # Extract 2-bit quants at this shift position
             q_vals = ((qs_half >> (sub * 2)) & 3).astype(np.float32)  # [n_blocks, 32]
-            # Reconstruct: d_sub[j] * q - m_sub[j]
             base_idx = half * 128 + sub * 32
-            result[:, base_idx:base_idx + 32] = (
-                d_sub[:, j:j+1] * q_vals - m_sub[:, j:j+1]
+
+            # First 16 elements: qs_half[0..15], scale index = half*8 + sub*2
+            si_0 = half * 8 + sub * 2
+            result[:, base_idx:base_idx + 16] = (
+                d_sub[:, si_0:si_0+1] * q_vals[:, :16] - m_sub[:, si_0:si_0+1]
+            )
+
+            # Second 16 elements: qs_half[16..31], scale index = si_0 + 1
+            si_1 = si_0 + 1
+            result[:, base_idx + 16:base_idx + 32] = (
+                d_sub[:, si_1:si_1+1] * q_vals[:, 16:] - m_sub[:, si_1:si_1+1]
             )
     return result.reshape(-1)
 
