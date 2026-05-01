@@ -2911,7 +2911,7 @@ int main(int argc, char **argv)
                     bigint_to_decimal(bp_str, sizeof(bp_str), &best_partial);
                     printf("\n  ★★★ LATE FACTORIZATION: best_partial (%s) was a valid factoring period! ★★★\n", bp_str);
                     printf("  %s × %s = N\n", p_str, q_str);
-                } else if (bigint_cmp(&best_partial, &bi_one) > 0) {
+                } else if (status == 2 || status == -1) {
                     /* Calculate actual period contribution for this base */
                     BigInt current_period;
                     bigint_set_u64(&current_period, 0); /* Initialize the struct properly first */
@@ -2922,17 +2922,23 @@ int main(int argc, char **argv)
                         bigint_copy(&cross_base_lcm, &current_period);
                         printf("  [Cross-base] Initialized LCM to verified period contribution\n");
                     } else {
+                        /* Save previous state before modifying */
+                        BigInt prev_lcm;
+                        bigint_set_u64(&prev_lcm, 0);
+                        bigint_copy(&prev_lcm, &cross_base_lcm);
+
                         /* Subsequent bases: accumulate LCM */
                         /* Proper LCM update: lcm(a,b) = (a*b)/gcd(a,b) */
                         bigint_gcd(&cross_base_gcd, &cross_base_lcm, &current_period);
                         bigint_mul(&cross_base_prod, &cross_base_lcm, &current_period);
                         bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
-                    }
 
-                    /* Clamp: if LCM exceeds N, hold current state */
-                    if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
-                        printf("  [Cross-base] LCM exceeded N, holding previous state\n");
-                        bigint_copy(&cross_base_lcm, &cross_base_gcd);  /* fall back to GCD */
+                        /* Clamp: if LCM exceeds N, hold previous state */
+                        if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
+                            printf("  [Cross-base] LCM exceeded N, holding previous state\n");
+                            bigint_copy(&cross_base_lcm, &prev_lcm);  /* fall back to prev_lcm */
+                        }
+                        bigint_clear(&prev_lcm);
                     }
 
                     uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
