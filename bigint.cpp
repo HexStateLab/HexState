@@ -24,6 +24,14 @@ void bigint_clear(BigInt *a) {
     mpz_set_ui(a->z, 0);
 }
 
+void bigint_destroy(BigInt *a) {
+    if (a->_initialized == BIGINT_MAGIC &&
+        a->z->_mp_alloc > 0 && a->z->_mp_alloc < (1 << 20)) {
+        mpz_clear(a->z);
+    }
+    a->_initialized = 0;
+}
+
 void bigint_copy(BigInt *dst, const BigInt *src) {
     bigint_ensure_init(dst);
     /* src should always be initialized if it holds a value */
