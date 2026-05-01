@@ -34,7 +34,8 @@ The engine requires zero dependencies outside of standard `mpfr` and `gmp` libra
 
 ```bash
 # Compile with heavy optimizations
-make
+gcc -O2 -std=gnu99 -o tesseract_factor tesseract_factor.c \
+    quhit_triality.c quhit_hexagram.c s6_exotic.c bigint.c -lm -lgmp -lmpfr
 
 # Execute with the default target
 ./factor
