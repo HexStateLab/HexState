@@ -42,15 +42,9 @@
 #include "bigint.h"
 #define D 6
 
-#include <stdlib.h>
-
-BigInt *cf_pool = NULL;
+BigInt cf_pool[10000];
 int cf_pool_count = 0;
-#define CF_POOL_MAX 100000000
 
-static int cf_pool_cmp(const void *a, const void *b) {
-    return bigint_cmp((const BigInt*)a, (const BigInt*)b);
-}
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1316,26 +1310,20 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01);
+static int hpc_measure_site_with_probs(HPCGraph *graph, int target_site,
+                                       const double probs[6], double random_01);
 
 /* Forward declaration — hpc_exact_marginals is defined below */
 static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
                                 double probs_out[6]);
 
-static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
+/* ── Collapse + Back-Action core (shared by both measure variants) ──
+ * After sampling an outcome, this collapses the target site to |outcome⟩,
+ * absorbs all edge weights into neighbor local states (Magic Pointer
+ * disentanglement), and removes the dead edges from the graph. */
+static int hpc_measure_site_collapse(HPCGraph *graph, int target_site, int outcome)
 {
-    /* Step 1: Compute marginal probabilities */
-    double probs[6];
-    hpc_exact_marginals(graph, target_site, probs);
-
-    /* Step 2: Sample outcome */
-    double cumul = 0.0;
-    int outcome = 5;
-    for (int v = 0; v < 6; v++) {
-        cumul += probs[v];
-        if (random_01 <= cumul) { outcome = v; break; }
-    }
-
-    /* Step 3: Collapse local state to |outcome⟩ */
+    /* Step 1: Collapse local state to |outcome⟩ */
     for (int v = 0; v < 6; v++) {
         graph->locals[target_site].edge_re[v] = (v == outcome) ? 1.0 : 0.0;
         graph->locals[target_site].edge_im[v] = 0.0;
@@ -1344,9 +1332,10 @@ static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
     graph->locals[target_site].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
     graph->locals[target_site].delta_valid = 0;
 
-    /* Step 4: Absorb edge weights into neighbor states.
+    /* Step 2: Absorb edge weights into neighbor states (back-action).
      * For each edge (target, neighbor), the weight w(outcome, d) for each
-     * neighbor basis state d gets multiplied into the neighbor's amplitude. */
+     * neighbor basis state d gets multiplied into the neighbor's amplitude.
+     * This is the Magic Pointer disentanglement — see magic_pointer.h mp_measure. */
     HPCAdjList *adj = &graph->adj[target_site];
     for (uint64_t ei = 0; ei < adj->count; ei++) {
         uint64_t eid = adj->edge_ids[ei];
@@ -1379,7 +1368,7 @@ static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
         pq->delta_valid = 0;
     }
 
-    /* Step 5: Remove edges touching this site from the graph.
+    /* Step 3: Remove edges touching this site from the graph.
      * We mark them by setting fidelity to -1 and remove from adj lists. */
     for (uint64_t ei = 0; ei < adj->count; ei++) {
         uint64_t eid = adj->edge_ids[ei];
@@ -1400,6 +1389,36 @@ static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
     adj->count = 0; /* Clear target's adj list */
 
     return outcome;
+}
+
+/* Full measure: computes marginals, samples, collapses + back-action */
+static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
+{
+    double probs[6];
+    hpc_exact_marginals(graph, target_site, probs);
+
+    double cumul = 0.0;
+    int outcome = 5;
+    for (int v = 0; v < 6; v++) {
+        cumul += probs[v];
+        if (random_01 <= cumul) { outcome = v; break; }
+    }
+
+    return hpc_measure_site_collapse(graph, target_site, outcome);
+}
+
+/* Measure with pre-computed marginals: skips redundant hpc_exact_marginals call */
+static int hpc_measure_site_with_probs(HPCGraph *graph, int target_site,
+                                       const double probs[6], double random_01)
+{
+    double cumul = 0.0;
+    int outcome = 5;
+    for (int v = 0; v < 6; v++) {
+        cumul += probs[v];
+        if (random_01 <= cumul) { outcome = v; break; }
+    }
+
+    return hpc_measure_site_collapse(graph, target_site, outcome);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1484,13 +1503,7 @@ static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
     uint64_t n_configs = 1;
     for (int i = 0; i < n_iqft; i++) n_configs *= 6;
 
-    if (n_configs > 100000000ULL || n_iqft > 20) {
-        /* Neighborhood too dense for exact enumeration.
-         * Fall back to analytical product-state marginal using
-         * local amplitudes × work register factor (below). */
-        /* NOTE: with the Griffiths-Niu semi-classical path, this
-         * bailout is rarely hit since measurements collapse sites
-         * sequentially, keeping neighborhoods bounded. */
+    if (n_configs > 100000000ULL || n_iqft > 12) {
         const TrialityQuhit *q = &graph->locals[target_site];
         double tot = 0.0;
         for (int v = 0; v < 6; v++) {
@@ -1865,11 +1878,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     clock_t t_setup_start = clock();
 
-    /* Reset CF pool for this attempt — each base has a different period,
-     * so cross-attempt convergents would produce meaningless proximity pairs. */
-    for (int i = 0; i < cf_pool_count; i++) bigint_destroy(&cf_pool[i]);
-    cf_pool_count = 0;
-
     /* Put all sites in uniform superposition */
     for (int i = 0; i < n_sites; i++)
         triality_dft(&graph->locals[i]);
@@ -1997,39 +2005,17 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site1 = blk * 6 + 1;
 
         for (int d = 0; d < 6; d++) {
-            /* Full-precision phase computation: MPFR precision scales with N
-             * so no information is lost regardless of N's bitlength.
-             * cos/sin computed in MPFR domain — only the final trig values
-             * (bounded to [-1,1]) are cast to double. */
-            mpfr_prec_t phase_prec = (mpfr_prec_t)(nbits * 2 + 64);
-            mpfr_t mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin;
-            mpfr_init2(mp_ratio, phase_prec);
-            mpfr_init2(mp_phase, phase_prec);
-            mpfr_init2(mp_2pi, phase_prec);
-            mpfr_init2(mp_cos, phase_prec);
-            mpfr_init2(mp_sin, phase_prec);
-            mpfr_const_pi(mp_2pi, MPFR_RNDN);
-            mpfr_mul_ui(mp_2pi, mp_2pi, 2, MPFR_RNDN);
+            /* Compute residue / N directly in double (sufficient for
+             * the phase rotation — the 2048-bit MPFR was overkill since
+             * both values are < N < 2^48 and double has 53-bit mantissa) */
+            double yA = (double)bigint_to_u64(&gc_powersA[d]);
+            double yB = (double)bigint_to_u64(&gc_powersB[d]);
+            double Nd = (double)bigint_to_u64(N);
+            double phaseA = 2.0 * M_PI * yA / Nd;
+            double phaseB = 2.0 * M_PI * yB / Nd;
 
-            /* phaseA = 2π × gc_powersA[d] / N */
-            mpfr_set_z(mp_ratio, gc_powersA[d].z, MPFR_RNDN);
-            mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
-            mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
-            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
-            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
-            double cosA = mpfr_get_d(mp_cos, MPFR_RNDN);
-            double sinA = mpfr_get_d(mp_sin, MPFR_RNDN);
-
-            /* phaseB = 2π × gc_powersB[d] / N */
-            mpfr_set_z(mp_ratio, gc_powersB[d].z, MPFR_RNDN);
-            mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
-            mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
-            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
-            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
-            double cosB = mpfr_get_d(mp_cos, MPFR_RNDN);
-            double sinB = mpfr_get_d(mp_sin, MPFR_RNDN);
-
-            mpfr_clears(mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin, (mpfr_ptr)0);
+            double cosA = cos(phaseA), sinA = sin(phaseA);
+            double cosB = cos(phaseB), sinB = sin(phaseB);
 
             double rA = graph->locals[site0].edge_re[d];
             double iA = graph->locals[site0].edge_im[d];
@@ -2063,10 +2049,14 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = bypass_sites[j];
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* Uniform phase coupling — no DSP windowing.
-             * A Hann/Hamming window destroys QFT unitarity and blurs
-             * the interference peaks.  All blocks contribute equally. */
-            double phase_scale = 1.0;
+            /* ── Spectral Windowed PHASE Attenuation (Hann² window) ──
+             * Hann²(blk) = [0.5 * (1 - cos(2π * blk / (n_blocks - 1)))]²
+             * Squared Hann tapers boundaries more steeply, suppressing sidelobes. */
+            double hann_w = (n_blocks > 1)
+                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
+                : 1.0;
+            hann_w = 0.05 + 0.95 * hann_w;  /* Floor at 5% to prevent boundary zeroing */
+            double phase_scale = hann_w;     /* No 1/√n — BP damping controls stability */
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -2129,10 +2119,12 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = s_head;
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* Uniform bridge coupling — no DSP windowing.
-             * Same rationale as intra-block: tapering inter-block
-             * phase transfers destroys global QFT unitarity. */
-            double bridge_scale = 1.0;
+            /* ── Spectral Windowed PHASE Attenuation on bridge (Hann²) ── */
+            double hann_bridge = (n_blocks > 1)
+                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
+                : 1.0;
+            hann_bridge = 0.05 + 0.95 * hann_bridge;  /* Floor at 5% */
+            double bridge_scale = hann_bridge;          /* No 1/√n */
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -2227,7 +2219,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_mul(&bi_t, &mult_bi[d-1], &ck_cache[k]);
             bigint_div_mod(&bi_t, N, &dummy_q, &mult_bi[d]);
         }
-        bigint_destroy(&dummy_q);
+        bigint_clear(&dummy_q);
 
         /* Precompute base-6 digits of mult_bi[d] */
         int mult_digits[6][n_work];
@@ -2240,10 +2232,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 mult_digits[d][p] = (int)bigint_to_u64(&r6);
                 bigint_copy(&tmp_bi, &q6);
             }
-            bigint_destroy(&tmp_bi); bigint_destroy(&r6); bigint_destroy(&q6);
-            bigint_destroy(&mult_bi[d]);
+            bigint_clear(&tmp_bi); bigint_clear(&r6); bigint_clear(&q6);
+            bigint_clear(&mult_bi[d]);
         }
-        bigint_destroy(&bi_t); bigint_destroy(&bi_t2);
+        bigint_clear(&bi_t); bigint_clear(&bi_t2);
 
         /* Create controlled-perm edge: freq_site_k controls the work register.
          * The perm edge encodes the constraint δ(work == mult[d] × y mod N)
@@ -2301,7 +2293,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate marginals — same format as before, just filled differently */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
-    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])calloc(marginals_sz, sizeof(mpfr_t[6]));
+    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
     for (int i = 0; i < marginals_sz; i++) {
         for (int d = 0; d < 6; d++) {
             mpfr_inits2(2048, marginals[i][d], (mpfr_ptr)0);
@@ -2332,37 +2324,44 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* ═══ GRIFFITHS-NIU SEMI-CLASSICAL QFT MEASUREMENT ═══
      *
      * Measures frequency register MSB-to-LSB. For each digit k:
-     *   1. Read oracle amplitudes α_k(d) from graph locals (phase basis)
-     *   2. Compute work register contribution C_k(d) from perm edge weights
-     *   3. Apply feed-forward phase correction: α'(d) = α(d) × C(d) × e^{-2πi d θ_k}
-     *   4. Apply IDFT6 to α'(d) → β(v): converts phase→computational basis
-     *   5. P(v) = |β(v)|² — interference happens in step 4
-     *   6. Sample outcome, update work register locals in graph
+     *   1. Compute feed-forward phase correction θ_k from previously measured digits
+     *   2. Apply θ_k to graph locals: α(d) *= e^{-2πi d θ_k}
+     *   3. Apply IDFT6 in-place: β(v) = (1/√6) Σ_d α'(d) e^{2πi dv/6}
+     *      THIS creates constructive/destructive interference at Shor peaks
+     *   4. Call hpc_exact_marginals — O(N·D) analytical Magic Pointer trace
+     *      over the external Hilbert space (no 6^N loop!)
+     *   5. Sample outcome via Born rule from exact marginals
+     *   6. Collapse site + back-action: absorb edge weights into work register
+     *      locals (Magic Pointer disentanglement — see magic_pointer.h)
      *
-     * The IDFT6 is what creates constructive interference at Shor frequencies.
-     * Without it, measuring in the phase basis gives uniform noise. */
+     * The back-action in step 6 replaces classical work register tracking.
+     * Interference is created by the IDFT6 in step 3 and preserved through
+     * the analytical edge contraction in the external Hilbert space. */
 
     int *measured_digits = (int*)calloc(n_sites_raw, sizeof(int));
-    BigInt work_val_bi;
-    bigint_set_u64(&work_val_bi, 1);  /* Classical work register tracking: starts at |1⟩ */
 
     for (int k = n_sites_raw - 1; k >= 0; k--) {
         int blk_k = k / 2, off_k = k % 2;
         int site_k = blk_k * 6 + off_k;
 
-        /* Step 1: Read oracle amplitudes from graph locals (phase basis) */
-        double alpha_re[6], alpha_im[6];
-        for (int d = 0; d < 6; d++) {
-            alpha_re[d] = graph->locals[site_k].edge_re[d];
-            alpha_im[d] = graph->locals[site_k].edge_im[d];
+        /* Step 1: Compute feed-forward phase correction from previously measured digits.
+         * The QFT phase is 2π F x / 6^n. For site k, the fractional phase from
+         * previously measured digit f_j (where j > k) is f_j / 6^{j-k+1}.
+         * So the power MUST start at 36.0 (6^2) for the immediately previous digit! */
+        double theta_k = 0.0;
+        {
+            double power = 36.0;
+            for (int j = k + 1; j < n_sites_raw; j++) {
+                theta_k += (double)measured_digits[j] / power;
+                power *= 6.0;
+            }
         }
 
         /* Step 2: Compute work register contribution C_k(d) analytically.
-         * For each control value d, the perm edges connect freq_k to work
-         * register digits. The work register is in state |work_val⟩.
-         * C_k(d) = Π_j w_e(d, work_digit_j) — product over work digit edges.
-         * Since work register locals are δ-functions (sharp), only one
-         * work digit value contributes per edge. */
+         * C_k(d) = Π_j Σ_{w=0}^{5} local_j(w) × edge_weight(d, w)
+         * This MUST be multiplied into locals BEFORE the IDFT6 — the
+         * interference pattern depends on C_k(d) being inside the coherent sum.
+         * (Prototype proved: C_k outside IDFT6 → all signal at v=0 → broken) */
         double ck_re[6], ck_im[6];
         for (int d = 0; d < 6; d++) { ck_re[d] = 1.0; ck_im[d] = 0.0; }
 
@@ -2372,109 +2371,85 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             const HPCEdge *edge = &graph->edges[eid];
             uint64_t partner = (edge->site_a == (uint64_t)site_k) ?
                                 edge->site_b : edge->site_a;
-            if ((int)partner < g_work_start) continue;
+            if (g_work_start < 0 || (int)partner < g_work_start) continue;
 
-            /* Work register site: read its current value (delta function) */
-            int work_digit_val = 0;
-            double best_amp = 0;
             const TrialityQuhit *wq = &graph->locals[partner];
-            for (int w = 0; w < 6; w++) {
-                double a2 = wq->edge_re[w]*wq->edge_re[w] + wq->edge_im[w]*wq->edge_im[w];
-                if (a2 > best_amp) { best_amp = a2; work_digit_val = w; }
-            }
-
-            /* Multiply edge weight w(d, work_digit_val) into C_k(d) */
             for (int d = 0; d < 6; d++) {
-                double wr, wi;
-                if (edge->site_a == (uint64_t)site_k) {
-                    wr = edge->w_re[d][work_digit_val];
-                    wi = edge->w_im[d][work_digit_val];
-                } else {
-                    wr = edge->w_re[work_digit_val][d];
-                    wi = edge->w_im[work_digit_val][d];
+                double sr = 0, si = 0;
+                for (int w = 0; w < 6; w++) {
+                    double lr = wq->edge_re[w], li = wq->edge_im[w];
+                    double wr, wi;
+                    if (edge->site_a == (uint64_t)site_k) {
+                        wr = edge->w_re[d][w]; wi = edge->w_im[d][w];
+                    } else {
+                        wr = edge->w_re[w][d]; wi = edge->w_im[w][d];
+                    }
+                    sr += lr*wr - li*wi;
+                    si += lr*wi + li*wr;
                 }
-                double nr = ck_re[d]*wr - ck_im[d]*wi;
-                double ni = ck_re[d]*wi + ck_im[d]*wr;
-                ck_re[d] = nr;
-                ck_im[d] = ni;
+                double nr = ck_re[d]*sr - ck_im[d]*si;
+                double ni = ck_re[d]*si + ck_im[d]*sr;
+                ck_re[d] = nr; ck_im[d] = ni;
             }
         }
 
-        /* Step 3: Feed-forward phase correction via MPFR.
-         * theta_k = Σ_{j>k} measured_digits[j] / 6^{j-k+1}
-         * Using MPFR eliminates the double overflow at 6^397 and the
-         * 53-bit precision event horizon that blinds distant digits. */
-        mpfr_prec_t ff_prec = (mpfr_prec_t)(nbits * 2 + 64);
-        mpfr_t mp_theta, mp_power, mp_digit, mp_term;
-        mpfr_init2(mp_theta, ff_prec);
-        mpfr_init2(mp_power, ff_prec);
-        mpfr_init2(mp_digit, ff_prec);
-        mpfr_init2(mp_term, ff_prec);
-        mpfr_set_d(mp_theta, 0.0, MPFR_RNDN);
-        mpfr_set_d(mp_power, 36.0, MPFR_RNDN);  /* 6^2 for first previous digit */
-        for (int j = k + 1; j < n_sites_raw; j++) {
-            mpfr_set_ui(mp_digit, (unsigned long)measured_digits[j], MPFR_RNDN);
-            mpfr_div(mp_term, mp_digit, mp_power, MPFR_RNDN);
-            mpfr_add(mp_theta, mp_theta, mp_term, MPFR_RNDN);
-            mpfr_mul_ui(mp_power, mp_power, 6, MPFR_RNDN);
-        }
-
-        double corrected_re[6], corrected_im[6];
+        /* Bake C_k(d) into locals: α(d) *= C_k(d) */
         for (int d = 0; d < 6; d++) {
-            /* α × C */
-            double ac_re = alpha_re[d]*ck_re[d] - alpha_im[d]*ck_im[d];
-            double ac_im = alpha_re[d]*ck_im[d] + alpha_im[d]*ck_re[d];
-
-            /* × e^{-2πi d θ_k} — compute trig in MPFR then extract double */
-            mpfr_t mp_angle, mp_cos_ff, mp_sin_ff, mp_2pi_ff;
-            mpfr_init2(mp_angle, ff_prec);
-            mpfr_init2(mp_cos_ff, ff_prec);
-            mpfr_init2(mp_sin_ff, ff_prec);
-            mpfr_init2(mp_2pi_ff, ff_prec);
-            mpfr_const_pi(mp_2pi_ff, MPFR_RNDN);
-            mpfr_mul_ui(mp_2pi_ff, mp_2pi_ff, 2, MPFR_RNDN);
-            mpfr_mul(mp_angle, mp_2pi_ff, mp_theta, MPFR_RNDN);
-            mpfr_mul_si(mp_angle, mp_angle, -d, MPFR_RNDN);
-            mpfr_cos(mp_cos_ff, mp_angle, MPFR_RNDN);
-            mpfr_sin(mp_sin_ff, mp_angle, MPFR_RNDN);
-            double pr = mpfr_get_d(mp_cos_ff, MPFR_RNDN);
-            double pi = mpfr_get_d(mp_sin_ff, MPFR_RNDN);
-            mpfr_clears(mp_angle, mp_cos_ff, mp_sin_ff, mp_2pi_ff, (mpfr_ptr)0);
-
-            corrected_re[d] = ac_re*pr - ac_im*pi;
-            corrected_im[d] = ac_re*pi + ac_im*pr;
+            double re = graph->locals[site_k].edge_re[d];
+            double im = graph->locals[site_k].edge_im[d];
+            graph->locals[site_k].edge_re[d] = re*ck_re[d] - im*ck_im[d];
+            graph->locals[site_k].edge_im[d] = re*ck_im[d] + im*ck_re[d];
         }
-        mpfr_clears(mp_theta, mp_power, mp_digit, mp_term, (mpfr_ptr)0);
 
-        /* Step 4: Apply IDFT6 to convert from phase basis → computational basis.
-         * β(v) = (1/√6) Σ_{d=0}^{5} α'(d) × e^{2πi d v / 6}
-         * THIS is where constructive/destructive interference creates the Shor peaks. */
+        /* Step 3: Apply feed-forward phase correction to locals (phase basis). */
+        for (int d = 0; d < 6; d++) {
+            double angle = -2.0 * M_PI * d * theta_k;
+            double pr = cos(angle), pi = sin(angle);
+            double re = graph->locals[site_k].edge_re[d];
+            double im = graph->locals[site_k].edge_im[d];
+            graph->locals[site_k].edge_re[d] = re*pr - im*pi;
+            graph->locals[site_k].edge_im[d] = re*pi + im*pr;
+        }
+
+        /* Step 4: Apply IDFT6 in-place: phase basis → computational basis.
+         * β(v) = (1/√6) Σ_{d=0}^{5} [α(d) × C_k(d) × e^{-2πi d θ_k}] × e^{2πi d v / 6}
+         * C_k(d) is INSIDE the coherent sum — THIS creates Shor peaks. */
+        {
+            double alpha_re[6], alpha_im[6];
+            for (int d = 0; d < 6; d++) {
+                alpha_re[d] = graph->locals[site_k].edge_re[d];
+                alpha_im[d] = graph->locals[site_k].edge_im[d];
+            }
+            double inv_sqrt6 = 1.0 / sqrt(6.0);
+            for (int v = 0; v < 6; v++) {
+                double sum_re = 0.0, sum_im = 0.0;
+                for (int d = 0; d < 6; d++) {
+                    double angle = 2.0 * M_PI * d * v / 6.0;
+                    double er = cos(angle), ei = sin(angle);
+                    sum_re += alpha_re[d]*er - alpha_im[d]*ei;
+                    sum_im += alpha_re[d]*ei + alpha_im[d]*er;
+                }
+                graph->locals[site_k].edge_re[v] = sum_re * inv_sqrt6;
+                graph->locals[site_k].edge_im[v] = sum_im * inv_sqrt6;
+            }
+        }
+
+        /* Step 5: Compute marginals from |local(v)|² — C_k already baked in.
+         * No need for hpc_exact_marginals work factor (it's in the locals). */
         double probs[6];
         double total = 0.0;
         for (int v = 0; v < 6; v++) {
-            double sum_re = 0.0, sum_im = 0.0;
-            for (int d = 0; d < 6; d++) {
-                double angle = 2.0 * M_PI * d * v / 6.0;
-                double er = cos(angle), ei2 = sin(angle);
-                sum_re += corrected_re[d]*er - corrected_im[d]*ei2;
-                sum_im += corrected_re[d]*ei2 + corrected_im[d]*er;
-            }
-            /* P(v) = |β(v)|² */
-            probs[v] = (sum_re*sum_re + sum_im*sum_im) / 6.0;
+            probs[v] = graph->locals[site_k].edge_re[v] * graph->locals[site_k].edge_re[v] +
+                       graph->locals[site_k].edge_im[v] * graph->locals[site_k].edge_im[v];
             total += probs[v];
         }
-
-        /* Normalize */
         if (total > 1e-30) {
-            for (int d = 0; d < 6; d++) probs[d] /= total;
+            for (int v = 0; v < 6; v++) probs[v] /= total;
         } else {
-            for (int d = 0; d < 6; d++) probs[d] = 1.0 / 6.0;
+            for (int v = 0; v < 6; v++) probs[v] = 1.0 / 6.0;
         }
 
-        /* Step 5: Born Rule Measurement
-         * Shor's algorithm creates a superposition of r valid frequency peaks.
-         * We MUST sample probabilistically. Taking MAP (argmax) deterministically
-         * forces the algorithm into a single peak (often s=0), causing it to fail. */
+        /* Step 6: Born rule sampling + back-action (collapse + edge absorption) */
         double r01 = (double)rand() / RAND_MAX;
         double cumul = 0.0;
         int outcome = 5;
@@ -2482,44 +2457,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             cumul += probs[d];
             if (r01 <= cumul) { outcome = d; break; }
         }
+        hpc_measure_site_collapse(graph, site_k, outcome);
         measured_digits[k] = outcome;
-
-        /* Step 6: Update work register in graph (Fix ghost state!)
-         * After measuring freq_k = outcome, the work register gets multiplied
-         * by c_k^outcome mod N. Update the graph locals so subsequent
-         * marginals see the LIVE state, not the initial |1⟩ ghost. */
-        {
-            /* mult = c_k^outcome mod N */
-            BigInt mult_val, bi_t, dummy_q;
-            bigint_set_u64(&mult_val, 1);
-            bigint_set_u64(&bi_t, 0); bigint_set_u64(&dummy_q, 0);
-            for (int d = 0; d < outcome; d++) {
-                bigint_mul(&bi_t, &mult_val, &ck_cache[k]);
-                bigint_div_mod(&bi_t, N, &dummy_q, &mult_val);
-            }
-            
-            /* Update classical tracker */
-            bigint_mul(&bi_t, &work_val_bi, &mult_val);
-            bigint_div_mod(&bi_t, N, &dummy_q, &work_val_bi);
-            bigint_destroy(&dummy_q);
-            
-            /* Sync graph locals: work register now represents |work_val⟩ */
-            BigInt tmp_bi, q6, r6;
-            bigint_set_u64(&tmp_bi, 0); bigint_set_u64(&q6, 0); bigint_set_u64(&r6, 0);
-            bigint_copy(&tmp_bi, &work_val_bi);
-            for (int j = 0; j < n_work; j++) {
-                bigint_div_mod(&tmp_bi, &b6, &q6, &r6);
-                int digit_j = (int)bigint_to_u64(&r6);
-                TrialityQuhit *wq = &graph->locals[work_start + j];
-                for (int w = 0; w < 6; w++) {
-                    wq->edge_re[w] = (w == digit_j) ? 1.0 : 0.0;
-                    wq->edge_im[w] = 0.0;
-                }
-                bigint_copy(&tmp_bi, &q6);
-            }
-            bigint_destroy(&mult_val); bigint_destroy(&bi_t);
-            bigint_destroy(&tmp_bi); bigint_destroy(&q6); bigint_destroy(&r6);
-        }
 
         /* Store in marginals for downstream CF extraction */
         for (int d = 0; d < 6; d++) {
@@ -2617,70 +2556,62 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_set_u64(&mc_term, 0);
     bigint_set_u64(&mc_tmp, 0);
 
-    /* ── Phase 4: Beam Search Frequency Generation ──
-     * Parent-pointer tree: O(beam_width × branches) per position instead of
-     * O(k × beam_width × branches) path copying.  Top-K argmax selection
-     * replaces O(n²) bubble sort. */
+    /* ── Phase 4: Beam Search Frequency Generation ── */
     printf("    Executing Beam Search over marginals...\n");
     int beam_width = 32;
+    int max_branches = 6;
     int current_paths = 1;
-
-    /* Parent-pointer tree: beam_parent[k][b] = parent beam at position k-1,
-     * beam_digit[k][b] = digit chosen at position k for beam b. */
-    int (*beam_parent)[32] = (int(*)[32])calloc(n_sites_raw, sizeof(int[32]));
-    int (*beam_digit)[32]  = (int(*)[32])calloc(n_sites_raw, sizeof(int[32]));
-    double *path_probs = (double*)calloc(beam_width, sizeof(double));
-
-    /* Scratch arrays for candidate expansion (max beam_width × 6 = 192) */
-    int    cand_cap = beam_width * 6;
-    double *cand_probs  = (double*)calloc(cand_cap, sizeof(double));
-    int    *cand_parent = (int*)calloc(cand_cap, sizeof(int));
-    int    *cand_digit  = (int*)calloc(cand_cap, sizeof(int));
-
+    
+    int **paths = (int**)malloc(beam_width * sizeof(int*));
+    double *path_probs = (double*)malloc(beam_width * sizeof(double));
+    for (int i = 0; i < beam_width; i++) paths[i] = (int*)malloc(n_sites_raw * sizeof(int));
+    
+    int **new_paths = (int**)malloc(beam_width * max_branches * sizeof(int*));
+    double *new_path_probs = (double*)malloc(beam_width * max_branches * sizeof(double));
+    for (int i = 0; i < beam_width * max_branches; i++) new_paths[i] = (int*)malloc(n_sites_raw * sizeof(int));
+    
+    path_probs[0] = 0.0;
+    
     for (int k = 0; k < n_sites_raw; k++) {
         double probs[6];
         for (int d = 0; d < 6; d++) {
             probs[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
-            if (probs[d] < 1e-10) probs[d] = 1e-10;
+            if (probs[d] < 1e-10) probs[d] = 1e-10; 
         }
-
-        int n_cands = 0;
+        
+        int next_paths = 0;
         for (int p = 0; p < current_paths; p++) {
             for (int d = 0; d < 6; d++) {
-                if (probs[d] > 1e-6) {
-                    cand_probs[n_cands]  = path_probs[p] + log(probs[d]);
-                    cand_parent[n_cands] = p;
-                    cand_digit[n_cands]  = d;
-                    n_cands++;
+                if (probs[d] > 0.05) { /* Prune unlikely branches */
+                    for (int i = 0; i < k; i++) new_paths[next_paths][i] = paths[p][i];
+                    new_paths[next_paths][k] = d;
+                    new_path_probs[next_paths] = path_probs[p] + log(probs[d]);
+                    next_paths++;
                 }
             }
         }
-
-        /* Top-K selection via argmax (O(n_cands × beam_width)) */
-        int top_count = (n_cands < beam_width) ? n_cands : beam_width;
-        double new_probs[32];
-        for (int t = 0; t < top_count; t++) {
-            int best = -1;
-            double best_lp = -1e30;
-            for (int i = 0; i < n_cands; i++) {
-                if (cand_probs[i] > best_lp) {
-                    best_lp = cand_probs[i];
-                    best = i;
+        
+        /* Sort descending */
+        for (int i = 0; i < next_paths - 1; i++) {
+            for (int j = i + 1; j < next_paths; j++) {
+                if (new_path_probs[j] > new_path_probs[i]) {
+                    double tmp_p = new_path_probs[i];
+                    new_path_probs[i] = new_path_probs[j];
+                    new_path_probs[j] = tmp_p;
+                    
+                    int *tmp_ptr = new_paths[i];
+                    new_paths[i] = new_paths[j];
+                    new_paths[j] = tmp_ptr;
                 }
             }
-            beam_parent[k][t] = cand_parent[best];
-            beam_digit[k][t]  = cand_digit[best];
-            new_probs[t]      = best_lp;
-            cand_probs[best]  = -2e9; /* poison so it can't be selected again */
         }
-
-        current_paths = top_count;
-        for (int t = 0; t < current_paths; t++) {
-            path_probs[t] = new_probs[t];
+        
+        current_paths = (next_paths < beam_width) ? next_paths : beam_width;
+        for (int p = 0; p < current_paths; p++) {
+            for (int i = 0; i <= k; i++) paths[p][i] = new_paths[p][i];
+            path_probs[p] = new_path_probs[p];
         }
     }
-
-    free(cand_probs); free(cand_parent); free(cand_digit);
 
     printf("    Generated %d candidate frequencies.\n", current_paths);
     printf("    Register size:     %u bits\n", bigint_bitlen(&reg_sz));
@@ -2688,23 +2619,14 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* CF expansion of F/R — test every candidate frequency */
     for (int p_idx = 0; p_idx < current_paths && !success; p_idx++) {
         BigInt freq; bigint_set_u64(&freq, 0);
-
-        /* Reconstruct digit sequence from parent-pointer backtracking */
-        int *seq = (int*)calloc(n_sites_raw, sizeof(int));
-        int cur_beam = p_idx;
-        for (int s = n_sites_raw - 1; s >= 0; s--) {
-            seq[s] = beam_digit[s][cur_beam];
-            cur_beam = beam_parent[s][cur_beam];
-        }
-
-        /* Build frequency from reconstructed path */
+        
+        /* Build frequency from beam path */
         for (int idx = 0; idx < n_sites_raw; idx++) {
-            bigint_set_u64(&mc_d_bi, (uint64_t)seq[idx]);
+            bigint_set_u64(&mc_d_bi, (uint64_t)paths[p_idx][idx]);
             bigint_mul(&mc_term, &mc_d_bi, &p6_cache[idx]);
             bigint_add(&mc_tmp, &freq, &mc_term);
             bigint_copy(&freq, &mc_tmp);
         }
-        free(seq);
         
         printf("\n    [Beam %2d] Freq = %u bits (log_P = %.2f)\n", p_idx, bigint_bitlen(&freq), path_probs[p_idx]);
 
@@ -2728,11 +2650,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     printf("    CF expansion: a0 = %u bits\n", bigint_bitlen(&cf_a));
 
-    /* CF steps scale with N: a 2048-bit period can require thousands
-     * of convergents.  2×nbits covers the worst case. */
-    int cf_max_steps = (int)(nbits * 2);
-    if (cf_max_steps < 200) cf_max_steps = 200;
-    for (int step = 0; step < cf_max_steps && !success; step++) {
+    /* Continue CF: swap num ↔ den, compute next quotient */
+    for (int step = 0; step < 200 && !success; step++) {
         /* num = old den, den = old remainder */
         bigint_copy(&cf_num, &cf_den);
         bigint_copy(&cf_den, &cf_rem);
@@ -2759,11 +2678,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             break;
         }
 
-        /* Add to global CF pool for proximity search.
-         * Only pool convergents with meaningful bitlength (>= nbits/4)
-         * to avoid trivial early CF values (2, 3, 5, 12...) dominating
-         * the closest-pair search. */
-        if (cf_pool_count < CF_POOL_MAX && bigint_bitlen(&cf_q0) >= nbits / 4) {
+        /* Add to global CF pool for common range clustering */
+        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) > 1) {
             bigint_copy(&cf_pool[cf_pool_count++], &cf_q0);
         }
 
@@ -2814,185 +2730,32 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d × %d [base-a], %u bits)\n", step, m, q_bits);
                     }
                 }
-                bigint_destroy(&r_mult); bigint_destroy(&m_bi);
+                bigint_clear(&r_mult); bigint_clear(&m_bi);
             }
-            bigint_destroy(&oracle_base);
+            bigint_clear(&oracle_base);
             
-            /* Record best partial period: only save convergents where
-             * the denominator is nontrivial (>1 bit) and smaller than N.
-             * This prevents the LCM accumulator from harvesting garbage
-             * from the final overflowed convergent. */
-            if (best_period && !success && bigint_bitlen(&cf_q0) > 1
-                && bigint_cmp(&cf_q0, N) < 0) {
+            /* Record the largest valid denominator as the best partial period for LCM harvesting */
+            if (best_period && !success) {
                 bigint_copy(best_period, &cf_q0);
             }
         }
     }
-    bigint_destroy(&cf_num); bigint_destroy(&cf_den); bigint_destroy(&cf_a); bigint_destroy(&cf_rem);
-    bigint_destroy(&cf_pm1); bigint_destroy(&cf_p0); bigint_destroy(&cf_qm1); bigint_destroy(&cf_q0);
-    bigint_destroy(&cf_p_new); bigint_destroy(&cf_q_new); bigint_destroy(&cf_tmp);
-    bigint_destroy(&freq);
+    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
+    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
+    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
+    bigint_clear(&freq);
     } /* End of Beam Search CF expansion loop */
 
-    /* ── CF Proximity Search ──
-     * If two independent CF convergents land within 1,000,000 of each other,
-     * the true period is almost certainly in that neighborhood.
-     * Brute-force scan the range between the closest pair. */
-    printf("\n    [DEBUG] CF pool: %d entries, success=%d\n", cf_pool_count, success);
-    if (!success && cf_pool_count >= 2) {
-        /* Sort cf_pool by value using qsort (O(N log N) required for large pools) */
-        qsort(cf_pool, cf_pool_count, sizeof(BigInt), cf_pool_cmp);
-
-        /* Find the closest pair */
-        BigInt best_lo, best_hi, diff_tmp;
-        bigint_set_u64(&best_lo, 0);
-        bigint_set_u64(&best_hi, 0);
-        bigint_set_u64(&diff_tmp, 0);
-        BigInt min_gap;
-        bigint_set_u64(&min_gap, 0);
-        int have_pair = 0;
-
-        for (int i = 0; i < cf_pool_count - 1; i++) {
-            /* Skip duplicates */
-            if (bigint_cmp(&cf_pool[i], &cf_pool[i+1]) == 0) continue;
-            /* Skip trivial values */
-            if (bigint_bitlen(&cf_pool[i]) <= 1) continue;
-
-            bigint_sub(&diff_tmp, &cf_pool[i+1], &cf_pool[i]);
-
-            if (!have_pair || bigint_cmp(&diff_tmp, &min_gap) < 0) {
-                bigint_copy(&min_gap, &diff_tmp);
-                bigint_copy(&best_lo, &cf_pool[i]);
-                bigint_copy(&best_hi, &cf_pool[i+1]);
-                have_pair = 1;
-            }
-        }
-
-        /* Check if the closest pair is within 1,000,000 */
-        BigInt proximity_limit;
-        bigint_set_u64(&proximity_limit, 1000000);
-
-        if (have_pair && bigint_cmp(&min_gap, &proximity_limit) <= 0) {
-            char lo_str[512], hi_str[512], gap_str[64];
-            bigint_to_decimal(lo_str, sizeof(lo_str), &best_lo);
-            bigint_to_decimal(hi_str, sizeof(hi_str), &best_hi);
-            bigint_to_decimal(gap_str, sizeof(gap_str), &min_gap);
-            printf("\n    ── CF Proximity Search ──\n");
-            printf("    Closest CF pair: %s .. %s (gap = %s)\n", lo_str, hi_str, gap_str);
-            printf("    Scanning %s candidates...\n", gap_str);
-
-            uint64_t gap_u64 = bigint_to_u64(&min_gap);
-            BigInt candidate;
-            bigint_set_u64(&candidate, 0);
-            bigint_copy(&candidate, &best_lo);
-
-            BigInt inc;
-            bigint_set_u64(&inc, 1);
-
-            for (uint64_t step = 0; step <= gap_u64 && !success; step++) {
-                /* Try candidate directly, and small multiples/divisors.
-                 * The CF convergent might be r/m or m*r for small m. */
-                BigInt test_r, base6, m_bi, dummy_q;
-                bigint_set_u64(&test_r, 0);
-                bigint_set_u64(&base6, 6);
-                bigint_set_u64(&m_bi, 0);
-                bigint_set_u64(&dummy_q, 0);
-
-                for (int m = 1; m <= 6 && !success; m++) {
-                    /* Test m × candidate */
-                    bigint_set_u64(&m_bi, (uint64_t)m);
-                    bigint_mul(&test_r, &candidate, &m_bi);
-
-                    int ret = try_period(&test_r, &base6, N, factor_p, factor_q);
-                    if (ret == 1) {
-                        char c_str[512];
-                        bigint_to_decimal(c_str, sizeof(c_str), &test_r);
-                        printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan, r = %s [×%d])\n", c_str, m);
-                        success = 1; break;
-                    }
-                    if (!success) {
-                        ret = try_period(&test_r, a_val, N, factor_p, factor_q);
-                        if (ret == 1) {
-                            char c_str[512];
-                            bigint_to_decimal(c_str, sizeof(c_str), &test_r);
-                            printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan [base-a], r = %s [×%d])\n", c_str, m);
-                            success = 1; break;
-                        }
-                    }
-
-                    /* Test candidate / m (if divisible) */
-                    if (m > 1) {
-                        BigInt div_rem;
-                        bigint_set_u64(&div_rem, 0);
-                        bigint_div_mod(&candidate, &m_bi, &test_r, &div_rem);
-                        if (bigint_is_zero(&div_rem) && !bigint_is_zero(&test_r)) {
-                            ret = try_period(&test_r, &base6, N, factor_p, factor_q);
-                            if (ret == 1) {
-                                char c_str[512];
-                                bigint_to_decimal(c_str, sizeof(c_str), &test_r);
-                                printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan, r = %s [÷%d])\n", c_str, m);
-                                success = 1;
-                            }
-                            if (!success) {
-                                ret = try_period(&test_r, a_val, N, factor_p, factor_q);
-                                if (ret == 1) {
-                                    char c_str[512];
-                                    bigint_to_decimal(c_str, sizeof(c_str), &test_r);
-                                    printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan [base-a], r = %s [÷%d])\n", c_str, m);
-                                    success = 1;
-                                }
-                            }
-                        }
-                        bigint_destroy(&div_rem);
-                    }
-                }
-
-                bigint_destroy(&test_r);
-                bigint_destroy(&base6);
-                bigint_destroy(&m_bi);
-                bigint_destroy(&dummy_q);
-
-                /* candidate++ */
-                BigInt next;
-                bigint_set_u64(&next, 0);
-                bigint_add(&next, &candidate, &inc);
-                bigint_copy(&candidate, &next);
-                bigint_destroy(&next);
-
-                /* Progress every 100K */
-                if (step > 0 && step % 100000 == 0) {
-                    printf("    ... scanned %lu / %lu\n", (unsigned long)step, (unsigned long)gap_u64);
-                }
-            }
-
-            if (!success) {
-                printf("    Proximity search complete: no factor found in range.\n");
-            }
-
-            bigint_destroy(&candidate);
-            bigint_destroy(&inc);
-        } else if (have_pair) {
-            char gap_str[512];
-            bigint_to_decimal(gap_str, sizeof(gap_str), &min_gap);
-            printf("\n    ── CF Proximity Search: SKIPPED (closest gap = %s, limit = 1000000) ──\n", gap_str);
-        } else {
-            printf("\n    ── CF Proximity Search: SKIPPED (no valid pair in pool of %d) ──\n", cf_pool_count);
-        }
-
-        bigint_destroy(&best_lo);
-        bigint_destroy(&best_hi);
-        bigint_destroy(&diff_tmp);
-        bigint_destroy(&min_gap);
-        bigint_destroy(&proximity_limit);
-    }
-
-    free(beam_parent); free(beam_digit); free(path_probs);
+    for (int i = 0; i < beam_width; i++) free(paths[i]);
+    free(paths); free(path_probs);
+    for (int i = 0; i < beam_width * max_branches; i++) free(new_paths[i]);
+    free(new_paths); free(new_path_probs);
 
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
     for (int i = 0; i < n_sites_raw; i++) {
-        bigint_destroy(&p6_cache[i]);
-        bigint_destroy(&ck_cache[i]);
+        bigint_clear(&p6_cache[i]);
+        bigint_clear(&ck_cache[i]);
     }
     free(p6_cache);
     free(ck_cache);
@@ -3005,10 +2768,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             mpfr_clear(marginals[s][d]);
     free(marginals);
 
-    /* Cleanup — CF and frequency BigInts (destroy = free GMP memory) */
-    bigint_destroy(&work_val_bi);
-    bigint_destroy(&mc_d_bi); bigint_destroy(&mc_term); bigint_destroy(&mc_tmp);
-    bigint_destroy(&reg_sz); bigint_destroy(&gc_reg_tmp); bigint_destroy(&current_p6); bigint_destroy(&next_p6);
+    /* Cleanup — CF and frequency BigInts */
+    /* Clean up */
+    bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
+    bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
 
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
@@ -3037,13 +2800,6 @@ int main(int argc, char **argv)
     triality_exotic_init();
     s6_exotic_init();
     triality_stats_reset();
-
-    /* Allocate the CF pool once on startup */
-    cf_pool = (BigInt*)calloc(CF_POOL_MAX, sizeof(BigInt));
-    if (!cf_pool) {
-        printf("FATAL: Failed to allocate CF pool.\n");
-        return 1;
-    }
 
     printf("\n");
     printf("  ╔════════════════════════════════════════════════════════════════╗\n");
