@@ -2172,16 +2172,16 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         if (site_k >= n_sites) continue;
 
         /* c_k = a^{6^{k+offset}} mod N */
-        BigInt bi_t, bi_t2;
-        bigint_set_u64(&bi_t, 0); bigint_set_u64(&bi_t2, 0);
+        BigInt bi_t, bi_t2, dummy_q;
+        bigint_set_u64(&bi_t, 0); bigint_set_u64(&bi_t2, 0); bigint_set_u64(&dummy_q, 0);
         bigint_copy(&ck_cache[k], a_val);
         for (int s = 0; s < k + scale_offset; s++) {
             bigint_mul(&bi_t, &ck_cache[k], &ck_cache[k]);
-            bigint_mod(&bi_t2, &bi_t, N);
+            bigint_div_mod(&bi_t, N, &dummy_q, &bi_t2);
             bigint_mul(&bi_t, &bi_t2, &ck_cache[k]);
-            bigint_mod(&bi_t2, &bi_t, N);
+            bigint_div_mod(&bi_t, N, &dummy_q, &bi_t2);
             bigint_mul(&bi_t, &bi_t2, &bi_t2);
-            bigint_mod(&ck_cache[k], &bi_t, N);
+            bigint_div_mod(&bi_t, N, &dummy_q, &ck_cache[k]);
         }
 
         /* Compute multiplier[d] = c_k^d mod N for d=0..5 */
@@ -2190,8 +2190,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_set_u64(&mult_bi[0], 1);
         for (int d = 1; d < 6; d++) {
             bigint_mul(&bi_t, &mult_bi[d-1], &ck_cache[k]);
-            bigint_mod(&mult_bi[d], &bi_t, N);
+            bigint_div_mod(&bi_t, N, &dummy_q, &mult_bi[d]);
         }
+        bigint_clear(&dummy_q);
 
         /* Precompute base-6 digits of mult_bi[d] */
         int mult_digits[6][n_work];
@@ -2434,17 +2435,18 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * marginals see the LIVE state, not the initial |1⟩ ghost. */
         {
             /* mult = c_k^outcome mod N */
-            BigInt mult_val, bi_t;
+            BigInt mult_val, bi_t, dummy_q;
             bigint_set_u64(&mult_val, 1);
-            bigint_set_u64(&bi_t, 0);
+            bigint_set_u64(&bi_t, 0); bigint_set_u64(&dummy_q, 0);
             for (int d = 0; d < outcome; d++) {
                 bigint_mul(&bi_t, &mult_val, &ck_cache[k]);
-                bigint_mod(&mult_val, &bi_t, N);
+                bigint_div_mod(&bi_t, N, &dummy_q, &mult_val);
             }
             
             /* Update classical tracker */
             bigint_mul(&bi_t, &work_val_bi, &mult_val);
-            bigint_mod(&work_val_bi, &bi_t, N);
+            bigint_div_mod(&bi_t, N, &dummy_q, &work_val_bi);
+            bigint_clear(&dummy_q);
             
             /* Sync graph locals: work register now represents |work_val⟩ */
             BigInt tmp_bi, q6, r6;
@@ -2679,6 +2681,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_clear(&r_mult); bigint_clear(&m_bi);
             }
             bigint_clear(&oracle_base);
+            
+            /* Record the largest valid denominator as the best partial period for LCM harvesting */
+            if (best_period && !success) {
+                bigint_copy(best_period, &cf_q0);
+            }
         }
     }
 
