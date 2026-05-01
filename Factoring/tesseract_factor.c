@@ -2005,12 +2005,13 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site1 = blk * 6 + 1;
 
         for (int d = 0; d < 6; d++) {
-            /* Compute residue / N directly in double (sufficient for
-             * the phase rotation — the 2048-bit MPFR was overkill since
-             * both values are < N < 2^48 and double has 53-bit mantissa) */
-            double yA = (double)bigint_to_u64(&gc_powersA[d]);
-            double yB = (double)bigint_to_u64(&gc_powersB[d]);
-            double Nd = (double)bigint_to_u64(N);
+            /* Compute residue / N directly in double using mpz_get_d.
+             * This correctly computes the fractional phase even for 768-bit numbers
+             * because both numerator and denominator share the large exponent,
+             * leaving the 53-bit mantissa to accurately represent the ratio. */
+            double yA = mpz_get_d(gc_powersA[d].z);
+            double yB = mpz_get_d(gc_powersB[d].z);
+            double Nd = mpz_get_d(N->z);
             double phaseA = 2.0 * M_PI * yA / Nd;
             double phaseB = 2.0 * M_PI * yB / Nd;
 
@@ -2443,6 +2444,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                        graph->locals[site_k].edge_im[v] * graph->locals[site_k].edge_im[v];
             total += probs[v];
         }
+        
         if (total > 1e-30) {
             for (int v = 0; v < 6; v++) probs[v] /= total;
         } else {
