@@ -1916,6 +1916,14 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_set_u64(&gc_rN, 0); bigint_set_u64(&gc_q_sh, 0);
     bigint_set_u64(&gc_r_sh, 0);
 
+    /* Arbitrary precision variables for phase rotation to prevent the Mantissa Wall */
+    mpfr_t mp_yA, mp_yB, mp_Nd, mp_ratioA, mp_ratioB, mp_pi2, mp_phaseA, mp_phaseB;
+    mpfr_t mp_sinA, mp_cosA, mp_sinB, mp_cosB;
+    mpfr_inits2(4096, mp_yA, mp_yB, mp_Nd, mp_ratioA, mp_ratioB, mp_pi2, 
+                mp_phaseA, mp_phaseB, mp_sinA, mp_cosA, mp_sinB, mp_cosB, (mpfr_ptr)0);
+    mpfr_const_pi(mp_pi2, MPFR_RNDN);
+    mpfr_mul_d(mp_pi2, mp_pi2, 2.0, MPFR_RNDN);
+
     /* Scale offset: ensure 6^k > N for ALL scales so no digit is trivially 0.
      * offset = ceil(log_6(N)) = ceil(nbits / log2(6)) */
     int scale_offset = (int)ceil((double)nbits / log2(6.0));
@@ -2005,18 +2013,26 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site1 = blk * 6 + 1;
 
         for (int d = 0; d < 6; d++) {
-            /* Compute residue / N directly in double using mpz_get_d.
-             * This correctly computes the fractional phase even for 768-bit numbers
-             * because both numerator and denominator share the large exponent,
-             * leaving the 53-bit mantissa to accurately represent the ratio. */
-            double yA = mpz_get_d(gc_powersA[d].z);
-            double yB = mpz_get_d(gc_powersB[d].z);
-            double Nd = mpz_get_d(N->z);
-            double phaseA = 2.0 * M_PI * yA / Nd;
-            double phaseB = 2.0 * M_PI * yB / Nd;
+            /* Use 4096-bit MPFR arithmetic to evaluate the fractional phase 
+             * before decomposing into sin/cos. This pushes past the 53-bit mantissa wall 
+             * and gives enough angular resolution for up to 2048-bit numbers. */
+            mpfr_set_z(mp_yA, gc_powersA[d].z, MPFR_RNDN);
+            mpfr_set_z(mp_yB, gc_powersB[d].z, MPFR_RNDN);
+            mpfr_set_z(mp_Nd, N->z, MPFR_RNDN);
+            
+            mpfr_div(mp_ratioA, mp_yA, mp_Nd, MPFR_RNDN);
+            mpfr_div(mp_ratioB, mp_yB, mp_Nd, MPFR_RNDN);
+            
+            mpfr_mul(mp_phaseA, mp_ratioA, mp_pi2, MPFR_RNDN);
+            mpfr_mul(mp_phaseB, mp_ratioB, mp_pi2, MPFR_RNDN);
 
-            double cosA = cos(phaseA), sinA = sin(phaseA);
-            double cosB = cos(phaseB), sinB = sin(phaseB);
+            mpfr_sin_cos(mp_sinA, mp_cosA, mp_phaseA, MPFR_RNDN);
+            mpfr_sin_cos(mp_sinB, mp_cosB, mp_phaseB, MPFR_RNDN);
+
+            double cosA = mpfr_get_d(mp_cosA, MPFR_RNDN);
+            double sinA = mpfr_get_d(mp_sinA, MPFR_RNDN);
+            double cosB = mpfr_get_d(mp_cosB, MPFR_RNDN);
+            double sinB = mpfr_get_d(mp_sinB, MPFR_RNDN);
 
             double rA = graph->locals[site0].edge_re[d];
             double iA = graph->locals[site0].edge_im[d];
@@ -2319,6 +2335,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             for (int d = 0; d < 6; d++)
                 mpfr_clear(marginals[i][d]);
         free(marginals);
+        mpfr_clears(mp_yA, mp_yB, mp_Nd, mp_ratioA, mp_ratioB, mp_pi2, 
+                    mp_phaseA, mp_phaseB, mp_sinA, mp_cosA, mp_sinB, mp_cosB, (mpfr_ptr)0);
         return 0.0;
     }
 
@@ -2771,6 +2789,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     free(marginals);
 
     /* Cleanup — CF and frequency BigInts */
+    mpfr_clears(mp_yA, mp_yB, mp_Nd, mp_ratioA, mp_ratioB, mp_pi2, 
+                mp_phaseA, mp_phaseB, mp_sinA, mp_cosA, mp_sinB, mp_cosB, (mpfr_ptr)0);
+
     /* Clean up */
     bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
     bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
