@@ -40,10 +40,8 @@
 #include "s6_exotic.h"
 #include "hpc_z6_codes.h"
 #include "bigint.h"
-#define D 6
 
-BigInt cf_pool[10000];
-int cf_pool_count = 0;
+#define D 6
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
@@ -2559,87 +2557,35 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_copy(&current_p6, &next_p6);
     }
 
+    BigInt freq; bigint_set_u64(&freq, 0);
     BigInt mc_d_bi, mc_term, mc_tmp;
     bigint_set_u64(&mc_d_bi, 0);
     bigint_set_u64(&mc_term, 0);
     bigint_set_u64(&mc_tmp, 0);
 
-    /* ── Phase 4: Beam Search Frequency Generation ── */
-    printf("    Executing Beam Search over marginals...\n");
-    int beam_width = 32;
-    int max_branches = 6;
-    int current_paths = 1;
-    
-    int **paths = (int**)malloc(beam_width * sizeof(int*));
-    double *path_probs = (double*)malloc(beam_width * sizeof(double));
-    for (int i = 0; i < beam_width; i++) paths[i] = (int*)malloc(n_sites_raw * sizeof(int));
-    
-    int **new_paths = (int**)malloc(beam_width * max_branches * sizeof(int*));
-    double *new_path_probs = (double*)malloc(beam_width * max_branches * sizeof(double));
-    for (int i = 0; i < beam_width * max_branches; i++) new_paths[i] = (int*)malloc(n_sites_raw * sizeof(int));
-    
-    path_probs[0] = 0.0;
-    
-    for (int k = 0; k < n_sites_raw; k++) {
-        double probs[6];
-        for (int d = 0; d < 6; d++) {
-            probs[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
-            if (probs[d] < 1e-10) probs[d] = 1e-10; 
-        }
-        
-        int next_paths = 0;
-        for (int p = 0; p < current_paths; p++) {
-            for (int d = 0; d < 6; d++) {
-                if (probs[d] > 0.05) { /* Prune unlikely branches */
-                    for (int i = 0; i < k; i++) new_paths[next_paths][i] = paths[p][i];
-                    new_paths[next_paths][k] = d;
-                    new_path_probs[next_paths] = path_probs[p] + log(probs[d]);
-                    next_paths++;
-                }
-            }
-        }
-        
-        /* Sort descending */
-        for (int i = 0; i < next_paths - 1; i++) {
-            for (int j = i + 1; j < next_paths; j++) {
-                if (new_path_probs[j] > new_path_probs[i]) {
-                    double tmp_p = new_path_probs[i];
-                    new_path_probs[i] = new_path_probs[j];
-                    new_path_probs[j] = tmp_p;
-                    
-                    int *tmp_ptr = new_paths[i];
-                    new_paths[i] = new_paths[j];
-                    new_paths[j] = tmp_ptr;
-                }
-            }
-        }
-        
-        current_paths = (next_paths < beam_width) ? next_paths : beam_width;
-        for (int p = 0; p < current_paths; p++) {
-            for (int i = 0; i <= k; i++) paths[p][i] = new_paths[p][i];
-            path_probs[p] = new_path_probs[p];
-        }
+    /* ── Build frequency from Griffiths-Niu measured digits ── */
+    char wv_str[1300];
+    bigint_to_decimal(wv_str, sizeof(wv_str), &work_val_bi);
+    char av_str[1300];
+    bigint_to_decimal(av_str, sizeof(av_str), a_val);
+    printf("    Work register final: %s  (a=%s)\n", wv_str, av_str);
+
+    /* Build frequency: site n-1 gave f_0, site n-2 gave f_1, etc.
+     * So the digit for 6^idx is stored in measured_digits[n_sites_raw - 1 - idx]. */
+    for (int idx = 0; idx < n_sites_raw; idx++) {
+        int f_idx = n_sites_raw - 1 - idx;
+        bigint_set_u64(&mc_d_bi, (uint64_t)measured_digits[f_idx]);
+        bigint_mul(&mc_term, &mc_d_bi, &p6_cache[idx]);
+        bigint_add(&mc_tmp, &freq, &mc_term);
+        bigint_copy(&freq, &mc_tmp);
     }
 
-    printf("    Generated %d candidate frequencies.\n", current_paths);
+    printf("    Measured frequency: %u bits\n", bigint_bitlen(&freq));
     printf("    Register size:     %u bits\n", bigint_bitlen(&reg_sz));
 
-    /* CF expansion of F/R — test every candidate frequency */
-    for (int p_idx = 0; p_idx < current_paths && !success; p_idx++) {
-        BigInt freq; bigint_set_u64(&freq, 0);
-        
-        /* Build frequency from beam path */
-        for (int idx = 0; idx < n_sites_raw; idx++) {
-            bigint_set_u64(&mc_d_bi, (uint64_t)paths[p_idx][idx]);
-            bigint_mul(&mc_term, &mc_d_bi, &p6_cache[n_sites_raw - 1 - idx]);
-            bigint_add(&mc_tmp, &freq, &mc_term);
-            bigint_copy(&freq, &mc_tmp);
-        }
-        
-        printf("\n    [Beam %2d] Freq = %u bits (log_P = %.2f)\n", p_idx, bigint_bitlen(&freq), path_probs[p_idx]);
-
-        BigInt cf_num, cf_den, cf_a, cf_rem;
-        BigInt cf_pm1, cf_p0, cf_qm1, cf_q0;
+    /* CF expansion of F/R — test every convergent denominator */
+    BigInt cf_num, cf_den, cf_a, cf_rem;
+    BigInt cf_pm1, cf_p0, cf_qm1, cf_q0;
     BigInt cf_p_new, cf_q_new, cf_tmp;
     bigint_set_u64(&cf_num, 0); bigint_set_u64(&cf_den, 0);
     bigint_set_u64(&cf_a, 0); bigint_set_u64(&cf_rem, 0);
@@ -2686,11 +2632,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             break;
         }
 
-        /* Add to global CF pool for common range clustering */
-        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) > 1) {
-            bigint_copy(&cf_pool[cf_pool_count++], &cf_q0);
-        }
-
         /* Test this convergent denominator as a period candidate */
         uint32_t q_bits = bigint_bitlen(&cf_q0);
 
@@ -2698,7 +2639,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             char q_str[512];
             bigint_to_decimal(q_str, sizeof(q_str), &cf_q0);
             printf("    CF step %d: denom = %s (%u bits)\n", step, q_str, q_bits);
-            
             /* Oracle encodes 6^k → period is ord_N(6), use base 6 for GCD check */
             BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
             int ret = try_period(&cf_q0, &oracle_base, N, factor_p, factor_q);
@@ -2748,16 +2688,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
     }
-    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
-    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
-    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
-    bigint_clear(&freq);
-    } /* End of Beam Search CF expansion loop */
-
-    for (int i = 0; i < beam_width; i++) free(paths[i]);
-    free(paths); free(path_probs);
-    for (int i = 0; i < beam_width * max_branches; i++) free(new_paths[i]);
-    free(new_paths); free(new_path_probs);
 
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
@@ -2778,8 +2708,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Cleanup — CF and frequency BigInts */
     bigint_clear(&work_val_bi);
-    bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
+    bigint_clear(&freq); bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
     bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
+    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
+    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
+    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
 
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
@@ -2926,9 +2859,6 @@ int main(int argc, char **argv)
     }
 
     int attempt_count = 1;
-    BigInt cf_history[200];
-    for (int i = 0; i < 200; i++) bigint_set_u64(&cf_history[i], 0);
-    int cf_hist_count = 0;
     for (int bi = active_base_idx; !success; bi = (auto_a ? (bi + 1) % 200 : bi)) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
@@ -2937,7 +2867,6 @@ int main(int argc, char **argv)
         printf("  ── Attempt %d: a = %s ──\n\n", attempt_count++, a_str);
 
         bigint_set_u64(&best_partial, 0);
-        int old_pool_count = cf_pool_count;
         clock_t t_start = clock();
         success = (int)factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
                                   &cross_base_acc_period, &cross_base_acc_samples, 0);
@@ -2982,7 +2911,7 @@ int main(int argc, char **argv)
                     bigint_to_decimal(bp_str, sizeof(bp_str), &best_partial);
                     printf("\n  ★★★ LATE FACTORIZATION: best_partial (%s) was a valid factoring period! ★★★\n", bp_str);
                     printf("  %s × %s = N\n", p_str, q_str);
-                } else if (status == 2 || status == -1) {
+                } else if (bigint_cmp(&best_partial, &bi_one) > 0) {
                     /* Calculate actual period contribution for this base */
                     BigInt current_period;
                     bigint_set_u64(&current_period, 0); /* Initialize the struct properly first */
@@ -2993,23 +2922,17 @@ int main(int argc, char **argv)
                         bigint_copy(&cross_base_lcm, &current_period);
                         printf("  [Cross-base] Initialized LCM to verified period contribution\n");
                     } else {
-                        /* Save previous state before modifying */
-                        BigInt prev_lcm;
-                        bigint_set_u64(&prev_lcm, 0);
-                        bigint_copy(&prev_lcm, &cross_base_lcm);
-
                         /* Subsequent bases: accumulate LCM */
                         /* Proper LCM update: lcm(a,b) = (a*b)/gcd(a,b) */
                         bigint_gcd(&cross_base_gcd, &cross_base_lcm, &current_period);
                         bigint_mul(&cross_base_prod, &cross_base_lcm, &current_period);
                         bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
+                    }
 
-                        /* Clamp: if LCM exceeds N, hold previous state */
-                        if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
-                            printf("  [Cross-base] LCM exceeded N, holding previous state\n");
-                            bigint_copy(&cross_base_lcm, &prev_lcm);  /* fall back to prev_lcm */
-                        }
-                        bigint_clear(&prev_lcm);
+                    /* Clamp: if LCM exceeds N, hold current state */
+                    if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
+                        printf("  [Cross-base] LCM exceeded N, holding previous state\n");
+                        bigint_copy(&cross_base_lcm, &cross_base_gcd);  /* fall back to GCD */
                     }
 
                     uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
@@ -3081,7 +3004,6 @@ int main(int argc, char **argv)
                     printf("  [Cross-base] Dumped invalid best_partial %s. It's not a period!\n", bp_str);
                 }
             }
-
             printf("\n");
         }
     }
