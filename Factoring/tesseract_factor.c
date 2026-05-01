@@ -42,62 +42,6 @@
 #include "bigint.h"
 
 #define D 6
-#define CF_MAX_STEPS 200
-
-typedef struct {
-    /* try_period temporaries */
-    BigInt tp_one, tp_two, tp_r_half, tp_q_unused, tp_r_mod;
-    BigInt tp_half_pow, tp_h_minus, tp_p1, tp_dummy_rem;
-    BigInt tp_h_plus, tp_p2;
-
-    /* factor_with_hpc temporaries */
-    BigInt b6, one;
-    BigInt val_k_A, val_k_B, div_6_blk;
-    BigInt gc_b36, gc_next_A, gc_next_B, gc_next_div;
-    BigInt gc_gcd_check, gc_val_minus_1, gc_dummy_rem;
-    BigInt gc_powersA[6], gc_powersB[6];
-    BigInt gc_tmpA, gc_tmpB, gc_q_div;
-    BigInt gc_b6_mod, gc_shift_div_A, gc_shift_div_B, gc_dummy_rm2;
-    BigInt gc_qA, gc_qB, gc_rA_mod, gc_rB_mod;
-    BigInt gc_temp_N, gc_qN, gc_rN, gc_q_sh, gc_r_sh;
-    BigInt gc_six_pow_k, gc_d_bi;
-} MathWorkspace;
-
-static void init_workspace(MathWorkspace *ws) {
-    bigint_set_u64(&ws->tp_one, 1); bigint_set_u64(&ws->tp_two, 2);
-    bigint_set_u64(&ws->tp_r_half, 0); bigint_set_u64(&ws->tp_q_unused, 0);
-    bigint_set_u64(&ws->tp_r_mod, 0); bigint_set_u64(&ws->tp_half_pow, 0);
-    bigint_set_u64(&ws->tp_h_minus, 0); bigint_set_u64(&ws->tp_p1, 0);
-    bigint_set_u64(&ws->tp_dummy_rem, 0); bigint_set_u64(&ws->tp_h_plus, 0);
-    bigint_set_u64(&ws->tp_p2, 0);
-    
-    bigint_set_u64(&ws->b6, 6); bigint_set_u64(&ws->one, 1);
-    bigint_set_u64(&ws->val_k_A, 0); bigint_set_u64(&ws->val_k_B, 0); bigint_set_u64(&ws->div_6_blk, 0);
-    bigint_set_u64(&ws->gc_b36, 36); bigint_set_u64(&ws->gc_next_A, 0); bigint_set_u64(&ws->gc_next_B, 0); bigint_set_u64(&ws->gc_next_div, 0);
-    bigint_set_u64(&ws->gc_gcd_check, 0); bigint_set_u64(&ws->gc_val_minus_1, 0); bigint_set_u64(&ws->gc_dummy_rem, 0);
-    for (int i = 0; i < 6; i++) { bigint_set_u64(&ws->gc_powersA[i], 0); bigint_set_u64(&ws->gc_powersB[i], 0); }
-    bigint_set_u64(&ws->gc_tmpA, 0); bigint_set_u64(&ws->gc_tmpB, 0); bigint_set_u64(&ws->gc_q_div, 0);
-    bigint_set_u64(&ws->gc_b6_mod, 0); bigint_set_u64(&ws->gc_shift_div_A, 0); bigint_set_u64(&ws->gc_shift_div_B, 0); bigint_set_u64(&ws->gc_dummy_rm2, 0);
-    bigint_set_u64(&ws->gc_qA, 0); bigint_set_u64(&ws->gc_qB, 0); bigint_set_u64(&ws->gc_rA_mod, 0); bigint_set_u64(&ws->gc_rB_mod, 0);
-    bigint_set_u64(&ws->gc_temp_N, 0); bigint_set_u64(&ws->gc_qN, 0); bigint_set_u64(&ws->gc_rN, 0); bigint_set_u64(&ws->gc_q_sh, 0); bigint_set_u64(&ws->gc_r_sh, 0);
-    bigint_set_u64(&ws->gc_six_pow_k, 0); bigint_set_u64(&ws->gc_d_bi, 0);
-}
-
-static void clear_workspace(MathWorkspace *ws) {
-    bigint_clear(&ws->tp_one); bigint_clear(&ws->tp_two); bigint_clear(&ws->tp_r_half); bigint_clear(&ws->tp_q_unused); bigint_clear(&ws->tp_r_mod);
-    bigint_clear(&ws->tp_half_pow); bigint_clear(&ws->tp_h_minus); bigint_clear(&ws->tp_p1); bigint_clear(&ws->tp_dummy_rem);
-    bigint_clear(&ws->tp_h_plus); bigint_clear(&ws->tp_p2);
-    bigint_clear(&ws->b6); bigint_clear(&ws->one);
-    bigint_clear(&ws->val_k_A); bigint_clear(&ws->val_k_B); bigint_clear(&ws->div_6_blk);
-    bigint_clear(&ws->gc_b36); bigint_clear(&ws->gc_next_A); bigint_clear(&ws->gc_next_B); bigint_clear(&ws->gc_next_div);
-    bigint_clear(&ws->gc_gcd_check); bigint_clear(&ws->gc_val_minus_1); bigint_clear(&ws->gc_dummy_rem);
-    for (int i = 0; i < 6; i++) { bigint_clear(&ws->gc_powersA[i]); bigint_clear(&ws->gc_powersB[i]); }
-    bigint_clear(&ws->gc_tmpA); bigint_clear(&ws->gc_tmpB); bigint_clear(&ws->gc_q_div);
-    bigint_clear(&ws->gc_b6_mod); bigint_clear(&ws->gc_shift_div_A); bigint_clear(&ws->gc_shift_div_B); bigint_clear(&ws->gc_dummy_rm2);
-    bigint_clear(&ws->gc_qA); bigint_clear(&ws->gc_qB); bigint_clear(&ws->gc_rA_mod); bigint_clear(&ws->gc_rB_mod);
-    bigint_clear(&ws->gc_temp_N); bigint_clear(&ws->gc_qN); bigint_clear(&ws->gc_rN); bigint_clear(&ws->gc_q_sh); bigint_clear(&ws->gc_r_sh);
-    bigint_clear(&ws->gc_six_pow_k); bigint_clear(&ws->gc_d_bi);
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
@@ -2217,8 +2161,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     /* Add controlled permutation edges: freq site k → work register */
-    uint64_t N_u64_work = bigint_to_u64(N);
-    uint64_t a_u64_work = bigint_to_u64(a_val);
+    BigInt *ck_cache = calloc(n_sites_raw, sizeof(BigInt));
+    for (int k = 0; k < n_sites_raw; k++) bigint_set_u64(&ck_cache[k], 0);
+
     int n_oracle_edges = 0;
 
     for (int k = 0; k < n_sites_raw; k++) {
@@ -2227,21 +2172,42 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         if (site_k >= n_sites) continue;
 
         /* c_k = a^{6^{k+offset}} mod N */
-        uint64_t c_k = a_u64_work;
+        BigInt bi_t, bi_t2;
+        bigint_set_u64(&bi_t, 0); bigint_set_u64(&bi_t2, 0);
+        bigint_copy(&ck_cache[k], a_val);
         for (int s = 0; s < k + scale_offset; s++) {
-            __uint128_t t = c_k;
-            t = (t * t) % N_u64_work;
-            t = (t * (uint64_t)c_k) % N_u64_work;
-            t = (t * t) % N_u64_work;
-            c_k = (uint64_t)t;
+            bigint_mul(&bi_t, &ck_cache[k], &ck_cache[k]);
+            bigint_mod(&bi_t2, &bi_t, N);
+            bigint_mul(&bi_t, &bi_t2, &ck_cache[k]);
+            bigint_mod(&bi_t2, &bi_t, N);
+            bigint_mul(&bi_t, &bi_t2, &bi_t2);
+            bigint_mod(&ck_cache[k], &bi_t, N);
         }
 
         /* Compute multiplier[d] = c_k^d mod N for d=0..5 */
-        uint64_t mult[6];
-        mult[0] = 1;
+        BigInt mult_bi[6];
+        for (int d = 0; d < 6; d++) bigint_set_u64(&mult_bi[d], 0);
+        bigint_set_u64(&mult_bi[0], 1);
         for (int d = 1; d < 6; d++) {
-            mult[d] = ((__uint128_t)mult[d-1] * c_k) % N_u64_work;
+            bigint_mul(&bi_t, &mult_bi[d-1], &ck_cache[k]);
+            bigint_mod(&mult_bi[d], &bi_t, N);
         }
+
+        /* Precompute base-6 digits of mult_bi[d] */
+        int mult_digits[6][n_work];
+        for (int d = 0; d < 6; d++) {
+            BigInt tmp_bi, r6, q6;
+            bigint_set_u64(&tmp_bi, 0); bigint_set_u64(&r6, 0); bigint_set_u64(&q6, 0);
+            bigint_copy(&tmp_bi, &mult_bi[d]);
+            for (int p = 0; p < n_work; p++) {
+                bigint_div_mod(&tmp_bi, &b6, &q6, &r6);
+                mult_digits[d][p] = (int)bigint_to_u64(&r6);
+                bigint_copy(&tmp_bi, &q6);
+            }
+            bigint_clear(&tmp_bi); bigint_clear(&r6); bigint_clear(&q6);
+            bigint_clear(&mult_bi[d]);
+        }
+        bigint_clear(&bi_t); bigint_clear(&bi_t2);
 
         /* Create controlled-perm edge: freq_site_k controls the work register.
          * The perm edge encodes the constraint δ(work == mult[d] × y mod N)
@@ -2269,9 +2235,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
              * j-th digit of mult[d], scaled by a coupling strength. */
             for (int d = 0; d < 6; d++) {
                 /* Extract j-th base-6 digit of mult[d] */
-                uint64_t tmp = mult[d];
-                for (int p = 0; p < j; p++) tmp /= 6;
-                int target_digit = tmp % 6;
+                int target_digit = mult_digits[d][j];
 
                 for (int wj = 0; wj < 6; wj++) {
                     /* Phase coupling: peaked at the correct digit value.
@@ -2301,10 +2265,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate marginals — same format as before, just filled differently */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
-    double (*marginals)[6] = (double (*)[6])malloc(marginals_sz * sizeof(double[6]));
+    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
     for (int i = 0; i < marginals_sz; i++) {
         for (int d = 0; d < 6; d++) {
-            marginals[i][d] = 0.0;
+            mpfr_inits2(2048, marginals[i][d], (mpfr_ptr)0);
+            mpfr_set_d(marginals[i][d], 0.0, MPFR_RNDN);
         }
     }
 
@@ -2321,6 +2286,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
         bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
         for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
+        for (int i = 0; i < marginals_sz; i++)
+            for (int d = 0; d < 6; d++)
+                mpfr_clear(marginals[i][d]);
         free(marginals);
         return 0.0;
     }
@@ -2339,7 +2307,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * Without it, measuring in the phase basis gives uniform noise. */
 
     int *measured_digits = (int*)calloc(n_sites_raw, sizeof(int));
-    uint64_t work_val = 1;  /* Classical work register tracking: starts at |1⟩ */
+    BigInt work_val_bi;
+    bigint_set_u64(&work_val_bi, 1);  /* Classical work register tracking: starts at |1⟩ */
 
     for (int k = n_sites_raw - 1; k >= 0; k--) {
         int blk_k = k / 2, off_k = k % 2;
@@ -2439,16 +2408,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             total += probs[v];
         }
 
-        /* DEBUG DUMP for k=38 */
-        if (k == 38) {
-            printf("DEBUG k=38:\n");
-            for(int d=0; d<6; d++) {
-                printf("  d=%d: alpha=(%f, %f) ck=(%f, %f) work_val=%llu\n",
-                    d, alpha_re[d], alpha_im[d], ck_re[d], ck_im[d], 
-                    (unsigned long long)work_val);
-            }
-        }
-
         /* Normalize */
         if (total > 1e-30) {
             for (int d = 0; d < 6; d++) probs[d] /= total;
@@ -2474,39 +2433,40 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * by c_k^outcome mod N. Update the graph locals so subsequent
          * marginals see the LIVE state, not the initial |1⟩ ghost. */
         {
-            /* Recompute c_k for this scale */
-            uint64_t c_k = a_u64_work;
-            for (int s = 0; s < k + scale_offset; s++) {
-                __uint128_t t = c_k;
-                t = (t * t) % N_u64_work;
-                t = (t * (uint64_t)c_k) % N_u64_work;
-                t = (t * t) % N_u64_work;
-                c_k = (uint64_t)t;
-            }
             /* mult = c_k^outcome mod N */
-            uint64_t mult_val = 1;
+            BigInt mult_val, bi_t;
+            bigint_set_u64(&mult_val, 1);
+            bigint_set_u64(&bi_t, 0);
             for (int d = 0; d < outcome; d++) {
-                mult_val = ((__uint128_t)mult_val * c_k) % N_u64_work;
+                bigint_mul(&bi_t, &mult_val, &ck_cache[k]);
+                bigint_mod(&mult_val, &bi_t, N);
             }
+            
             /* Update classical tracker */
-            work_val = ((__uint128_t)work_val * mult_val) % N_u64_work;
-
+            bigint_mul(&bi_t, &work_val_bi, &mult_val);
+            bigint_mod(&work_val_bi, &bi_t, N);
+            
             /* Sync graph locals: work register now represents |work_val⟩ */
+            BigInt tmp_bi, q6, r6;
+            bigint_set_u64(&tmp_bi, 0); bigint_set_u64(&q6, 0); bigint_set_u64(&r6, 0);
+            bigint_copy(&tmp_bi, &work_val_bi);
             for (int j = 0; j < n_work; j++) {
-                uint64_t tmp = work_val;
-                for (int p = 0; p < j; p++) tmp /= 6;
-                int digit_j = tmp % 6;
+                bigint_div_mod(&tmp_bi, &b6, &q6, &r6);
+                int digit_j = (int)bigint_to_u64(&r6);
                 TrialityQuhit *wq = &graph->locals[work_start + j];
                 for (int w = 0; w < 6; w++) {
                     wq->edge_re[w] = (w == digit_j) ? 1.0 : 0.0;
                     wq->edge_im[w] = 0.0;
                 }
+                bigint_copy(&tmp_bi, &q6);
             }
+            bigint_clear(&mult_val); bigint_clear(&bi_t);
+            bigint_clear(&tmp_bi); bigint_clear(&q6); bigint_clear(&r6);
         }
 
         /* Store in marginals for downstream CF extraction */
         for (int d = 0; d < 6; d++) {
-            marginals[k][d] = probs[d];
+            mpfr_set_d(marginals[k][d], probs[d], MPFR_RNDN);
         }
 
         /* Display */
@@ -2534,7 +2494,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     for (int scale = 0; scale < n_sites_raw; scale++) {
         double max_p = 0.0;
         for (int d = 0; d < 6; d++) {
-            double p = marginals[scale][d];
+            double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
             if (p > max_p) max_p = p;
         }
         /* A position has signal if its max probability is significantly above uniform (1/6 ≈ 0.167) */
@@ -2602,8 +2562,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_set_u64(&mc_tmp, 0);
 
     /* ── Build frequency from Griffiths-Niu measured digits ── */
-    printf("    Work register final: %llu  (a=%llu)\n",
-           (unsigned long long)work_val, (unsigned long long)a_u64_work);
+    char wv_str[1300];
+    bigint_to_decimal(wv_str, sizeof(wv_str), &work_val_bi);
+    char av_str[1300];
+    bigint_to_decimal(av_str, sizeof(av_str), a_val);
+    printf("    Work register final: %s  (a=%s)\n", wv_str, av_str);
 
     /* Build frequency: site n-1 gave f_0, site n-2 gave f_1, etc.
      * So the digit for 6^idx is stored in measured_digits[n_sites_raw - 1 - idx]. */
@@ -2721,15 +2684,23 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
-    for (int i = 0; i < n_sites_raw; i++) bigint_clear(&p6_cache[i]);
+    for (int i = 0; i < n_sites_raw; i++) {
+        bigint_clear(&p6_cache[i]);
+        bigint_clear(&ck_cache[i]);
+    }
     free(p6_cache);
+    free(ck_cache);
     free(measured_digits);
     free(bp_has_signal);
     free(flippable);
 
+    for (int s = 0; s < marginals_sz; s++)
+        for (int d = 0; d < 6; d++)
+            mpfr_clear(marginals[s][d]);
     free(marginals);
 
     /* Cleanup — CF and frequency BigInts */
+    bigint_clear(&work_val_bi);
     bigint_clear(&freq); bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
     bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
     bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
@@ -2880,12 +2851,13 @@ int main(int argc, char **argv)
         active_base_idx = 0;
     }
 
-    for (int bi = active_base_idx; bi < max_bases && !success; bi++) {
+    int attempt_count = 1;
+    for (int bi = active_base_idx; !success; bi = (auto_a ? (bi + 1) % 200 : bi)) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
         char a_str[1300];
         bigint_to_decimal(a_str, sizeof(a_str), &a_val);
-        printf("  ── Attempt %d: a = %s ──\n\n", bi + 1, a_str);
+        printf("  ── Attempt %d: a = %s ──\n\n", attempt_count++, a_str);
 
         bigint_set_u64(&best_partial, 0);
         clock_t t_start = clock();
