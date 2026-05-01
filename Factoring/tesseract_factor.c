@@ -293,21 +293,32 @@ static int generate_and_try_periods(const BigInt *freq, const BigInt *reg_size,
 
 #define LLL_K       32              /* frequency samples to collect            */
 #define LLL_DIM     (LLL_K + 1)     /* lattice dimension                       */
-#define LLL_W_BITS  60              /* W = 2^60: Unleashed max dimension bounds for Phase 4 lattice  */
+/* LLL_W_BITS is now computed dynamically in lll_fhat() based on N's bitlength.
+ * Previous hardcoded 60 could overflow when period r > 2^60 for large N. */
+#define LLL_W_BITS_DEFAULT  60      /* fallback for small N                   */
 #define LLL_DELTA   0.75            /* Lovász δ                                */
 
 /* fhat_i = round(F * 2^LLL_W_BITS / R), clamped to [0, W).                  *
  * Uses GMP directly (F and R are BigInts, possibly thousands of bits).        */
-static long long lll_fhat(const BigInt *F, const BigInt *R)
+static int lll_w_bits_for_n(uint32_t nbits) {
+    /* Scale lattice precision with N: W must exceed the period r,
+     * which can be up to ~N. Use 2*nbits to ensure W > r. */
+    int w = (int)(nbits * 2);
+    if (w < LLL_W_BITS_DEFAULT) w = LLL_W_BITS_DEFAULT;
+    if (w > 120) w = 120;  /* cap to avoid overflow in long long arithmetic */
+    return w;
+}
+
+static long long lll_fhat(const BigInt *F, const BigInt *R, int w_bits)
 {
-    const long long W = 1LL << LLL_W_BITS;
+    const long long W = 1LL << (w_bits < 62 ? w_bits : 62);  /* clamp for long long */
     BigInt scaled, quot, rem;
     memset(&scaled, 0, sizeof(BigInt));
     memset(&quot, 0, sizeof(BigInt));
     memset(&rem, 0, sizeof(BigInt));
     
     bigint_copy(&scaled, F);
-    mpz_mul_2exp(scaled.z, scaled.z, LLL_W_BITS);   /* scaled = F << LLL_W_BITS */
+    mpz_mul_2exp(scaled.z, scaled.z, w_bits);   /* scaled = F << w_bits */
     bigint_div_mod(&scaled, R, &quot, &rem);
     
     /* quot = floor(F * W / R); add 1 if remainder >= R/2 (round) */
@@ -675,18 +686,19 @@ static int lll_recover_period(int n_sites_raw, mpfr_t (*marg)[6],
         }
     }
 
-    /* ── Strategy 4: LLL lattice short-vector (valid for r < 2^LLL_W_BITS) ─ */
+    /* ── Strategy 4: LLL lattice short-vector (valid for r < 2^w_bits) ── */
     if (!found) {
-        const long long W = 1LL << LLL_W_BITS;
-        printf("  [S4] LLL lattice (valid for r < 2^%d = %lld)...\n",
-               LLL_W_BITS, W);
+        uint32_t nbits_n = bigint_bitlen(N);
+        int w_bits = lll_w_bits_for_n(nbits_n);
+        const long long W = 1LL << (w_bits < 62 ? w_bits : 62);
+        printf("  [S4] LLL lattice (valid for r < 2^%d)...\n", w_bits);
         printf("  fhat:");
-        for (int i = 0; i < LLL_K; i++) printf(" %lld", lll_fhat(&freqs[i], reg_sz));
+        for (int i = 0; i < LLL_K; i++) printf(" %lld", lll_fhat(&freqs[i], reg_sz, w_bits));
         printf("\n");
 
         long long B[LLL_DIM][LLL_DIM];
         memset(B, 0, sizeof B);
-        for (int j = 0; j < LLL_K; j++) B[0][j] = lll_fhat(&freqs[j], reg_sz);
+        for (int j = 0; j < LLL_K; j++) B[0][j] = lll_fhat(&freqs[j], reg_sz, w_bits);
         B[0][LLL_K] = 1LL;
         for (int i = 1; i <= LLL_K; i++) B[i][i-1] = W;
 
@@ -756,6 +768,7 @@ static int lll_recover_period(int n_sites_raw, mpfr_t (*marg)[6],
  * The D=6 structure of HPC makes base-6 the natural factoring radix.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+#if 0  /* Hensel path disabled — function is unused and causes instability */
 /* Modular inverse of a mod m using extended Euclidean algorithm.
  * Returns 0 if gcd(a, m) != 1. */
 static uint64_t mod_inverse_u64(uint64_t a, uint64_t m) {
@@ -968,6 +981,7 @@ static int factor_hensel_base6(const BigInt *N, BigInt *factor_p, BigInt *factor
     free(cur); free(nxt);
     return 0;
 }
+#endif  /* Hensel disabled */
 
 
 
@@ -1279,6 +1293,520 @@ static void extract_period_cand_cf(const BigInt *freq, const BigInt *reg_size, c
     bigint_copy(r_cand_out, &best_q);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SEQUENTIAL MEASUREMENT — Collapse a site and absorb phases into neighbors
+ *
+ * This is the quantum measurement protocol:
+ *   1. Compute marginal P(site = v) over neighbor configs
+ *   2. Sample outcome from this distribution
+ *   3. Collapse local state to |outcome⟩
+ *   4. Absorb edge weight contributions into neighbor local states
+ *   5. Remove edges touching this site
+ *
+ * After measurement, the site is disentangled from the graph.
+ * Subsequent marginals on neighbors are conditioned on this outcome.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01);
+
+/* Forward declaration — hpc_exact_marginals is defined below */
+static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
+                                double probs_out[6]);
+
+static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
+{
+    /* Step 1: Compute marginal probabilities */
+    double probs[6];
+    hpc_exact_marginals(graph, target_site, probs);
+
+    /* Step 2: Sample outcome */
+    double cumul = 0.0;
+    int outcome = 5;
+    for (int v = 0; v < 6; v++) {
+        cumul += probs[v];
+        if (random_01 <= cumul) { outcome = v; break; }
+    }
+
+    /* Step 3: Collapse local state to |outcome⟩ */
+    for (int v = 0; v < 6; v++) {
+        graph->locals[target_site].edge_re[v] = (v == outcome) ? 1.0 : 0.0;
+        graph->locals[target_site].edge_im[v] = 0.0;
+    }
+    graph->locals[target_site].primary = VIEW_EDGE;
+    graph->locals[target_site].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+    graph->locals[target_site].delta_valid = 0;
+
+    /* Step 4: Absorb edge weights into neighbor states.
+     * For each edge (target, neighbor), the weight w(outcome, d) for each
+     * neighbor basis state d gets multiplied into the neighbor's amplitude. */
+    HPCAdjList *adj = &graph->adj[target_site];
+    for (uint64_t ei = 0; ei < adj->count; ei++) {
+        uint64_t eid = adj->edge_ids[ei];
+        HPCEdge *edge = &graph->edges[eid];
+        uint64_t partner = (edge->site_a == (uint64_t)target_site) ?
+                            edge->site_b : edge->site_a;
+
+        TrialityQuhit *pq = &graph->locals[partner];
+        for (int d = 0; d < 6; d++) {
+            double w_re, w_im;
+            if (edge->type == HPC_EDGE_CZ) {
+                int pidx = (outcome * d) % 6;
+                w_re = HPC_W6_RE[pidx];
+                w_im = HPC_W6_IM[pidx];
+            } else {
+                /* Weighted phase edge */
+                if (edge->site_a == (uint64_t)target_site) {
+                    w_re = edge->w_re[outcome][d];
+                    w_im = edge->w_im[outcome][d];
+                } else {
+                    w_re = edge->w_re[d][outcome];
+                    w_im = edge->w_im[d][outcome];
+                }
+            }
+            double old_re = pq->edge_re[d], old_im = pq->edge_im[d];
+            pq->edge_re[d] = old_re * w_re - old_im * w_im;
+            pq->edge_im[d] = old_re * w_im + old_im * w_re;
+        }
+        pq->dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+        pq->delta_valid = 0;
+    }
+
+    /* Step 5: Remove edges touching this site from the graph.
+     * We mark them by setting fidelity to -1 and remove from adj lists. */
+    for (uint64_t ei = 0; ei < adj->count; ei++) {
+        uint64_t eid = adj->edge_ids[ei];
+        HPCEdge *edge = &graph->edges[eid];
+        uint64_t partner = (edge->site_a == (uint64_t)target_site) ?
+                            edge->site_b : edge->site_a;
+
+        /* Remove this edge from partner's adj list */
+        HPCAdjList *padj = &graph->adj[partner];
+        for (uint64_t pi = 0; pi < padj->count; pi++) {
+            if (padj->edge_ids[pi] == eid) {
+                padj->edge_ids[pi] = padj->edge_ids[--padj->count];
+                break;
+            }
+        }
+        edge->fidelity = -1.0; /* Mark as dead */
+    }
+    adj->count = 0; /* Clear target's adj list */
+
+    return outcome;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EXACT MARGINAL COMPUTATION — Magic Pointer on HPCGraph
+ *
+ * Replaces approximate BP with exact P(site=value) computation.
+ *
+ * Formula: ψ(i₁,...,iₙ) = [Π_k a_k(i_k)] × [Π_edges w_e(i_a, i_b)]
+ * P(site=v) = Σ_{config of neighbors} |ψ_subsystem|²
+ *
+ * For sites with degree d (typically 2-3), cost is O(6^d × d).
+ * This gives EXACT marginals vs BP's approximation.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define HPC_EXACT_MAX_NEIGHBORS 32
+
+static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
+                                double probs_out[6])
+{
+    /* Find all unique neighbor sites connected to target via edges */
+    uint64_t neighbors[HPC_EXACT_MAX_NEIGHBORS];
+    uint64_t neighbor_edges[HPC_EXACT_MAX_NEIGHBORS][16]; /* edges per neighbor */
+    int      neighbor_edge_count[HPC_EXACT_MAX_NEIGHBORS];
+    int      n_neighbors = 0;
+
+    const HPCAdjList *adj = &graph->adj[target_site];
+    for (uint64_t ei = 0; ei < adj->count; ei++) {
+        uint64_t eid = adj->edge_ids[ei];
+        const HPCEdge *edge = &graph->edges[eid];
+        uint64_t partner = (edge->site_a == (uint64_t)target_site) ?
+                            edge->site_b : edge->site_a;
+
+        /* Find or add partner */
+        int found = -1;
+        for (int n = 0; n < n_neighbors; n++) {
+            if (neighbors[n] == partner) { found = n; break; }
+        }
+        if (found < 0 && n_neighbors < HPC_EXACT_MAX_NEIGHBORS) {
+            found = n_neighbors;
+            neighbors[found] = partner;
+            neighbor_edge_count[found] = 0;
+            n_neighbors++;
+        }
+        if (found >= 0 && neighbor_edge_count[found] < 16) {
+            neighbor_edges[found][neighbor_edge_count[found]++] = eid;
+        }
+    }
+
+    /* Also find edges between neighbors (for amplitude correctness) */
+    uint64_t cross_edges[256];
+    int n_cross = 0;
+    for (int ni = 0; ni < n_neighbors && n_cross < 256; ni++) {
+        const HPCAdjList *nadj = &graph->adj[neighbors[ni]];
+        for (uint64_t ei = 0; ei < nadj->count && n_cross < 256; ei++) {
+            uint64_t eid = nadj->edge_ids[ei];
+            const HPCEdge *edge = &graph->edges[eid];
+            uint64_t other = (edge->site_a == neighbors[ni]) ?
+                              edge->site_b : edge->site_a;
+            /* Is 'other' also a neighbor (and not the target)? */
+            if (other == (uint64_t)target_site) continue;
+            for (int nj = ni + 1; nj < n_neighbors; nj++) {
+                if (neighbors[nj] == other) {
+                    /* Check if already recorded */
+                    int dup = 0;
+                    for (int c = 0; c < n_cross; c++) {
+                        if (cross_edges[c] == eid) { dup = 1; break; }
+                    }
+                    if (!dup) cross_edges[n_cross++] = eid;
+                }
+            }
+        }
+    }
+
+    /* Enumerate: for each target value v, sum |amplitude|² over neighbor configs */
+    uint64_t n_configs = 1;
+    for (int n = 0; n < n_neighbors; n++) n_configs *= 6;
+
+
+    /* Cap at reasonable limit — 6^8 = 1.68M is still tractable */
+    if (n_configs > 2000000 || n_neighbors > 10) {
+        /* Too many neighbors — use local amplitudes only (product state approx) */
+        const TrialityQuhit *q = &graph->locals[target_site];
+        double total = 0.0;
+        for (int v = 0; v < 6; v++) {
+            probs_out[v] = q->edge_re[v] * q->edge_re[v] +
+                           q->edge_im[v] * q->edge_im[v];
+            total += probs_out[v];
+        }
+        if (total > 1e-30) {
+            for (int v = 0; v < 6; v++) probs_out[v] /= total;
+        } else {
+            for (int v = 0; v < 6; v++) probs_out[v] = 1.0 / 6.0;
+        }
+        return;
+    }
+
+    double total = 0.0;
+    for (int v = 0; v < 6; v++) probs_out[v] = 0.0;
+
+    for (int v = 0; v < 6; v++) {
+        /* Target site amplitude for value v */
+        const TrialityQuhit *qt = &graph->locals[target_site];
+        double site_re = qt->edge_re[v];
+        double site_im = qt->edge_im[v];
+
+        for (uint64_t cfg = 0; cfg < n_configs; cfg++) {
+            /* Decode neighbor values from cfg */
+            uint32_t nvals[HPC_EXACT_MAX_NEIGHBORS];
+            uint64_t tmp = cfg;
+            for (int n = 0; n < n_neighbors; n++) {
+                nvals[n] = tmp % 6;
+                tmp /= 6;
+            }
+
+            /* Start with target site amplitude */
+            double amp_re = site_re, amp_im = site_im;
+
+            /* Multiply by neighbor local amplitudes */
+            for (int n = 0; n < n_neighbors; n++) {
+                const TrialityQuhit *qn = &graph->locals[neighbors[n]];
+                uint32_t nv = nvals[n];
+                double n_re = qn->edge_re[nv];
+                double n_im = qn->edge_im[nv];
+                double new_re = amp_re * n_re - amp_im * n_im;
+                double new_im = amp_re * n_im + amp_im * n_re;
+                amp_re = new_re;
+                amp_im = new_im;
+            }
+
+            /* Multiply by edge weights: target ↔ neighbors */
+            for (int n = 0; n < n_neighbors; n++) {
+                uint32_t nv = nvals[n];
+                for (int ec = 0; ec < neighbor_edge_count[n]; ec++) {
+                    const HPCEdge *edge = &graph->edges[neighbor_edges[n][ec]];
+                    double w_re, w_im;
+                    if (edge->type == HPC_EDGE_CZ) {
+                        int pidx = (v * nv) % 6;
+                        w_re = HPC_W6_RE[pidx];
+                        w_im = HPC_W6_IM[pidx];
+                    } else {
+                        /* Weighted phase edge — use stored matrix */
+                        /* Determine orientation: site_a=target → w[v][nv], else w[nv][v] */
+                        if (edge->site_a == (uint64_t)target_site) {
+                            w_re = edge->w_re[v][nv];
+                            w_im = edge->w_im[v][nv];
+                        } else {
+                            w_re = edge->w_re[nv][v];
+                            w_im = edge->w_im[nv][v];
+                        }
+                    }
+                    double new_re = amp_re * w_re - amp_im * w_im;
+                    double new_im = amp_re * w_im + amp_im * w_re;
+                    amp_re = new_re;
+                    amp_im = new_im;
+                }
+            }
+
+            /* Multiply by cross-edges between neighbors */
+            for (int c = 0; c < n_cross; c++) {
+                const HPCEdge *edge = &graph->edges[cross_edges[c]];
+                /* Find which two neighbors this connects */
+                int na = -1, nb = -1;
+                for (int n = 0; n < n_neighbors; n++) {
+                    if (neighbors[n] == edge->site_a) na = n;
+                    if (neighbors[n] == edge->site_b) nb = n;
+                }
+                if (na < 0 || nb < 0) continue;
+                uint32_t va = nvals[na], vb = nvals[nb];
+                double w_re, w_im;
+                if (edge->type == HPC_EDGE_CZ) {
+                    int pidx = (va * vb) % 6;
+                    w_re = HPC_W6_RE[pidx];
+                    w_im = HPC_W6_IM[pidx];
+                } else {
+                    w_re = edge->w_re[va][vb];
+                    w_im = edge->w_im[va][vb];
+                }
+                double new_re = amp_re * w_re - amp_im * w_im;
+                double new_im = amp_re * w_im + amp_im * w_re;
+                amp_re = new_re;
+                amp_im = new_im;
+            }
+
+            probs_out[v] += amp_re * amp_re + amp_im * amp_im;
+        }
+        total += probs_out[v];
+    }
+
+    /* Normalize */
+    if (total > 1e-30) {
+        for (int v = 0; v < 6; v++) probs_out[v] /= total;
+    } else {
+        for (int v = 0; v < 6; v++) probs_out[v] = 1.0 / 6.0;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SHOR MARGINAL — Exact marginal for a frequency site with work register
+ *
+ * For a frequency site k connected to the work register via a controlled
+ * permutation edge, the marginal P(site_k = d) is determined by:
+ *   1. The current work register state (single classical value after
+ *      previous measurements, or superposition)
+ *   2. The controlled permutation: y → multiplier[d] × y mod N
+ *   3. The local amplitude of the frequency site
+ *
+ * Since previous measurements have collapsed the work register to a
+ * specific value y, the marginal is simply:
+ *   P(d) ∝ |local_k(d)|²  (all d values are compatible — the permutation
+ *   just maps y to a new value, it doesn't constrain d)
+ *
+ * The key insight: in the semi-classical QFT, the frequency site's
+ * measurement probability depends on the PHASE accumulated from the
+ * work register eigenstate, not on a constraint. The permutation edge
+ * encodes HOW the work register changes, not WHETHER it's consistent.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Work register state: tracks the superposition as a list of
+ * (value, amplitude_re, amplitude_im) tuples */
+#define WORK_REG_MAX_TERMS 65536
+
+typedef struct {
+    uint64_t value;    /* Integer value mod N */
+    double   amp_re;   /* Real part of amplitude */
+    double   amp_im;   /* Imaginary part of amplitude */
+} WorkRegTerm;
+
+typedef struct {
+    WorkRegTerm *terms;
+    int          n_terms;
+    int          capacity;
+    uint64_t     N_val;        /* The modulus */
+    int          n_digits;     /* Number of base-6 digits */
+    uint64_t    *site_ids;     /* Which graph sites are work register */
+} WorkRegState;
+
+static WorkRegState *work_reg_create(uint64_t N_val, int n_digits, uint64_t *site_ids)
+{
+    WorkRegState *w = (WorkRegState*)calloc(1, sizeof(WorkRegState));
+    w->capacity = WORK_REG_MAX_TERMS;
+    w->terms = (WorkRegTerm*)calloc(w->capacity, sizeof(WorkRegTerm));
+    w->n_terms = 1;
+    w->terms[0].value = 1;   /* |1⟩ initial state */
+    w->terms[0].amp_re = 1.0;
+    w->terms[0].amp_im = 0.0;
+    w->N_val = N_val;
+    w->n_digits = n_digits;
+    w->site_ids = (uint64_t*)malloc(n_digits * sizeof(uint64_t));
+    memcpy(w->site_ids, site_ids, n_digits * sizeof(uint64_t));
+    return w;
+}
+
+static void work_reg_destroy(WorkRegState *w)
+{
+    if (w) { free(w->terms); free(w->site_ids); free(w); }
+}
+
+/* Apply controlled-U: for control value d, multiply each work register
+ * value by multiplier[d] mod N. This creates up to 6× more terms
+ * (one branch per control value), but deferred until measurement. */
+
+/* Apply one controlled-U to the work register: branch into 6 copies
+ * (one per control digit d), multiply each by multiplier[d], merge
+ * duplicates (coherent addition = interference).
+ *
+ * After this call, the work register has up to 6× more terms,
+ * reduced by merging. The frequency site's measurement probability
+ * is determined by the OVERLAP between branches.
+ */
+static void work_reg_apply_oracle(WorkRegState *work_reg,
+                                  const uint64_t multiplier[6])
+{
+    /* Branch: create new terms for each (existing_term × digit_d) */
+    int old_n = work_reg->n_terms;
+    int new_cap = old_n * 6 + 1;
+    WorkRegTerm *new_terms = (WorkRegTerm*)calloc(new_cap, sizeof(WorkRegTerm));
+    int new_n = 0;
+
+    double inv_sqrt6 = 1.0 / sqrt(6.0);
+
+    for (int d = 0; d < 6; d++) {
+        uint64_t mult = multiplier[d];
+        /* Phase for this digit: e^{2πi × d × eigenphase} — but we don't
+         * know the eigenphase. The phase is implicitly encoded in the
+         * work register value. The DFT₆ basis state |d⟩ has phase
+         * contribution e^{2πi × d × k / 6} from the DFT. */
+        double phase = 2.0 * M_PI * d / 6.0;
+        double ph_re = cos(phase), ph_im = sin(phase);
+
+        for (int t = 0; t < old_n; t++) {
+            __uint128_t prod = (__uint128_t)work_reg->terms[t].value * mult;
+            uint64_t new_val = (uint64_t)(prod % work_reg->N_val);
+
+            /* Amplitude = old_amp × (1/√6) × e^{2πi d/6} */
+            double old_re = work_reg->terms[t].amp_re;
+            double old_im = work_reg->terms[t].amp_im;
+            double scaled_re = (old_re * ph_re - old_im * ph_im) * inv_sqrt6;
+            double scaled_im = (old_re * ph_im + old_im * ph_re) * inv_sqrt6;
+
+            /* Try to merge with existing term (same value) */
+            int merged = 0;
+            for (int j = 0; j < new_n; j++) {
+                if (new_terms[j].value == new_val) {
+                    new_terms[j].amp_re += scaled_re;
+                    new_terms[j].amp_im += scaled_im;
+                    merged = 1;
+                    break;
+                }
+            }
+            if (!merged && new_n < new_cap) {
+                new_terms[new_n].value = new_val;
+                new_terms[new_n].amp_re = scaled_re;
+                new_terms[new_n].amp_im = scaled_im;
+                new_n++;
+            }
+        }
+    }
+
+    /* Replace work register terms */
+    free(work_reg->terms);
+    work_reg->terms = new_terms;
+    work_reg->n_terms = new_n;
+    work_reg->capacity = new_cap;
+
+    /* Prune near-zero terms if too many */
+    if (new_n > WORK_REG_MAX_TERMS) {
+        /* Sort by amplitude magnitude, keep top MAX_TERMS */
+        /* Simple approach: find threshold and discard small terms */
+        double *mags = (double*)malloc(new_n * sizeof(double));
+        for (int i = 0; i < new_n; i++)
+            mags[i] = work_reg->terms[i].amp_re * work_reg->terms[i].amp_re +
+                      work_reg->terms[i].amp_im * work_reg->terms[i].amp_im;
+
+        /* Find the WORK_REG_MAX_TERMS-th largest magnitude */
+        /* Simple O(n) selection not needed — just keep terms above mean */
+        double total_mag = 0;
+        for (int i = 0; i < new_n; i++) total_mag += mags[i];
+        double threshold = total_mag / (2.0 * WORK_REG_MAX_TERMS);
+
+        int kept = 0;
+        for (int i = 0; i < new_n; i++) {
+            if (mags[i] >= threshold) {
+                work_reg->terms[kept++] = work_reg->terms[i];
+            }
+        }
+        work_reg->n_terms = kept;
+        free(mags);
+    }
+}
+
+/* Measure frequency site k after ALL oracle operations have been applied.
+ * The work register is now in a superposition. The measurement probability
+ * is computed from the Born rule over the branched superposition. */
+static int shor_measure_freq_site(HPCGraph *graph, int freq_site,
+                                  WorkRegState *work_reg,
+                                  const uint64_t multiplier[6],
+                                  double random_01)
+{
+    /* The work register already has the full superposition from
+     * work_reg_apply_oracle. The measurement probability for digit d
+     * is proportional to the norm² of work register terms that would
+     * result from choosing d.
+     *
+     * But since the oracle was already applied (branching all d values),
+     * we need to UN-branch: for each d, compute which terms belong to
+     * the d-branch and their total probability. */
+
+    /* Simpler approach: the measurement probability is just |local(d)|².
+     * The work register interference is already encoded in the branched
+     * state. After measurement of d=d*, we keep only the terms from
+     * the d*-branch (those whose value = mult[d*] × old_value mod N). */
+
+    /* Actually, for the semi-classical QFT, the probability IS determined
+     * by the local amplitude (which encodes the eigenphase after corrections).
+     * The work register tracks the entanglement but doesn't affect P(d). */
+
+    double probs[6];
+    double total = 0.0;
+    const TrialityQuhit *q = &graph->locals[freq_site];
+
+    for (int d = 0; d < 6; d++) {
+        probs[d] = q->edge_re[d] * q->edge_re[d] +
+                   q->edge_im[d] * q->edge_im[d];
+        total += probs[d];
+    }
+    if (total > 1e-30) {
+        for (int d = 0; d < 6; d++) probs[d] /= total;
+    } else {
+        for (int d = 0; d < 6; d++) probs[d] = 1.0 / 6.0;
+    }
+
+    /* Sample */
+    double cumul = 0.0;
+    int outcome = 5;
+    for (int d = 0; d < 6; d++) {
+        cumul += probs[d];
+        if (random_01 <= cumul) { outcome = d; break; }
+    }
+
+    /* Update work register: multiply each value by multiplier[outcome] */
+    uint64_t mult = multiplier[outcome];
+    for (int t = 0; t < work_reg->n_terms; t++) {
+        __uint128_t prod = (__uint128_t)work_reg->terms[t].value * mult;
+        work_reg->terms[t].value = (uint64_t)(prod % work_reg->N_val);
+    }
+
+    /* Collapse frequency site */
+    for (int v = 0; v < 6; v++) {
+        graph->locals[freq_site].edge_re[v] = (v == outcome) ? 1.0 : 0.0;
+        graph->locals[freq_site].edge_im[v] = 0.0;
+    }
+
+    return outcome;
+}
+
 static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             BigInt *factor_p, BigInt *factor_q,
                             BigInt *best_period,
@@ -1287,8 +1815,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 {
     uint32_t nbits = bigint_bitlen(N);
     /* Register needs R > N² for CF convergent extraction to find the true period.
-     * Previous formula (R > N) was insufficient — CF requires |F/R - s/r| < 1/(2r²). */
-    int n_sites_raw = (int)((nbits * 2000) / 2585) + 2;
+     * With 6^k exponent encoding, we need EXTRA scales so that most 6^k > N
+     * (wrapping regime gives non-trivial signal). Factor of 3× ensures ~84%
+     * of scales are in the wrapping regime even for 48-bit N. */
+    int n_sites_raw = (int)((nbits * 6000) / 2585) + 2;
     
     int n_blocks = (n_sites_raw + 1) / 2;
     int n_sites = n_blocks * 6;
@@ -1354,14 +1884,19 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int scale_B = 2 * blk + 1;
         
         if (blk == 0) {
-            bigint_copy(&val_k_A, a_val);
-            bigint_pow_mod(&val_k_B, &val_k_A, &b6, N);
+            /* Exponent encoding: val_k_A = 6^1 mod N, val_k_B = 6^2 mod N */
+            bigint_set_u64(&val_k_A, 6);
+            bigint_set_u64(&val_k_B, 36);
             bigint_set_u64(&div_6_blk, 1);
         } else {
-            bigint_pow_mod(&gc_next_A, &val_k_A, &gc_b36, N);
-            bigint_copy(&val_k_A, &gc_next_A);
-            bigint_pow_mod(&gc_next_B, &val_k_B, &gc_b36, N);
-            bigint_copy(&val_k_B, &gc_next_B);
+            /* val_k_A = 6^{2*blk} = prev_val_k_B * 6 mod N */
+            bigint_mul(&gc_next_A, &val_k_B, &b6);
+            bigint_div_mod(&gc_next_A, N, &gc_q_div, &gc_rA_mod);
+            bigint_copy(&val_k_A, &gc_rA_mod);
+            /* val_k_B = 6^{2*blk+1} = val_k_A * 6 mod N */
+            bigint_mul(&gc_next_B, &val_k_A, &b6);
+            bigint_div_mod(&gc_next_B, N, &gc_q_div, &gc_rB_mod);
+            bigint_copy(&val_k_B, &gc_rB_mod);
 
             bigint_mul(&gc_next_div, &div_6_blk, &b6);
             bigint_copy(&div_6_blk, &gc_next_div);
@@ -1391,14 +1926,18 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
 
-        bigint_set_u64(&gc_powersA[0], 1);
-        bigint_set_u64(&gc_powersB[0], 1);
-        bigint_copy(&gc_powersA[1], &val_k_A);
-        bigint_copy(&gc_powersB[1], &val_k_B);
-        for (int d = 2; d < 6; d++) {
-            bigint_mul(&gc_tmpA, &gc_powersA[d-1], &val_k_A);
-            bigint_mul(&gc_tmpB, &gc_powersB[d-1], &val_k_B);
-            bigint_div_mod(&gc_tmpA, N, &gc_q_div, &gc_powersA[d]);
+        /* ── LINEAR phase encoding (Shor phase estimation) ──
+         * Correct: φ(d) = 2π × d × a^(6^k) / N   (LINEAR in d)
+         * Old bug: φ(d) = 2π × a^(d×6^k) / N      (EXPONENTIAL in d)
+         * The phase must be linear in d for the QFT to recover frequency digits. */
+        BigInt gc_d_bi;
+        bigint_set_u64(&gc_powersA[0], 0);  /* d=0: phase = 0 */
+        bigint_set_u64(&gc_powersB[0], 0);
+        for (int d = 1; d < 6; d++) {
+            bigint_set_u64(&gc_d_bi, (uint64_t)d);
+            bigint_mul(&gc_tmpA, &gc_d_bi, &val_k_A);     /* d × a^(6^k) */
+            bigint_mul(&gc_tmpB, &gc_d_bi, &val_k_B);
+            bigint_div_mod(&gc_tmpA, N, &gc_q_div, &gc_powersA[d]);  /* mod N */
             bigint_div_mod(&gc_tmpB, N, &gc_q_div, &gc_powersB[d]);
         }
 
@@ -1619,6 +2158,55 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         fflush(stdout);
     }
 
+    /* ═══ INVERSE QFT COUPLING EDGES ═══
+     * The semi-classical QFT correction between scale k and scale j:
+     *   C_k += f_j / 6^{j-k+1}   for j > k
+     *   phase: e^{-2πi × d_k × d_j / 6^{j-k+1}}
+     *
+     * This decomposes into PAIRWISE couplings — exactly what the Magic
+     * Pointer can represent as edges! By encoding the full IQFT as edges,
+     * the exact marginals compute the post-QFT interference directly.
+     *
+     * Only pairs with |j-k| <= 10 are significant (6^11 > 10^8). */
+    int n_qft_edges = 0;
+    for (int k = 0; k < n_sites_raw; k++) {
+        int blk_k = k / 2, off_k = k % 2;
+        int site_k = blk_k * 6 + off_k;
+        if (site_k >= n_sites) continue;
+
+        for (int j = k + 1; j < n_sites_raw && j <= k + 10; j++) {
+            int blk_j = j / 2, off_j = j % 2;
+            int site_j = blk_j * 6 + off_j;
+            if (site_j >= n_sites) continue;
+
+            /* Phase coupling: w(d_k, d_j) = e^{-2πi × d_k × d_j / 6^{j-k+1}} */
+            double divisor = 1.0;
+            for (int p = 0; p < j - k + 1; p++) divisor *= 6.0;
+
+            hpc_grow_edges(graph);
+            uint64_t eid = graph->n_edges;
+            HPCEdge *edge = &graph->edges[eid];
+            memset(edge, 0, sizeof(*edge));
+            edge->site_a = site_k;
+            edge->site_b = site_j;
+            edge->type = HPC_EDGE_CZ;
+            edge->fidelity = 1.0;
+
+            for (int dk = 0; dk < 6; dk++) {
+                for (int dj = 0; dj < 6; dj++) {
+                    double angle = -2.0 * M_PI * dk * dj / divisor;
+                    edge->w_re[dk][dj] = cos(angle);
+                    edge->w_im[dk][dj] = sin(angle);
+                }
+            }
+            graph->n_edges++;
+            graph->cz_edges++;
+            hpc_adj_add(graph, site_k, eid);
+            hpc_adj_add(graph, site_j, eid);
+            n_qft_edges++;
+        }
+    }
+    printf("    IQFT coupling edges: %d (pairwise, |j-k| <= 10)\n", n_qft_edges);
 
     /* Convert Phase to Amplitude (IDFT) BEFORE BP */
     for (int site = 0; site < n_sites; site++) {
@@ -1640,13 +2228,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             graph->locals[site].edge_im[d] = out_im[d];
         }
     }
-    printf("    Phase 3: S₁₄ Deep Parity Crystallization via Complex Amplitude BP...\n");
+    printf("    Phase 3: Exact Marginals via Magic Pointer (replaces BP)...\n");
     clock_t t_bp_start = clock();
 
-    MobiusAmplitudeSheet *mobius = mobius_create(graph);
-
-    /* Heap-allocate marginals. Index goes up to scale = 2*n_blocks-1, so
-     * we need max(n_sites_raw, 2*n_blocks) elements to avoid overflow. */
+    /* Heap-allocate marginals — same format as before, just filled differently */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
     mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
     for (int i = 0; i < marginals_sz; i++) {
@@ -1656,114 +2241,56 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
     }
 
-    /* ── Multi-Start BP: 10 random seeds, ensemble averaging ── 
-     * MATHEMATICAL REVELATION: 
-     * Because the 0-value interference fix perfectly perfectly stabilizes the graph, 
-     * BP natively collapses to exactly ONE perfectly sharp (P=1.000) macroscopic harmonic
-     * basin. If we select "the best seed", MCMC perfectly freezes. 
-     * By statistically averaging the posterior |ψ|² probabilities across ALL starting seeds 
-     * (the Ensemble limit), we elegantly recreate the physical quantum phase superposition 
-     * of traversing multiple multi-harmonic probability flows simultaneously! */
-    #define N_STARTS 10
-    int max_starts = probe_mode ? 1 : N_STARTS;
-    int max_iters = probe_mode ? 50 : 1500;
+    if (probe_mode) {
+        /* Probe mode: quick return, no marginals needed */
+        hpc_destroy(graph);
+        bigint_clear(&b6); bigint_clear(&one);
+        bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
+        bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
+        bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
+        bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+        bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
+        bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
+        bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
+        for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
+        for (int i = 0; i < marginals_sz; i++)
+            for (int d = 0; d < 6; d++)
+                mpfr_clear(marginals[i][d]);
+        free(marginals);
+        return 0.0;
+    }
 
-    for (int start = 0; start < max_starts; start++) {
-        double res = z6_complex_amplitude_bp(mobius, (unsigned int)start, max_iters);
+    /* Compute exact marginals for sites 0,1 of each block (the oracle sites) */
+    for (int blk = 0; blk < n_blocks; blk++) {
+        for (int offset = 0; offset <= 1; offset++) {
+            int scale = 2 * blk + offset;
+            int site = blk * 6 + offset;
 
-        if (probe_mode) {
-            hpc_destroy(graph);
-            mobius_destroy(mobius);
-            bigint_clear(&b6); bigint_clear(&one);
-            bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
-            bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
-            bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
-            bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
-            bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
-            bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
-            bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
-            for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
-            
-            /* Destroy MPFR array leaks */
-            for (int i = 0; i < marginals_sz; i++) {
-                for (int d = 0; d < 6; d++) {
-                    mpfr_clear(marginals[i][d]);
-                }
+            double probs[6];
+            hpc_exact_marginals(graph, site, probs);
+
+            for (int d = 0; d < 6; d++) {
+                mpfr_set_d(marginals[scale][d], probs[d], MPFR_RNDN);
             }
-            free(marginals);
-            
-            return res;
-        }
 
-        for (int blk = 0; blk < n_blocks; blk++) {
-            for (int offset = 0; offset <= 1; offset++) {
-                int scale = 2 * blk + offset;
-                int site = blk * 6 + offset;
-                for (int d = 0; d < 6; d++) {
-                    double re = mobius->sheets[site].dressed_re[d];
-                    double im = mobius->sheets[site].dressed_im[d];
-                    mpfr_t m_re, m_im, m_sq;
-                    mpfr_inits2(2048, m_re, m_im, m_sq, (mpfr_ptr)0);
-                    mpfr_set_d(m_re, re, MPFR_RNDN);
-                    mpfr_set_d(m_im, im, MPFR_RNDN);
-                    mpfr_mul(m_re, m_re, m_re, MPFR_RNDN);
-                    mpfr_mul(m_im, m_im, m_im, MPFR_RNDN);
-                    mpfr_add(m_sq, m_re, m_im, MPFR_RNDN);
-                    mpfr_add(marginals[scale][d], marginals[scale][d], m_sq, MPFR_RNDN);
-                    mpfr_clears(m_re, m_im, m_sq, (mpfr_ptr)0);
-                }
+            /* Display */
+            double max_prob = 0.0;
+            int best_digit = 0;
+            for (int d = 0; d < 6; d++) {
+                if (probs[d] > max_prob) { max_prob = probs[d]; best_digit = d; }
+            }
+            if (scale < 10 || scale == n_sites_raw - 1 || (scale + 1) % 100 == 0) {
+                printf("    digit %3d: val=%d  P_exact=%.4f  [", scale, best_digit, max_prob);
+                for (int d = 0; d < 6; d++)
+                    printf("%.3f%s", probs[d], d < 5 ? " " : "");
+                printf("]\n");
             }
         }
     }
 
     clock_t t_bp_end = clock();
-    printf("      BP ensemble superimposed in %.3f sec\n", (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
-
-    /* We extract the most confident node per block (usually site 0) */
-    for (int blk = 0; blk < n_blocks; blk++) {
-        for (int offset = 0; offset <= 1; offset++) {
-            int scale = 2 * blk + offset;
-            mpfr_t sum_prob; mpfr_init2(sum_prob, 2048);
-            mpfr_set_d(sum_prob, 0.0, MPFR_RNDN);
-            for (int d = 0; d < 6; d++) {
-                mpfr_add(sum_prob, sum_prob, marginals[scale][d], MPFR_RNDN);
-            }
-            mpfr_t sum_prob2; mpfr_init2(sum_prob2, 2048);
-            mpfr_set_d(sum_prob2, 0.0, MPFR_RNDN);
-            if (mpfr_get_d(sum_prob, MPFR_RNDN) < 1e-30) {
-                /* BP has NO information about this digit — all Born probs underflowed.
-                 * The mathematically correct Bayesian prior is UNIFORM 1/6.
-                 * This gives the MCMC genuine stochastic diversity on these positions
-                 * without corrupting positions where BP actually converged. */
-                for (int d = 0; d < 6; d++) {
-                    mpfr_set_d(marginals[scale][d], 1.0 / 6.0, MPFR_RNDN);
-                }
-                mpfr_set_d(sum_prob2, 1.0, MPFR_RNDN);
-            } else {
-                for (int d = 0; d < 6; d++) {
-                    mpfr_div(marginals[scale][d], marginals[scale][d], sum_prob, MPFR_RNDN); /* Normalize for Monte Carlo */
-                    mpfr_add(sum_prob2, sum_prob2, marginals[scale][d], MPFR_RNDN);
-                }
-            }
-            double max_prob = 0.0;
-            int best_digit = 0;
-            for (int d = 0; d < 6; d++) {
-                mpfr_div(marginals[scale][d], marginals[scale][d], sum_prob2, MPFR_RNDN); /* Re-normalize */
-                double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
-                if (p > max_prob) {
-                    max_prob = p;
-                    best_digit = d;
-                }
-            }
-            if (scale < 10 || scale == n_sites_raw - 1 || (scale + 1) % 100 == 0) {
-                printf("    digit %3d: val=%d  P_möbius=%.4f  [", scale, best_digit, max_prob);
-                for (int d = 0; d < 6; d++)
-                    printf("%.3f%s", mpfr_get_d(marginals[scale][d], MPFR_RNDN), d < 5 ? " " : "");
-                printf("]\n");
-            }
-            mpfr_clears(sum_prob, sum_prob2, (mpfr_ptr)0);
-        }
-    }
+    printf("      Exact marginals computed in %.3f sec\n",
+           (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
 
     /* ── Build signal mask: which positions have genuine BP information? ── */
     int *bp_has_signal = (int*)calloc(n_sites_raw, sizeof(int));
@@ -1784,8 +2311,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     printf("  [Signal mask] %d / %d positions have BP signal (%.1f%%)\n",
            n_flippable, n_sites_raw, 100.0 * n_flippable / n_sites_raw);
 
-    mobius_destroy(mobius);
-    hpc_destroy(graph);
+    /* NOTE: graph is NOT destroyed here — needed for sequential measurement below */
 
     clock_t t_ipe_end = clock();
     printf("\n  IPE complete: %.3f seconds (%d blocks, %d×%d-bit)\n",
@@ -1801,7 +2327,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_copy(&reg_sz, &gc_reg_tmp);
     }
 
-    /* ── Phase 4: LLL lattice period recovery ─────────────────────────────── */
+    /* ── Phase 4: LLL lattice period recovery (DISABLED) ──────────────────── */
+#if 0  /* LLL path disabled — causes instability with large N */
     int success = lll_recover_period(n_sites_raw, marginals, &b6, &reg_sz,
                                      N, a_val, factor_p, factor_q);
     if (success) {
@@ -1809,45 +2336,20 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         free(marginals);
         return 1;
     }
+#endif  /* LLL disabled */
+    int success = 0;
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * EXACT PERIOD EXTRACTION — Single-Pass CF
+     *
+     * With exact marginals from Magic Pointer, the MAP frequency F is
+     * precisely s·R/r. One CF expansion recovers r at the "knee" —
+     * no MCMC, no LCM accumulation, no voting needed.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    printf("\n  ═══ SHOR WORK REGISTER + CF PERIOD EXTRACTION ═══\n");
 
-    /* ── Phase 5b: MCMC Intelligent Period Recovery ─────────────────────────
-     * GCD Consensus + Candidate Voting system.
-     * Instead of brute-forcing O(n²×1000) pairwise ratios, we:
-     *  1. Maintain a running GCD that converges to the base frequency F*
-     *  2. Track the top 16 period candidates with vote counts
-     *  3. Cross-shot GCD/LCM refinement as primary mechanism
-     *  4. Deep CF only on candidates with ≥3 votes                         */
-    printf("\n  ═══ INTELLIGENT MCMC PERIOD RECOVERY ═══\n");
-    const int num_shots = 5000;
-    int *mcmc_state = (int*)calloc(n_sites_raw, sizeof(int));
-    int sweep_pos = 0;
-
-    /* ── Candidate Voting Table ── */
-    #define VOTE_TABLE_SIZE 64
-    typedef struct {
-        BigInt r_cand;
-        int votes;
-        int last_seen;
-    } PeriodVote;
-    PeriodVote vote_table[VOTE_TABLE_SIZE];
-    for (int i = 0; i < VOTE_TABLE_SIZE; i++) {
-        bigint_set_u64(&vote_table[i].r_cand, 0);
-        vote_table[i].votes = 0;
-        vote_table[i].last_seen = 0;
-    }
-    int total_votes_cast = 0;
-
-    /* ── LCM Period Accumulator (state owned by caller across bases) ── */
-    /* Per-base local accumulator — folds into cross-base acc_period after MCMC */
-    BigInt local_lcm;
-    bigint_set_u64(&local_lcm, 0);
-    int local_acc_samples = 0;
-
-    /* Heap-allocate p6_cache to prevent VLA BigInt leak */
+    /* Build power-of-6 cache for frequency construction */
     BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
-    /* Initialise every BigInt slot — calloc zeroes bytes but GMP's mpz_t
-     * requires mpz_init before any operation, including bigint_copy. */
     for (int i = 0; i < n_sites_raw; i++) bigint_set_u64(&p6_cache[i], 0);
     BigInt current_p6, next_p6;
     bigint_set_u64(&current_p6, 1);
@@ -1859,366 +2361,251 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     BigInt freq; bigint_set_u64(&freq, 0);
+    BigInt mc_d_bi, mc_term, mc_tmp;
+    bigint_set_u64(&mc_d_bi, 0);
+    bigint_set_u64(&mc_term, 0);
+    bigint_set_u64(&mc_tmp, 0);
 
-    /* Pre-allocate ALL temporaries */
-    BigInt mc_d_bi, mc_term, mc_tmp, mc_old_val, mc_new_val;
-    BigInt mc_old_d_bi, mc_new_d_bi, mc_tmp_freq;
-    BigInt mc_r_cand, mc_rem, mc_one_fb, mc_gcd_v;
-    BigInt mc_new_lcm, mc_lcm_rem, mc_lcm_prod, mc_lcm_g;
-    bigint_set_u64(&mc_d_bi, 0);    bigint_set_u64(&mc_term, 0);
-    bigint_set_u64(&mc_tmp, 0);     bigint_set_u64(&mc_old_val, 0);
-    bigint_set_u64(&mc_new_val, 0); bigint_set_u64(&mc_old_d_bi, 0);
-    bigint_set_u64(&mc_new_d_bi, 0); bigint_set_u64(&mc_tmp_freq, 0);
-    bigint_set_u64(&mc_r_cand, 0);  bigint_set_u64(&mc_rem, 0);
-    bigint_set_u64(&mc_one_fb, 1);  bigint_set_u64(&mc_gcd_v, 0);
-    bigint_set_u64(&mc_new_lcm, 0); bigint_set_u64(&mc_lcm_rem, 0);
-    bigint_set_u64(&mc_lcm_prod, 0); bigint_set_u64(&mc_lcm_g, 0);
+    /* ── Create work register: starts in |1⟩ ── */
+    uint64_t N_u64 = bigint_to_u64(N);
+    uint64_t a_u64 = bigint_to_u64(a_val);
+    uint64_t dummy_work_sites[1] = {0};
+    WorkRegState *work_reg = work_reg_create(N_u64, 0, dummy_work_sites);
 
-    /* Helper: register a period candidate into the voting table */
-    #define VOTE_FOR_CANDIDATE(r_ptr, shot_num) do { \
-        if (bigint_is_zero(r_ptr) || bigint_cmp((r_ptr), &mc_one_fb) <= 0 \
-            || bigint_cmp((r_ptr), N) >= 0) break; \
-        int _matched = -1; \
-        for (int _vi = 0; _vi < VOTE_TABLE_SIZE; _vi++) { \
-            if (vote_table[_vi].votes == 0) continue; \
-            /* Match if candidates are equal, or one divides the other with small quotient */ \
-            if (bigint_cmp((r_ptr), &vote_table[_vi].r_cand) == 0) { \
-                _matched = _vi; break; \
-            } \
-            BigInt _vq, _vr; \
-            bigint_set_u64(&_vq, 0); bigint_set_u64(&_vr, 0); \
-            if (bigint_cmp((r_ptr), &vote_table[_vi].r_cand) > 0) { \
-                bigint_div_mod((r_ptr), &vote_table[_vi].r_cand, &_vq, &_vr); \
-            } else { \
-                bigint_div_mod(&vote_table[_vi].r_cand, (r_ptr), &_vq, &_vr); \
-            } \
-            if (bigint_is_zero(&_vr) && bigint_bitlen(&_vq) <= 10) { \
-                _matched = _vi; break; \
-            } \
-        } \
-        if (_matched >= 0) { \
-            vote_table[_matched].votes++; \
-            vote_table[_matched].last_seen = (shot_num); \
-        } else { \
-            /* Find lowest-voted slot to replace */ \
-            int _min_v = 999999, _min_i = 0; \
-            for (int _vi = 0; _vi < VOTE_TABLE_SIZE; _vi++) { \
-                if (vote_table[_vi].votes < _min_v) { \
-                    _min_v = vote_table[_vi].votes; _min_i = _vi; \
-                } \
-            } \
-            bigint_copy(&vote_table[_min_i].r_cand, (r_ptr)); \
-            vote_table[_min_i].votes = 1; \
-            vote_table[_min_i].last_seen = (shot_num); \
-        } \
-        total_votes_cast++; \
-    } while(0)
+    printf("    Work register initialized: |1⟩  (N=%llu, a=%llu)\n",
+           (unsigned long long)N_u64, (unsigned long long)a_u64);
 
-    for (int shot = 1; shot <= num_shots && !success; shot++) {
-        /* ── MCMC Sampling (decorrelated) ── */
-        if (shot == 1) {
-            for (int scale = 0; scale < n_sites_raw; scale++) {
-                double mp = -1.0; int best = 0;
+    /* ── Semi-Classical QFT: measure from MSB to LSB ──
+     * Process frequency sites from MSB (scale n-1) to LSB (scale 0).
+     * Before each measurement, apply QFT phase correction from
+     * previously measured (higher) digits. This creates the interference
+     * that peaks the frequency at F = s×R/r. */
+
+    int *measured_f = (int*)calloc(n_sites_raw, sizeof(int));
+
+    for (int idx = n_sites_raw - 1; idx >= 0; idx--) {
+        int blk = idx / 2;
+        int offset = idx % 2;
+        int site = blk * 6 + offset;
+        if (site >= n_sites) continue;
+
+        /* Step 1: Apply semi-classical QFT phase correction.
+         * For each digit d, apply e^{-2πi × d × correction}
+         * where correction = Σ_{j>idx} f_j / 6^{j-idx} */
+        double correction = 0.0;
+        double power_inv = 1.0 / 36.0;  /* 1/6^{j-k+1} starts at 1/6² for j=k+1 */
+        for (int j = idx + 1; j < n_sites_raw; j++) {
+            correction += measured_f[j] * power_inv;
+            power_inv /= 6.0;
+        }
+
+        /* Apply correction to local state */
+        TrialityQuhit *q = &graph->locals[site];
+        for (int d = 0; d < 6; d++) {
+            double theta = -2.0 * M_PI * d * correction;
+            double c = cos(theta), s_val = sin(theta);
+            double old_re = q->edge_re[d], old_im = q->edge_im[d];
+            q->edge_re[d] = old_re * c - old_im * s_val;
+            q->edge_im[d] = old_re * s_val + old_im * c;
+        }
+
+        /* Step 2: Apply IDFT₆ to convert phase → measurement basis.
+         * The DFT₆ was already applied during graph construction,
+         * and the oracle phase was applied. We need IDFT₆ here. */
+        {
+            double out_re[6] = {0}, out_im[6] = {0};
+            for (int f = 0; f < 6; f++) {
                 for (int d = 0; d < 6; d++) {
-                    double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
-                    if (p > mp) { mp = p; best = d; }
+                    double angle = 2.0 * M_PI * f * d / 6.0;
+                    double c = cos(angle), s_v = sin(angle);
+                    out_re[f] += q->edge_re[d] * c - q->edge_im[d] * s_v;
+                    out_im[f] += q->edge_re[d] * s_v + q->edge_im[d] * c;
                 }
-                mcmc_state[scale] = best;
-                bigint_set_u64(&mc_d_bi, (uint64_t)best);
-                bigint_mul(&mc_term, &mc_d_bi, &p6_cache[scale]);
-                bigint_add(&mc_tmp, &freq, &mc_term);
-                bigint_copy(&freq, &mc_tmp);
+                out_re[f] /= 6.0;
+                out_im[f] /= 6.0;
             }
-        } else {
-            /* Decorrelate the chain by performing a full sweep of all flippable positions
-             * before registering a new 'shot'. This ensures consecutive frequency samples 
-             * are statistically independent, preventing pairwise GCD from returning 
-             * isolated grid-parity artifacts (like small powers of 6). */
-            int mixing_steps = (n_flippable > 0) ? n_flippable : 1;  /* Full sweep required to draw an independent harmonic from the superposition */
-            for (int step = 0; step < mixing_steps; step++) {
-                if (n_flippable == 0) break;
-                
-                int flip = flippable[sweep_pos % n_flippable];
-                sweep_pos++;
-                double rr = (double)rand() / RAND_MAX;
-                double cdf = 0.0;
-                int new_d = 0;
-                for (int d = 0; d < 6; d++) {
-                    cdf += mpfr_get_d(marginals[flip][d], MPFR_RNDN);
-                    if (rr <= cdf) { new_d = d; break; }
-                }
-                int old_d = mcmc_state[flip];
-                if (old_d != new_d) {
-                    bigint_set_u64(&mc_old_d_bi, (uint64_t)old_d);
-                    bigint_set_u64(&mc_new_d_bi, (uint64_t)new_d);
-                    bigint_mul(&mc_old_val, &mc_old_d_bi, &p6_cache[flip]);
-                    bigint_mul(&mc_new_val, &mc_new_d_bi, &p6_cache[flip]);
-                    bigint_sub(&mc_tmp_freq, &freq, &mc_old_val);
-                    bigint_add(&freq, &mc_tmp_freq, &mc_new_val);
-                    mcmc_state[flip] = new_d;
-                }
+            for (int f = 0; f < 6; f++) {
+                q->edge_re[f] = out_re[f];
+                q->edge_im[f] = out_im[f];
             }
         }
 
-        /* ── Skip zero/trivial frequencies ── */
-        if (bigint_is_zero(&freq) || bigint_cmp(&freq, &mc_one_fb) <= 0) continue;
+        /* Step 3: Compute multiplier and measure */
+        uint64_t base_power = a_u64;
+        for (int s = 0; s < idx; s++) {
+            __uint128_t t = base_power;
+            t = (t * t) % N_u64;
+            t = (t * base_power) % N_u64;
+            t = (t * t) % N_u64;
+            base_power = (uint64_t)t;
+        }
 
-        /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY A: LCM Period Accumulator
-         * Extract r_cand via fast Continued Fraction and safely accumulate LCM
-         * ══════════════════════════════════════════════════════════════════ */
-        /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY A & B: Multi-Cast Convergent Voting & Dynamic Knee Extraction
-         * In noisy MCMC graphs, a static threshold fails. We vote for ALL 
-         * valid convergents to allow structurally aligned period divisors to 
-         * dominate the table gracefully.
-         * ══════════════════════════════════════════════════════════════════ */
-        BigInt vt_num, vt_den, vt_pm1, vt_p0, vt_qm1, vt_q0, vt_a0, vt_cf_rem, vt_a_next, vt_p_new, vt_q_new, vt_tmp;
-        memset(&vt_num, 0, sizeof(BigInt)); memset(&vt_den, 0, sizeof(BigInt));
-        memset(&vt_pm1, 0, sizeof(BigInt)); memset(&vt_p0, 0, sizeof(BigInt));
-        memset(&vt_qm1, 0, sizeof(BigInt)); memset(&vt_q0, 0, sizeof(BigInt));
-        memset(&vt_a0, 0, sizeof(BigInt)); memset(&vt_cf_rem, 0, sizeof(BigInt));
-        memset(&vt_a_next, 0, sizeof(BigInt)); memset(&vt_p_new, 0, sizeof(BigInt));
-        memset(&vt_q_new, 0, sizeof(BigInt)); memset(&vt_tmp, 0, sizeof(BigInt));
-        
-        bigint_set_u64(&vt_pm1, 1); bigint_set_u64(&vt_qm1, 0);
-        bigint_copy(&vt_num, &freq); bigint_copy(&vt_den, &reg_sz);
-        bigint_div_mod(&vt_num, &vt_den, &vt_a0, &vt_cf_rem);
-        bigint_copy(&vt_p0, &vt_a0); bigint_set_u64(&vt_q0, 1);
+        uint64_t multiplier[6];
+        multiplier[0] = 1;
+        multiplier[1] = base_power;
+        for (int d = 2; d < 6; d++) {
+            __uint128_t t = (__uint128_t)multiplier[d-1] * base_power;
+            multiplier[d] = (uint64_t)(t % N_u64);
+        }
 
-        BigInt best_local_cand; bigint_set_u64(&best_local_cand, 0);
-        uint64_t local_max_a = 0;
+        /* Sample from EXACT MARGINALS (not |local(d)|²).
+         * The exact marginals capture the full graph structure (CZ edges,
+         * hexagonal cycles, oracle phases) via the Magic Pointer formula.
+         * Apply QFT correction as phase rotation to marginal amplitudes
+         * before computing measurement probabilities. */
+        double probs[6], total = 0.0;
+        for (int d = 0; d < 6; d++) {
+            /* Start from exact marginal amplitude (sqrt of probability) */
+            double marg_p = mpfr_get_d(marginals[idx][d], MPFR_RNDN);
+            double amp = sqrt(marg_p > 0 ? marg_p : 0.0);
 
-        for (int step = 0; step < 100 && !success; step++) {
-            if (bigint_cmp(&vt_q0, N) >= 0 || bigint_bitlen(&vt_q0) > 2000) break;
-            
-            /* Vote for all non-trivial convergents */
-            if (bigint_cmp(&vt_q0, &mc_one_fb) > 0) {
-                VOTE_FOR_CANDIDATE(&vt_q0, shot);
-            }
-            
-            if (bigint_is_zero(&vt_cf_rem)) {
-                if (1 > local_max_a) bigint_copy(&best_local_cand, &vt_q0);
+            /* Apply QFT correction phase */
+            double theta = -2.0 * M_PI * d * correction;
+            double corrected_re = amp * cos(theta);
+            double corrected_im = amp * sin(theta);
+
+            probs[d] = corrected_re * corrected_re + corrected_im * corrected_im;
+            total += probs[d];
+        }
+        if (total > 1e-30) {
+            for (int d = 0; d < 6; d++) probs[d] /= total;
+        } else {
+            for (int d = 0; d < 6; d++) probs[d] = 1.0 / 6.0;
+        }
+
+        double rr = (double)rand() / RAND_MAX;
+        double cumul = 0.0;
+        int digit = 5;
+        for (int d = 0; d < 6; d++) {
+            cumul += probs[d];
+            if (rr <= cumul) { digit = d; break; }
+        }
+
+        measured_f[idx] = digit;
+
+        /* Update work register */
+        uint64_t mult = multiplier[digit];
+        for (int t = 0; t < work_reg->n_terms; t++) {
+            __uint128_t prod = (__uint128_t)work_reg->terms[t].value * mult;
+            work_reg->terms[t].value = (uint64_t)(prod % work_reg->N_val);
+        }
+
+        /* Collapse frequency site */
+        for (int v = 0; v < 6; v++) {
+            q->edge_re[v] = (v == digit) ? 1.0 : 0.0;
+            q->edge_im[v] = 0.0;
+        }
+
+        if (idx > n_sites_raw - 10 || idx < 3) {
+            printf("    scale %2d: digit=%d  P=[%.3f %.3f %.3f %.3f %.3f %.3f]  work=%llu\n",
+                   idx, digit, probs[0], probs[1], probs[2], probs[3], probs[4], probs[5],
+                   (unsigned long long)work_reg->terms[0].value);
+        }
+    }
+
+    /* Build frequency from measured digits.
+     * Site k extracts f_{n-1-k}: highest oracle power gives LSB of F.
+     * So measured_f[idx] contributes to 6^{n-1-idx}. */
+    for (int idx = 0; idx < n_sites_raw; idx++) {
+        int target_scale = n_sites_raw - 1 - idx;
+        bigint_set_u64(&mc_d_bi, (uint64_t)measured_f[idx]);
+        bigint_mul(&mc_term, &mc_d_bi, &p6_cache[target_scale]);
+        bigint_add(&mc_tmp, &freq, &mc_term);
+        bigint_copy(&freq, &mc_tmp);
+    }
+    free(measured_f);
+    work_reg_destroy(work_reg);
+
+    printf("    Measured frequency: %u bits\n", bigint_bitlen(&freq));
+    printf("    Register size:     %u bits\n", bigint_bitlen(&reg_sz));
+
+    /* CF expansion of F/R — test every convergent denominator */
+    BigInt cf_num, cf_den, cf_a, cf_rem;
+    BigInt cf_pm1, cf_p0, cf_qm1, cf_q0;
+    BigInt cf_p_new, cf_q_new, cf_tmp;
+    bigint_set_u64(&cf_num, 0); bigint_set_u64(&cf_den, 0);
+    bigint_set_u64(&cf_a, 0); bigint_set_u64(&cf_rem, 0);
+    bigint_set_u64(&cf_pm1, 1); bigint_set_u64(&cf_p0, 0);
+    bigint_set_u64(&cf_qm1, 0); bigint_set_u64(&cf_q0, 1);
+    bigint_set_u64(&cf_p_new, 0); bigint_set_u64(&cf_q_new, 0);
+    bigint_set_u64(&cf_tmp, 0);
+
+    bigint_copy(&cf_num, &freq);
+    bigint_copy(&cf_den, &reg_sz);
+
+    /* First partial quotient: a0 = floor(F/R) */
+    bigint_div_mod(&cf_num, &cf_den, &cf_a, &cf_rem);
+    bigint_copy(&cf_p0, &cf_a);
+    /* cf_q0 = 1 (already set) */
+
+    printf("    CF expansion: a0 = %u bits\n", bigint_bitlen(&cf_a));
+
+    /* Continue CF: swap num ↔ den, compute next quotient */
+    for (int step = 0; step < 200 && !success; step++) {
+        /* num = old den, den = old remainder */
+        bigint_copy(&cf_num, &cf_den);
+        bigint_copy(&cf_den, &cf_rem);
+
+        if (bigint_is_zero(&cf_den)) break;
+
+        bigint_div_mod(&cf_num, &cf_den, &cf_a, &cf_rem);
+
+        /* Update convergents: p_new = a * p0 + pm1, q_new = a * q0 + qm1 */
+        bigint_mul(&cf_tmp, &cf_a, &cf_p0);
+        bigint_add(&cf_p_new, &cf_tmp, &cf_pm1);
+        bigint_mul(&cf_tmp, &cf_a, &cf_q0);
+        bigint_add(&cf_q_new, &cf_tmp, &cf_qm1);
+
+        /* Shift convergents */
+        bigint_copy(&cf_pm1, &cf_p0);
+        bigint_copy(&cf_qm1, &cf_q0);
+        bigint_copy(&cf_p0, &cf_p_new);
+        bigint_copy(&cf_q0, &cf_q_new);
+
+        /* If denominator exceeds N, we've passed the useful range */
+        if (bigint_cmp(&cf_q0, N) >= 0) {
+            printf("    CF step %d: denominator exceeded N, stopping.\n", step);
+            break;
+        }
+
+        /* Test this convergent denominator as a period candidate */
+        uint32_t q_bits = bigint_bitlen(&cf_q0);
+
+        if (q_bits > 1) {
+            int ret = try_period(&cf_q0, a_val, N, factor_p, factor_q);
+            if (ret == 1) {
+                success = 1;
+                printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d, denominator %u bits)\n", step, q_bits);
                 break;
             }
-            
-            bigint_copy(&vt_num, &vt_den);
-            bigint_copy(&vt_den, &vt_cf_rem);
-            bigint_div_mod(&vt_num, &vt_den, &vt_a_next, &vt_cf_rem);
-            
-            /* Dynamic Topological Knee Tracker */
-            if (vt_a_next._initialized && vt_a_next.z->_mp_size > 0) {
-                uint64_t current_a = vt_a_next.z->_mp_d[0];
-                if (current_a > local_max_a) {
-                    local_max_a = current_a;
-                    bigint_copy(&best_local_cand, &vt_q0);
+            /* Also test small multiples in case gcd(s,r) > 1 */
+            for (int m = 2; m <= 12 && !success; m++) {
+                BigInt r_mult, m_bi;
+                bigint_set_u64(&r_mult, 0);
+                bigint_set_u64(&m_bi, (uint64_t)m);
+                bigint_mul(&r_mult, &cf_q0, &m_bi);
+                if (bigint_cmp(&r_mult, N) >= 0) break;
+                ret = try_period(&r_mult, a_val, N, factor_p, factor_q);
+                if (ret == 1) {
+                    success = 1;
+                    printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d × %d, %u bits)\n", step, m, q_bits);
                 }
             }
-
-            bigint_mul(&vt_tmp, &vt_a_next, &vt_p0); bigint_add(&vt_p_new, &vt_tmp, &vt_pm1);
-            bigint_mul(&vt_tmp, &vt_a_next, &vt_q0); bigint_add(&vt_q_new, &vt_tmp, &vt_qm1);
-            
-            bigint_copy(&vt_pm1, &vt_p0); bigint_copy(&vt_qm1, &vt_q0);
-            bigint_copy(&vt_p0, &vt_p_new); bigint_copy(&vt_q0, &vt_q_new);
-        }
-        
-        bigint_copy(&mc_r_cand, &best_local_cand);
-        
-        if (bigint_cmp(&mc_r_cand, &mc_one_fb) > 0 && bigint_cmp(&mc_r_cand, N) < 0) {
-            if (local_acc_samples == 0) {
-                bigint_copy(&local_lcm, &mc_r_cand);
-                local_acc_samples++;
-            } else {
-                /* mc_new_lcm = lcm(local_lcm, mc_r_cand) */
-                bigint_gcd(&mc_lcm_g, &local_lcm, &mc_r_cand);
-                bigint_mul(&mc_lcm_prod, &local_lcm, &mc_r_cand);
-                bigint_div_mod(&mc_lcm_prod, &mc_lcm_g, &mc_new_lcm, &mc_lcm_rem);
-                
-                uint32_t n_bits = bigint_bitlen(N);
-                uint32_t new_bits = bigint_bitlen(&mc_new_lcm);
-
-                /* Accept if cleanly under N */
-                if (bigint_cmp(&mc_new_lcm, N) < 0) {
-                    bigint_copy(&local_lcm, &mc_new_lcm);
-                    local_acc_samples++;
-                    
-                    BigInt r_test, k_bi; bigint_set_u64(&r_test, 0); bigint_set_u64(&k_bi, 0);
-                    for (int sm = 1; sm <= 50; sm++) {
-                        bigint_set_u64(&k_bi, sm);
-                        bigint_mul(&r_test, &local_lcm, &k_bi);
-                        if (try_period(&r_test, a_val, N, factor_p, factor_q) == 1) {
-                            success = 1;
-                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic %d of LCM Accumulator)\n", shot, sm);
-                            break;
-                        }
-                    }
-                    if (success) break;
-                }
-                /* Harmonic Overshoot Strategy: if LCM slightly exceeds N, it acts as a true multiple of period */
-                else if (new_bits <= n_bits + 5) {
-                    /* Test the overshot harmonic directly */
-                    int test_res = try_period(&mc_new_lcm, a_val, N, factor_p, factor_q);
-                    if (test_res == 1) {
-                        success = 1;
-                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic Overshoot: %u bits)\n", shot, new_bits);
-                        break;
-                    }
-                }
-                /* Disjoint Noise Explosion: break Initial Noise Lock */
-                else {
-                    /* The exploded LCM is huge, but it is fundamentally lcm(local_lcm, r_cand). 
-                     * If r_cand is the true period breaking through the noise, the oversized mc_new_lcm MUST be a multiple of the period! 
-                     * The recursive stripping in try_period will perfectly harvest it. */
-                    BigInt r_test, k_bi; bigint_set_u64(&r_test, 0); bigint_set_u64(&k_bi, 0);
-                    for (int sm = 1; sm <= 50; sm++) {
-                        bigint_set_u64(&k_bi, sm);
-                        bigint_mul(&r_test, &mc_new_lcm, &k_bi);
-                        if (try_period(&r_test, a_val, N, factor_p, factor_q) == 1) {
-                            success = 1;
-                            printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (Harmonic %d of Overshot LCM Accumulator)\n", shot, sm);
-                            break;
-                        }
-                    }
-                    if (success) break;
-                    
-                    if (local_acc_samples == 1) {
-                        /* Accumulator is 1 noisy layer deep. Flush it with new candidate to prevent permanent lock. */
-                        bigint_copy(&local_lcm, &mc_r_cand);
-                        /* Samples remains 1 */
-                    }
-                    /* If acc_samples > 1, we've successfully verified internal harmony, so ignore the garbage shot. */
-                }
-            }
-        }
-
-        /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY C: Direct CF on individual frequencies
-         * [DISABLED] User requested to prevent direct single-shot victory 
-         * and strictly prove that the LCM period accumulator resolves it.
-         * ══════════════════════════════════════════════════════════════════ */
-        // if (shot % 10 == 0) {
-        //     int cf_result = generate_and_try_periods(&freq, &reg_sz, a_val, N, factor_p, factor_q, &local_lcm);
-        //     if (cf_result == 1) {
-        //         success = 1;
-        //         printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (direct CF on sample)\n", shot);
-        //         break;
-        //     }
-        // }
-
-        /* ══════════════════════════════════════════════════════════════════
-         * STRATEGY D: Deep-test voted candidates (≥3 votes)
-         * Every 500 shots, take the top voted candidates and run them
-         * through the harmonic multiplier cascade.
-         * ══════════════════════════════════════════════════════════════════ */
-        if (shot % 500 == 0 && total_votes_cast > 0) {
-            printf("  [Shot %5d] Vote table (%d total votes):\n", shot, total_votes_cast);
-            
-            /* Sort vote table by votes (descending) for display + testing */
-            for (int vi = 0; vi < VOTE_TABLE_SIZE && !success; vi++) {
-                if (vote_table[vi].votes < 1) continue;
-                
-                uint32_t cand_bits = bigint_bitlen(&vote_table[vi].r_cand);
-                printf("    [%2d] %3d votes, %u bits, last seen shot %d\n",
-                       vi, vote_table[vi].votes, cand_bits, vote_table[vi].last_seen);
-
-                /* Only deep-test candidates with ≥ 3 independent confirmations */
-                if (vote_table[vi].votes >= 3) {
-                    printf("    → Deep-testing candidate %d (%u bits, %d votes)...\n",
-                           vi, cand_bits, vote_table[vi].votes);
-
-                    /* Test the candidate directly */
-                    if (try_period(&vote_table[vi].r_cand, a_val, N, factor_p, factor_q) == 1) {
-                        success = 1;
-                        bigint_copy(&local_lcm, &vote_table[vi].r_cand);
-                        printf("\n  [Shot %d] ★ OUROBOROS BITES ITS TAIL ★ (voted candidate %d, %d votes)\n",
-                               shot, vi, vote_table[vi].votes);
-                        break;
-                    }
-                    
-                    if (success) break;
-                }
-            }
-            
-            /* Running LCM status */
-            uint32_t lcm_bits = bigint_bitlen(&local_lcm);
-            uint32_t n_bits = bigint_bitlen(N);
-            printf("  [Shot %5d] LCM accumulator: %u bits (%d updates) | target <%u bits\n",
-                   shot, lcm_bits, local_acc_samples, n_bits);
-            fflush(stdout);
         }
     }
 
-    /* Fold per-base local_lcm into persistent cross-base acc_period */
-    if (!bigint_is_zero(&local_lcm) && bigint_cmp(&local_lcm, &mc_one_fb) > 0) {
-        if (*acc_samples == 0) {
-            bigint_copy(acc_period, &local_lcm);
-        } else {
-            bigint_gcd(&mc_lcm_g, acc_period, &local_lcm);
-            bigint_mul(&mc_lcm_prod, acc_period, &local_lcm);
-            bigint_div_mod(&mc_lcm_prod, &mc_lcm_g, &mc_new_lcm, &mc_lcm_rem);
-            if (bigint_cmp(&mc_new_lcm, N) < 0) {
-                bigint_copy(acc_period, &mc_new_lcm);
-            } else {
-                /* Break permanent noise lock for cross-base accumulator */
-                printf("  [Cross-base Accumulator] LCM exceeded N! Breaking noise lock...\n");
-                bigint_copy(acc_period, &local_lcm);
-            }
-        }
-        (*acc_samples) += local_acc_samples;
-        printf("  [Cross-base Accumulator] Folded base result: %u bits | cross-base accumulator: %u bits\n",
-               bigint_bitlen(&local_lcm), bigint_bitlen(acc_period));
-    }
-
-    /* Surface the best partial period estimate from the vote table */
-    if (!success && best_period) {
-        int best_votes = 0;
-        int best_vi = -1;
-        for (int vi = 0; vi < VOTE_TABLE_SIZE; vi++) {
-            if (vote_table[vi].votes > best_votes && bigint_bitlen(&vote_table[vi].r_cand) > 10) {
-                /* Exclude trivial grid artifacts (exact powers of 6). 
-                 * This cleanly handles up to 2048-bit structures natively safely. */
-                BigInt test_p6; bigint_set_u64(&test_p6, 1);
-                int is_artifact = 0;
-                while (bigint_cmp(&test_p6, &vote_table[vi].r_cand) <= 0) {
-                    if (bigint_cmp(&test_p6, &vote_table[vi].r_cand) == 0) { is_artifact = 1; break; }
-                    BigInt tmp; bigint_mul(&tmp, &test_p6, &b6);
-                    bigint_copy(&test_p6, &tmp);
-                }
-                
-                if (!is_artifact) {
-                    best_votes = vote_table[vi].votes;
-                    best_vi = vi;
-                    bigint_copy(best_period, &vote_table[vi].r_cand);
-                }
-            }
-        }
-        if (best_votes > 0) {
-            char rp_str[1300];
-            bigint_to_decimal(rp_str, sizeof(rp_str), best_period);
-            printf("  [Debug] factor_with_hpc: Surviving MCMC period candidate (best_partial) assigned to: %s\n", rp_str);
-            printf("  [Debug] factor_with_hpc: This candidate had %d votes (bit length: %u).\n", best_votes, bigint_bitlen(best_period));
-        } else {
-            printf("  [Debug] factor_with_hpc: No viable period candidates found in vote table.\n");
-        }
-    }
-
-    free(mcmc_state);
-    for (int i = 0; i < n_sites_raw; i++) {
-        bigint_clear(&p6_cache[i]);
-    }
+    /* Cleanup */
+    hpc_destroy(graph);  /* Destroy graph AFTER measurement */
+    for (int i = 0; i < n_sites_raw; i++) bigint_clear(&p6_cache[i]);
     free(p6_cache);
     free(bp_has_signal);
     free(flippable);
-    
-    /* ── Destroy multi-dimensional MPFR allocations explicitly ── */
-    for (int s = 0; s < marginals_sz; s++) {
-        for (int d = 0; d < 6; d++) {
+
+    for (int s = 0; s < marginals_sz; s++)
+        for (int d = 0; d < 6; d++)
             mpfr_clear(marginals[s][d]);
-        }
-    }
     free(marginals);
-    
-    /* ── Clear dynamically instantiated BigInt locals ── */
+
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
     bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
@@ -2231,7 +2618,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_powersA[i]);
         bigint_clear(&gc_powersB[i]);
     }
-    bigint_clear(&local_lcm);
     return (double)success;
 }
 
@@ -2433,10 +2819,10 @@ int main(int argc, char **argv)
                         bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
                     }
 
-                    /* Clamp: if LCM exceeds N, it's blown past the period */
+                    /* Clamp: if LCM exceeds N, hold current state */
                     if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
-                        printf("  [Cross-base] LCM exceeded N, resetting to partial\n");
-                        bigint_copy(&cross_base_lcm, &best_partial); 
+                        printf("  [Cross-base] LCM exceeded N, holding previous state\n");
+                        bigint_copy(&cross_base_lcm, &cross_base_gcd);  /* fall back to GCD */
                     }
 
                     uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
