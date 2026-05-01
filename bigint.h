@@ -38,6 +38,7 @@ typedef struct BigInt { mpz_t z; int _initialized; } BigInt;
 #endif
 
 void bigint_clear(BigInt *a);
+void bigint_destroy(BigInt *a);  /* Free GMP memory — call before scope exit */
 void bigint_copy(BigInt *dst, const BigInt *src);
 int bigint_is_zero(const BigInt *a);
 int bigint_cmp(const BigInt *a, const BigInt *b);
