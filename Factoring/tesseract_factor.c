@@ -1859,6 +1859,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     clock_t t_setup_start = clock();
 
+    /* Reset CF pool for this attempt — each base has a different period,
+     * so cross-attempt convergents would produce meaningless proximity pairs. */
+    for (int i = 0; i < cf_pool_count; i++) bigint_destroy(&cf_pool[i]);
+    cf_pool_count = 0;
+
     /* Put all sites in uniform superposition */
     for (int i = 0; i < n_sites; i++)
         triality_dft(&graph->locals[i]);
@@ -2748,8 +2753,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             break;
         }
 
-        /* Add to global CF pool for common range clustering */
-        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) > 1) {
+        /* Add to global CF pool for proximity search.
+         * Only pool convergents with meaningful bitlength (>= nbits/4)
+         * to avoid trivial early CF values (2, 3, 5, 12...) dominating
+         * the closest-pair search. */
+        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) >= nbits / 4) {
             bigint_copy(&cf_pool[cf_pool_count++], &cf_q0);
         }
 
@@ -2819,6 +2827,167 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_destroy(&cf_p_new); bigint_destroy(&cf_q_new); bigint_destroy(&cf_tmp);
     bigint_destroy(&freq);
     } /* End of Beam Search CF expansion loop */
+
+    /* ── CF Proximity Search ──
+     * If two independent CF convergents land within 1,000,000 of each other,
+     * the true period is almost certainly in that neighborhood.
+     * Brute-force scan the range between the closest pair. */
+    printf("\n    [DEBUG] CF pool: %d entries, success=%d\n", cf_pool_count, success);
+    if (!success && cf_pool_count >= 2) {
+        /* Sort cf_pool by value (insertion sort — pool is small) */
+        for (int i = 1; i < cf_pool_count; i++) {
+            for (int j = i; j > 0 && bigint_cmp(&cf_pool[j-1], &cf_pool[j]) > 0; j--) {
+                BigInt swap_tmp;
+                bigint_set_u64(&swap_tmp, 0);
+                bigint_copy(&swap_tmp, &cf_pool[j]);
+                bigint_copy(&cf_pool[j], &cf_pool[j-1]);
+                bigint_copy(&cf_pool[j-1], &swap_tmp);
+                bigint_destroy(&swap_tmp);
+            }
+        }
+
+        /* Find the closest pair */
+        BigInt best_lo, best_hi, diff_tmp;
+        bigint_set_u64(&best_lo, 0);
+        bigint_set_u64(&best_hi, 0);
+        bigint_set_u64(&diff_tmp, 0);
+        BigInt min_gap;
+        bigint_set_u64(&min_gap, 0);
+        int have_pair = 0;
+
+        for (int i = 0; i < cf_pool_count - 1; i++) {
+            /* Skip duplicates */
+            if (bigint_cmp(&cf_pool[i], &cf_pool[i+1]) == 0) continue;
+            /* Skip trivial values */
+            if (bigint_bitlen(&cf_pool[i]) <= 1) continue;
+
+            bigint_sub(&diff_tmp, &cf_pool[i+1], &cf_pool[i]);
+
+            if (!have_pair || bigint_cmp(&diff_tmp, &min_gap) < 0) {
+                bigint_copy(&min_gap, &diff_tmp);
+                bigint_copy(&best_lo, &cf_pool[i]);
+                bigint_copy(&best_hi, &cf_pool[i+1]);
+                have_pair = 1;
+            }
+        }
+
+        /* Check if the closest pair is within 1,000,000 */
+        BigInt proximity_limit;
+        bigint_set_u64(&proximity_limit, 10000000);
+
+        if (have_pair && bigint_cmp(&min_gap, &proximity_limit) <= 0) {
+            char lo_str[512], hi_str[512], gap_str[64];
+            bigint_to_decimal(lo_str, sizeof(lo_str), &best_lo);
+            bigint_to_decimal(hi_str, sizeof(hi_str), &best_hi);
+            bigint_to_decimal(gap_str, sizeof(gap_str), &min_gap);
+            printf("\n    ── CF Proximity Search ──\n");
+            printf("    Closest CF pair: %s .. %s (gap = %s)\n", lo_str, hi_str, gap_str);
+            printf("    Scanning %s candidates...\n", gap_str);
+
+            uint64_t gap_u64 = bigint_to_u64(&min_gap);
+            BigInt candidate;
+            bigint_set_u64(&candidate, 0);
+            bigint_copy(&candidate, &best_lo);
+
+            BigInt inc;
+            bigint_set_u64(&inc, 1);
+
+            for (uint64_t step = 0; step <= gap_u64 && !success; step++) {
+                /* Try candidate directly, and small multiples/divisors.
+                 * The CF convergent might be r/m or m*r for small m. */
+                BigInt test_r, base6, m_bi, dummy_q;
+                bigint_set_u64(&test_r, 0);
+                bigint_set_u64(&base6, 6);
+                bigint_set_u64(&m_bi, 0);
+                bigint_set_u64(&dummy_q, 0);
+
+                for (int m = 1; m <= 6 && !success; m++) {
+                    /* Test m × candidate */
+                    bigint_set_u64(&m_bi, (uint64_t)m);
+                    bigint_mul(&test_r, &candidate, &m_bi);
+
+                    int ret = try_period(&test_r, &base6, N, factor_p, factor_q);
+                    if (ret == 1) {
+                        char c_str[512];
+                        bigint_to_decimal(c_str, sizeof(c_str), &test_r);
+                        printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan, r = %s [×%d])\n", c_str, m);
+                        success = 1; break;
+                    }
+                    if (!success) {
+                        ret = try_period(&test_r, a_val, N, factor_p, factor_q);
+                        if (ret == 1) {
+                            char c_str[512];
+                            bigint_to_decimal(c_str, sizeof(c_str), &test_r);
+                            printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan [base-a], r = %s [×%d])\n", c_str, m);
+                            success = 1; break;
+                        }
+                    }
+
+                    /* Test candidate / m (if divisible) */
+                    if (m > 1) {
+                        BigInt div_rem;
+                        bigint_set_u64(&div_rem, 0);
+                        bigint_div_mod(&candidate, &m_bi, &test_r, &div_rem);
+                        if (bigint_is_zero(&div_rem) && !bigint_is_zero(&test_r)) {
+                            ret = try_period(&test_r, &base6, N, factor_p, factor_q);
+                            if (ret == 1) {
+                                char c_str[512];
+                                bigint_to_decimal(c_str, sizeof(c_str), &test_r);
+                                printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan, r = %s [÷%d])\n", c_str, m);
+                                success = 1;
+                            }
+                            if (!success) {
+                                ret = try_period(&test_r, a_val, N, factor_p, factor_q);
+                                if (ret == 1) {
+                                    char c_str[512];
+                                    bigint_to_decimal(c_str, sizeof(c_str), &test_r);
+                                    printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF proximity scan [base-a], r = %s [÷%d])\n", c_str, m);
+                                    success = 1;
+                                }
+                            }
+                        }
+                        bigint_destroy(&div_rem);
+                    }
+                }
+
+                bigint_destroy(&test_r);
+                bigint_destroy(&base6);
+                bigint_destroy(&m_bi);
+                bigint_destroy(&dummy_q);
+
+                /* candidate++ */
+                BigInt next;
+                bigint_set_u64(&next, 0);
+                bigint_add(&next, &candidate, &inc);
+                bigint_copy(&candidate, &next);
+                bigint_destroy(&next);
+
+                /* Progress every 100K */
+                if (step > 0 && step % 100000 == 0) {
+                    printf("    ... scanned %lu / %lu\n", (unsigned long)step, (unsigned long)gap_u64);
+                }
+            }
+
+            if (!success) {
+                printf("    Proximity search complete: no factor found in range.\n");
+            }
+
+            bigint_destroy(&candidate);
+            bigint_destroy(&inc);
+        } else if (have_pair) {
+            char gap_str[512];
+            bigint_to_decimal(gap_str, sizeof(gap_str), &min_gap);
+            printf("\n    ── CF Proximity Search: SKIPPED (closest gap = %s, limit = 10000000) ──\n", gap_str);
+        } else {
+            printf("\n    ── CF Proximity Search: SKIPPED (no valid pair in pool of %d) ──\n", cf_pool_count);
+        }
+
+        bigint_destroy(&best_lo);
+        bigint_destroy(&best_hi);
+        bigint_destroy(&diff_tmp);
+        bigint_destroy(&min_gap);
+        bigint_destroy(&proximity_limit);
+    }
 
     free(beam_parent); free(beam_digit); free(path_probs);
 
