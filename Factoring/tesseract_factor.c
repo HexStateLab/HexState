@@ -42,9 +42,15 @@
 #include "bigint.h"
 #define D 6
 
-BigInt cf_pool[10000];
-int cf_pool_count = 0;
+#include <stdlib.h>
 
+BigInt *cf_pool = NULL;
+int cf_pool_count = 0;
+#define CF_POOL_MAX 100000000
+
+static int cf_pool_cmp(const void *a, const void *b) {
+    return bigint_cmp((const BigInt*)a, (const BigInt*)b);
+}
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -2757,7 +2763,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * Only pool convergents with meaningful bitlength (>= nbits/4)
          * to avoid trivial early CF values (2, 3, 5, 12...) dominating
          * the closest-pair search. */
-        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) >= nbits / 4) {
+        if (cf_pool_count < CF_POOL_MAX && bigint_bitlen(&cf_q0) >= nbits / 4) {
             bigint_copy(&cf_pool[cf_pool_count++], &cf_q0);
         }
 
@@ -2834,17 +2840,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * Brute-force scan the range between the closest pair. */
     printf("\n    [DEBUG] CF pool: %d entries, success=%d\n", cf_pool_count, success);
     if (!success && cf_pool_count >= 2) {
-        /* Sort cf_pool by value (insertion sort — pool is small) */
-        for (int i = 1; i < cf_pool_count; i++) {
-            for (int j = i; j > 0 && bigint_cmp(&cf_pool[j-1], &cf_pool[j]) > 0; j--) {
-                BigInt swap_tmp;
-                bigint_set_u64(&swap_tmp, 0);
-                bigint_copy(&swap_tmp, &cf_pool[j]);
-                bigint_copy(&cf_pool[j], &cf_pool[j-1]);
-                bigint_copy(&cf_pool[j-1], &swap_tmp);
-                bigint_destroy(&swap_tmp);
-            }
-        }
+        /* Sort cf_pool by value using qsort (O(N log N) required for large pools) */
+        qsort(cf_pool, cf_pool_count, sizeof(BigInt), cf_pool_cmp);
 
         /* Find the closest pair */
         BigInt best_lo, best_hi, diff_tmp;
@@ -2873,7 +2870,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         /* Check if the closest pair is within 1,000,000 */
         BigInt proximity_limit;
-        bigint_set_u64(&proximity_limit, 10000000);
+        bigint_set_u64(&proximity_limit, 1000000);
 
         if (have_pair && bigint_cmp(&min_gap, &proximity_limit) <= 0) {
             char lo_str[512], hi_str[512], gap_str[64];
@@ -2977,7 +2974,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         } else if (have_pair) {
             char gap_str[512];
             bigint_to_decimal(gap_str, sizeof(gap_str), &min_gap);
-            printf("\n    ── CF Proximity Search: SKIPPED (closest gap = %s, limit = 10000000) ──\n", gap_str);
+            printf("\n    ── CF Proximity Search: SKIPPED (closest gap = %s, limit = 1000000) ──\n", gap_str);
         } else {
             printf("\n    ── CF Proximity Search: SKIPPED (no valid pair in pool of %d) ──\n", cf_pool_count);
         }
@@ -3040,6 +3037,13 @@ int main(int argc, char **argv)
     triality_exotic_init();
     s6_exotic_init();
     triality_stats_reset();
+
+    /* Allocate the CF pool once on startup */
+    cf_pool = (BigInt*)calloc(CF_POOL_MAX, sizeof(BigInt));
+    if (!cf_pool) {
+        printf("FATAL: Failed to allocate CF pool.\n");
+        return 1;
+    }
 
     printf("\n");
     printf("  ╔════════════════════════════════════════════════════════════════╗\n");
