@@ -2210,7 +2210,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             bigint_mul(&bi_t, &mult_bi[d-1], &ck_cache[k]);
             bigint_div_mod(&bi_t, N, &dummy_q, &mult_bi[d]);
         }
-        bigint_clear(&dummy_q);
+        bigint_destroy(&dummy_q);
 
         /* Precompute base-6 digits of mult_bi[d] */
         int mult_digits[6][n_work];
@@ -2223,10 +2223,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 mult_digits[d][p] = (int)bigint_to_u64(&r6);
                 bigint_copy(&tmp_bi, &q6);
             }
-            bigint_clear(&tmp_bi); bigint_clear(&r6); bigint_clear(&q6);
-            bigint_clear(&mult_bi[d]);
+            bigint_destroy(&tmp_bi); bigint_destroy(&r6); bigint_destroy(&q6);
+            bigint_destroy(&mult_bi[d]);
         }
-        bigint_clear(&bi_t); bigint_clear(&bi_t2);
+        bigint_destroy(&bi_t); bigint_destroy(&bi_t2);
 
         /* Create controlled-perm edge: freq_site_k controls the work register.
          * The perm edge encodes the constraint δ(work == mult[d] × y mod N)
@@ -2284,7 +2284,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate marginals — same format as before, just filled differently */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
-    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
+    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])calloc(marginals_sz, sizeof(mpfr_t[6]));
     for (int i = 0; i < marginals_sz; i++) {
         for (int d = 0; d < 6; d++) {
             mpfr_inits2(2048, marginals[i][d], (mpfr_ptr)0);
@@ -2464,7 +2464,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             /* Update classical tracker */
             bigint_mul(&bi_t, &work_val_bi, &mult_val);
             bigint_div_mod(&bi_t, N, &dummy_q, &work_val_bi);
-            bigint_clear(&dummy_q);
+            bigint_destroy(&dummy_q);
             
             /* Sync graph locals: work register now represents |work_val⟩ */
             BigInt tmp_bi, q6, r6;
@@ -2480,8 +2480,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 }
                 bigint_copy(&tmp_bi, &q6);
             }
-            bigint_clear(&mult_val); bigint_clear(&bi_t);
-            bigint_clear(&tmp_bi); bigint_clear(&q6); bigint_clear(&r6);
+            bigint_destroy(&mult_val); bigint_destroy(&bi_t);
+            bigint_destroy(&tmp_bi); bigint_destroy(&q6); bigint_destroy(&r6);
         }
 
         /* Store in marginals for downstream CF extraction */
@@ -2771,9 +2771,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                         printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d × %d [base-a], %u bits)\n", step, m, q_bits);
                     }
                 }
-                bigint_clear(&r_mult); bigint_clear(&m_bi);
+                bigint_destroy(&r_mult); bigint_destroy(&m_bi);
             }
-            bigint_clear(&oracle_base);
+            bigint_destroy(&oracle_base);
             
             /* Record the largest valid denominator as the best partial period for LCM harvesting */
             if (best_period && !success) {
@@ -2781,10 +2781,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
     }
-    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
-    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
-    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
-    bigint_clear(&freq);
+    bigint_destroy(&cf_num); bigint_destroy(&cf_den); bigint_destroy(&cf_a); bigint_destroy(&cf_rem);
+    bigint_destroy(&cf_pm1); bigint_destroy(&cf_p0); bigint_destroy(&cf_qm1); bigint_destroy(&cf_q0);
+    bigint_destroy(&cf_p_new); bigint_destroy(&cf_q_new); bigint_destroy(&cf_tmp);
+    bigint_destroy(&freq);
     } /* End of Beam Search CF expansion loop */
 
     free(beam_parent); free(beam_digit); free(path_probs);
@@ -2792,8 +2792,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
     for (int i = 0; i < n_sites_raw; i++) {
-        bigint_clear(&p6_cache[i]);
-        bigint_clear(&ck_cache[i]);
+        bigint_destroy(&p6_cache[i]);
+        bigint_destroy(&ck_cache[i]);
     }
     free(p6_cache);
     free(ck_cache);
@@ -2806,10 +2806,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             mpfr_clear(marginals[s][d]);
     free(marginals);
 
-    /* Cleanup — CF and frequency BigInts */
-    bigint_clear(&work_val_bi);
-    bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
-    bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
+    /* Cleanup — CF and frequency BigInts (destroy = free GMP memory) */
+    bigint_destroy(&work_val_bi);
+    bigint_destroy(&mc_d_bi); bigint_destroy(&mc_term); bigint_destroy(&mc_tmp);
+    bigint_destroy(&reg_sz); bigint_destroy(&gc_reg_tmp); bigint_destroy(&current_p6); bigint_destroy(&next_p6);
 
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
