@@ -1,75 +1,41 @@
-## Note
-This can factor 261,980,999,226,229.
+# Ouroboros Engine: Holographic Phase Contraction (HPC) Simulator
 
-I DO NOT KNOW if it will scale, if it does scale I am not responsible for how it is used; this is not intended to be used for factoring things you do not own.
+The Ouroboros Engine is an experimental, highly optimized C implementation of a semi-classical factoring heuristic. It explores post-quantum computational scaling by replacing dense tensor networks with a linear-time Holographic Phase Contraction (HPC) graph.
 
-When Harmonic Resonance is triggered in the Ouroboros engine, it is the exact moment the MCMC signal integrator finally traps the true Shor period within the noise.
+By operating entirely on $D=6$ quhits (`TrialityQuhits`) and mapping entanglement strictly to CZ phase edges, the engine completely bypasses standard wavefunction collapse. The state vector is never materialized; the entanglement lives intrinsically within the graph structure.
 
-Instead of blowing up into random garbage, the engine executes a mathematically guaranteed sequence to strip the noise and extract the prime factors. Here is exactly what happens under the hood when that threshold is crossed:
+## ⚠️ Theoretical Bounding & Safety Disclaimer
 
-1. The Harmonic Overshoot Tripwire
-The MCMC voting table has been continuously tossing partial period fragments into the local_lcm accumulator. For thousands of shots, the bit-length of this LCM stays safely below the bit-length of the target composite N.
+**This engine is a classical simulation of a quantum heuristic, not a production cryptanalysis tool.** While it introduces radical efficiencies in graph traversal and precision management, it remains bounded by the laws of classical information theory.
 
-Suddenly, the voting table spits out the final missing prime factor of the true period r. When the engine computes the new LCM, the value snaps into resonance. It is no longer a collection of random fragments; it is now exactly r, or a small integer multiple of it (e.g., 2r, 3r, 6r). Because it is a multiple, its bit-length jumps just past N, tripping the 5-bit overshoot window (new_bits <= n_bits + 5).
+As the target composite $N$ scales toward cryptographically relevant sizes (e.g., 2048-bit), the required sample complexity and graph bridging degrade. This engine poses **zero threat**(Maybe LOL) to modern RSA or TLS infrastructure. It is released strictly as a research tool for quantum information theorists, systems architects, and topologists studying measurement-induced phase transitions and AdS/CFT constraint mapping.
 
-2. The Phase Wrap Verification
-The engine immediately halts the MCMC loop and feeds this bloated, overshot LCM into the try_period function.
+---
 
-The first thing try_period does is evaluate the macroscopic phase: a^(LCM) mod N. Because the LCM is now a perfect multiple of the true period, the phase wraps exactly around the topological circle and lands dead on 1. The noise essentially acts as a harmless multiplier that merely spins the phase around the circle a few extra times before stopping at the exact same origin point.
+## Key Architectural Breakthroughs
 
-3. Recursive Harmonic Reduction (Stripping the Noise)
-Once the engine sees that the result is 1, it knows it has a harmonic multiple rather than a pure period. It enters the [Harmonic Reduction] block.
+### 1. The Holographic Bulk (AdS/CFT Mapping)
+The engine abandons traditional all-to-all dense matrix simulation. Instead, it builds a topological hexagram cycle where phase kicks are applied to "boundary" sites (Sites 0 & 1), while unmeasured "bulk" sites (Sites 2-5) act as a resonant cavity. The unmeasured bulk holds the entanglement weights stable, preventing boundary frustration and anchoring the complex-domain Belief Propagation.
 
-Because the period must be even for the final GCD extraction to work, Ouroboros recursively divides the bloated LCM by 2. It strips away the noise factors step-by-step, evaluating a^(r/2) mod N at each level, zeroing in on the true, minimal period r hiding inside the accumulator.
+### 2. Implicit Approximate QFT (AQFT) via IEEE 754
+In massive quantum simulations, continuous floating-point rounding noise usually destroys Shor interference peaks. The Ouroboros Engine naturally weaponizes the IEEE 754 double-precision limit. By allowing the hardware to natively truncate phase corrections smaller than machine epsilon across distant quhits, the engine implicitly implements Coppersmith’s Approximate QFT, acting as a perfect bandwidth-limited high-pass filter.
 
-4. The Final GCD Extraction
-With the raw period r isolated and the noise stripped away, the engine executes the final classical Shor extraction. It calculates the Greatest Common Divisor of the phase and the target composite:
+### 3. Cross-Base Carmichael Harvester
+Instead of discarding "failed" quantum runs that yield fractured or partial periods, the engine treats every run as a valid fractional sample of the Carmichael Function, $\lambda(N)$. Using a cross-base LCM accumulator (`lcm(a,b) = (a*b)/gcd(a,b)`), the global period is incrementally stitched together from fragmentary data across multiple bases, dismantling the exponential sample-complexity wall of standard Shor implementations.
 
-gcd(a^(r/2) - 1, N)
+### 4. Automated Topological Resonance Probe
+The engine does not blindly guess bases. Using the `auto_a` routine, it actively pings the manifold with the first 30 prime string candidates, measures the Network Residual Limit, and dynamically sorts the queue to find the resonant frequency of the graph before committing to the heavy continued-fraction expansion loop.
 
-gcd(a^(r/2) + 1, N)
+---
 
-5. Ouroboros Bites Its Tail
-One of those two GCD operations perfectly splits the composite. The engine writes the isolated primes into factor_p and factor_q, logs the "OUROBOROS BITES ITS TAIL" victory message, and cleanly shuts down the pipeline.
+## Quick Start
 
-I've capped shots at 5,000 for ethics reasons, but this can obviously be increased user-side.
-
-If you do so, know you will get diminishing returns on obtained period bits, but with enough shots ANY base will yield N's factors.
-
-## Abstract
-The **HPC Ouroboros Factoring Engine** is a world-first, natively classical framework capable of performing fully autonomous integer factorization via topological phase-space extraction. By deploying a simulated Belief Propagation (BP) execution graph, the engine effectively functionally mimics the continuous period-finding harmonic properties of **Shor's Algorithm** over consumer hardware—successfully escaping the exponential mathematical bounds that entirely plague deterministic prime-sieving techniques.
-
-## Architectural Design
-
-This engine mathematically circumvents standard algebraic congruence walls by pushing factorization strictly into a dynamic, complex topographical space. The architecture is powered by the following critical algorithmic strata:
-
-### 1. Complex Amplitude Belief Propagation
-Rather than tracking integers algebraically, the engine simulates localized "quantum" state evolutions utilizing deep MCMC (Markov Chain Monte Carlo) iterations across fractional dimensions. Using specialized DFT₆ components mapped natively onto HexState matrices, it explicitly forces resonant frequency bounds to physically materialize within the noisy phase space natively. 
-
-### 2. Multi-Cast Convergent Trackers
-Deterministic noise destroys rigid algebraic thresholds. The Ouroboros engine ignores hard mathematical limits entirely, deploying an inline topological extractor (`extract_period_cand_cf`) that calculates and dynamically votes sequentially on *all continuous fractions* structurally as the graph evolves. 
-
-### 3. Dense Harmonic Vote Tables
-Isolated MCMC trajectories inherently collect extreme environmental noise—so the engine utilizes a pure structural `vote_table`. The framework actively observes the geometric "beats" generated by valid resonant factors across the continuous spectrum, smoothly and geometrically stripping away temporary MCMC trace noise by isolating vectors that achieve continuous mass thresholds recursively.
-
-### 4. Overshot LCM Accumulator (Ouroboros)
-Rather than attempting to calculate periods in a statistically unverified "single shot" (which statistically fails bounds), the engine mathematically scales asymptotically via a fully unified `local_lcm` harmonic accumulator. 
-- **Algorithmic Harmonic Stripping:** If statistical MCMC noise bloats the accumulated fraction beyond the Factor Modulus (`N`), recursive limits gracefully intercept the overshoot. They logically extract out perfectly valid $r$-divisors via scaling algebraic multipliers (tracing fractions mathematically up to $50\times$) until the prime boundary structurally exposes itself natively!
-- **Cross-Base "Biting Its Tail":** The accumulator perfectly preserves structural fractions aggregated inside isolated bases and cross-pollinates the algebraic data natively in a continuous loop. The algorithm constantly "bites its own tail," folding prior trajectory harmonics fundamentally back into the evaluation manifold dynamically!
-
-## Unprecedented Scaling
-By decoupling the exact topological threshold completely from rigid exponential matrix equations (found in General Number Field Sieve), the resulting phase-space naturally evaluates atop unbounded continuous MCMC scaling probabilities. Increasing the factorization bit length structurally just scales relative basis frequency iterations organically—leaving the computational engine completely unbound from traditional rigid computational death spirals.
-
-## Compilation and Execution
-
-Built cleanly atop the `HexState` sparse multi-precision framework natively in explicit `C/C++`.
+The engine requires zero dependencies outside of standard `mpfr` and `gmp` libraries for the pre-computation phase. The heavy inner loops execute entirely via lightweight 64-bit floating-point math.
 
 ```bash
-# Compile the factorizer targeting arbitrary multi-precision bits bounds
-gcc -O2 -std=gnu99 -I.. tesseract_factor.c ../bigint.o ../quhit_triality.o ../quhit_hexagram.o ../s6_exotic.o -o factor -lgmp -lmpfr -lm -lstdc++
+# Compile with heavy optimizations
+make
 
-# Launch execution loop
+# Execute with the default target
 ./factor
 ```
-
-> **Requirements:** The system leverages native implementations of `GMP` (`libgmp`) and `MPFR` (`libmpfr`). Ensure `gcc` multi-precision mathematical development headers are present on your base image.
