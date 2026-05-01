@@ -40,8 +40,10 @@
 #include "s6_exotic.h"
 #include "hpc_z6_codes.h"
 #include "bigint.h"
-
 #define D 6
+
+BigInt cf_pool[10000];
+int cf_pool_count = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
@@ -1978,14 +1980,30 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site1 = blk * 6 + 1;
 
         for (int d = 0; d < 6; d++) {
-            /* Compute residue / N directly in double (sufficient for
-             * the phase rotation — the 2048-bit MPFR was overkill since
-             * both values are < N < 2^48 and double has 53-bit mantissa) */
-            double yA = (double)bigint_to_u64(&gc_powersA[d]);
-            double yB = (double)bigint_to_u64(&gc_powersB[d]);
-            double Nd = (double)bigint_to_u64(N);
-            double phaseA = 2.0 * M_PI * yA / Nd;
-            double phaseB = 2.0 * M_PI * yB / Nd;
+            /* MPFR phase computation: handles arbitrary-size N without
+             * truncation.  Previous code used bigint_to_u64() which
+             * silently returned 0 for values > 2^64, destroying all
+             * oracle phase information for large N. */
+            mpfr_t mp_ratio, mp_phase, mp_2pi;
+            mpfr_init2(mp_ratio, 128);
+            mpfr_init2(mp_phase, 128);
+            mpfr_init2(mp_2pi, 128);
+            mpfr_const_pi(mp_2pi, MPFR_RNDN);
+            mpfr_mul_ui(mp_2pi, mp_2pi, 2, MPFR_RNDN);
+
+            /* phaseA = 2π × gc_powersA[d] / N */
+            mpfr_set_z(mp_ratio, gc_powersA[d].z, MPFR_RNDN);
+            mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
+            mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
+            double phaseA = mpfr_get_d(mp_phase, MPFR_RNDN);
+
+            /* phaseB = 2π × gc_powersB[d] / N */
+            mpfr_set_z(mp_ratio, gc_powersB[d].z, MPFR_RNDN);
+            mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
+            mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
+            double phaseB = mpfr_get_d(mp_phase, MPFR_RNDN);
+
+            mpfr_clears(mp_ratio, mp_phase, mp_2pi, (mpfr_ptr)0);
 
             double cosA = cos(phaseA), sinA = sin(phaseA);
             double cosB = cos(phaseB), sinB = sin(phaseB);
@@ -2557,35 +2575,104 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_copy(&current_p6, &next_p6);
     }
 
-    BigInt freq; bigint_set_u64(&freq, 0);
     BigInt mc_d_bi, mc_term, mc_tmp;
     bigint_set_u64(&mc_d_bi, 0);
     bigint_set_u64(&mc_term, 0);
     bigint_set_u64(&mc_tmp, 0);
 
-    /* ── Build frequency from Griffiths-Niu measured digits ── */
-    char wv_str[1300];
-    bigint_to_decimal(wv_str, sizeof(wv_str), &work_val_bi);
-    char av_str[1300];
-    bigint_to_decimal(av_str, sizeof(av_str), a_val);
-    printf("    Work register final: %s  (a=%s)\n", wv_str, av_str);
+    /* ── Phase 4: Beam Search Frequency Generation ──
+     * Parent-pointer tree: O(beam_width × branches) per position instead of
+     * O(k × beam_width × branches) path copying.  Top-K argmax selection
+     * replaces O(n²) bubble sort. */
+    printf("    Executing Beam Search over marginals...\n");
+    int beam_width = 32;
+    int current_paths = 1;
 
-    /* Build frequency: site n-1 gave f_0, site n-2 gave f_1, etc.
-     * So the digit for 6^idx is stored in measured_digits[n_sites_raw - 1 - idx]. */
-    for (int idx = 0; idx < n_sites_raw; idx++) {
-        int f_idx = n_sites_raw - 1 - idx;
-        bigint_set_u64(&mc_d_bi, (uint64_t)measured_digits[f_idx]);
-        bigint_mul(&mc_term, &mc_d_bi, &p6_cache[idx]);
-        bigint_add(&mc_tmp, &freq, &mc_term);
-        bigint_copy(&freq, &mc_tmp);
+    /* Parent-pointer tree: beam_parent[k][b] = parent beam at position k-1,
+     * beam_digit[k][b] = digit chosen at position k for beam b. */
+    int (*beam_parent)[32] = (int(*)[32])calloc(n_sites_raw, sizeof(int[32]));
+    int (*beam_digit)[32]  = (int(*)[32])calloc(n_sites_raw, sizeof(int[32]));
+    double *path_probs = (double*)calloc(beam_width, sizeof(double));
+
+    /* Scratch arrays for candidate expansion (max beam_width × 6 = 192) */
+    int    cand_cap = beam_width * 6;
+    double *cand_probs  = (double*)malloc(cand_cap * sizeof(double));
+    int    *cand_parent = (int*)malloc(cand_cap * sizeof(int));
+    int    *cand_digit  = (int*)malloc(cand_cap * sizeof(int));
+
+    for (int k = 0; k < n_sites_raw; k++) {
+        double probs[6];
+        for (int d = 0; d < 6; d++) {
+            probs[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
+            if (probs[d] < 1e-10) probs[d] = 1e-10;
+        }
+
+        int n_cands = 0;
+        for (int p = 0; p < current_paths; p++) {
+            for (int d = 0; d < 6; d++) {
+                if (probs[d] > 0.05) {
+                    cand_probs[n_cands]  = path_probs[p] + log(probs[d]);
+                    cand_parent[n_cands] = p;
+                    cand_digit[n_cands]  = d;
+                    n_cands++;
+                }
+            }
+        }
+
+        /* Top-K selection via argmax (O(n_cands × beam_width)) */
+        int top_count = (n_cands < beam_width) ? n_cands : beam_width;
+        double new_probs[32];
+        for (int t = 0; t < top_count; t++) {
+            int best = -1;
+            double best_lp = -1e30;
+            for (int i = 0; i < n_cands; i++) {
+                if (cand_probs[i] > best_lp) {
+                    best_lp = cand_probs[i];
+                    best = i;
+                }
+            }
+            beam_parent[k][t] = cand_parent[best];
+            beam_digit[k][t]  = cand_digit[best];
+            new_probs[t]      = best_lp;
+            cand_probs[best]  = -2e9; /* poison so it can't be selected again */
+        }
+
+        current_paths = top_count;
+        for (int t = 0; t < current_paths; t++) {
+            path_probs[t] = new_probs[t];
+        }
     }
 
-    printf("    Measured frequency: %u bits\n", bigint_bitlen(&freq));
+    free(cand_probs); free(cand_parent); free(cand_digit);
+
+    printf("    Generated %d candidate frequencies.\n", current_paths);
     printf("    Register size:     %u bits\n", bigint_bitlen(&reg_sz));
 
-    /* CF expansion of F/R — test every convergent denominator */
-    BigInt cf_num, cf_den, cf_a, cf_rem;
-    BigInt cf_pm1, cf_p0, cf_qm1, cf_q0;
+    /* CF expansion of F/R — test every candidate frequency */
+    for (int p_idx = 0; p_idx < current_paths && !success; p_idx++) {
+        BigInt freq; bigint_set_u64(&freq, 0);
+
+        /* Reconstruct digit sequence from parent-pointer backtracking */
+        int *seq = (int*)calloc(n_sites_raw, sizeof(int));
+        int cur_beam = p_idx;
+        for (int s = n_sites_raw - 1; s >= 0; s--) {
+            seq[s] = beam_digit[s][cur_beam];
+            cur_beam = beam_parent[s][cur_beam];
+        }
+
+        /* Build frequency from reconstructed path */
+        for (int idx = 0; idx < n_sites_raw; idx++) {
+            bigint_set_u64(&mc_d_bi, (uint64_t)seq[idx]);
+            bigint_mul(&mc_term, &mc_d_bi, &p6_cache[idx]);
+            bigint_add(&mc_tmp, &freq, &mc_term);
+            bigint_copy(&freq, &mc_tmp);
+        }
+        free(seq);
+        
+        printf("\n    [Beam %2d] Freq = %u bits (log_P = %.2f)\n", p_idx, bigint_bitlen(&freq), path_probs[p_idx]);
+
+        BigInt cf_num, cf_den, cf_a, cf_rem;
+        BigInt cf_pm1, cf_p0, cf_qm1, cf_q0;
     BigInt cf_p_new, cf_q_new, cf_tmp;
     bigint_set_u64(&cf_num, 0); bigint_set_u64(&cf_den, 0);
     bigint_set_u64(&cf_a, 0); bigint_set_u64(&cf_rem, 0);
@@ -2632,6 +2719,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             break;
         }
 
+        /* Add to global CF pool for common range clustering */
+        if (cf_pool_count < 10000 && bigint_bitlen(&cf_q0) > 1) {
+            bigint_copy(&cf_pool[cf_pool_count++], &cf_q0);
+        }
+
         /* Test this convergent denominator as a period candidate */
         uint32_t q_bits = bigint_bitlen(&cf_q0);
 
@@ -2639,6 +2731,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             char q_str[512];
             bigint_to_decimal(q_str, sizeof(q_str), &cf_q0);
             printf("    CF step %d: denom = %s (%u bits)\n", step, q_str, q_bits);
+            
             /* Oracle encodes 6^k → period is ord_N(6), use base 6 for GCD check */
             BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
             int ret = try_period(&cf_q0, &oracle_base, N, factor_p, factor_q);
@@ -2688,6 +2781,13 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
     }
+    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
+    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
+    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
+    bigint_clear(&freq);
+    } /* End of Beam Search CF expansion loop */
+
+    free(beam_parent); free(beam_digit); free(path_probs);
 
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
@@ -2708,11 +2808,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Cleanup — CF and frequency BigInts */
     bigint_clear(&work_val_bi);
-    bigint_clear(&freq); bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
+    bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
     bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
-    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
-    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
-    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
 
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
@@ -2859,6 +2956,9 @@ int main(int argc, char **argv)
     }
 
     int attempt_count = 1;
+    BigInt cf_history[200];
+    for (int i = 0; i < 200; i++) bigint_set_u64(&cf_history[i], 0);
+    int cf_hist_count = 0;
     for (int bi = active_base_idx; !success; bi = (auto_a ? (bi + 1) % 200 : bi)) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
@@ -2867,6 +2967,7 @@ int main(int argc, char **argv)
         printf("  ── Attempt %d: a = %s ──\n\n", attempt_count++, a_str);
 
         bigint_set_u64(&best_partial, 0);
+        int old_pool_count = cf_pool_count;
         clock_t t_start = clock();
         success = (int)factor_with_hpc(&N, &a_val, &factor_p, &factor_q, &best_partial,
                                   &cross_base_acc_period, &cross_base_acc_samples, 0);
@@ -2911,7 +3012,7 @@ int main(int argc, char **argv)
                     bigint_to_decimal(bp_str, sizeof(bp_str), &best_partial);
                     printf("\n  ★★★ LATE FACTORIZATION: best_partial (%s) was a valid factoring period! ★★★\n", bp_str);
                     printf("  %s × %s = N\n", p_str, q_str);
-                } else if (bigint_cmp(&best_partial, &bi_one) > 0) {
+                } else if (status == 2 || status == -1) {
                     /* Calculate actual period contribution for this base */
                     BigInt current_period;
                     bigint_set_u64(&current_period, 0); /* Initialize the struct properly first */
@@ -2922,17 +3023,23 @@ int main(int argc, char **argv)
                         bigint_copy(&cross_base_lcm, &current_period);
                         printf("  [Cross-base] Initialized LCM to verified period contribution\n");
                     } else {
+                        /* Save previous state before modifying */
+                        BigInt prev_lcm;
+                        bigint_set_u64(&prev_lcm, 0);
+                        bigint_copy(&prev_lcm, &cross_base_lcm);
+
                         /* Subsequent bases: accumulate LCM */
                         /* Proper LCM update: lcm(a,b) = (a*b)/gcd(a,b) */
                         bigint_gcd(&cross_base_gcd, &cross_base_lcm, &current_period);
                         bigint_mul(&cross_base_prod, &cross_base_lcm, &current_period);
                         bigint_div_mod(&cross_base_prod, &cross_base_gcd, &cross_base_lcm, &cross_base_rem);
-                    }
 
-                    /* Clamp: if LCM exceeds N, hold current state */
-                    if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
-                        printf("  [Cross-base] LCM exceeded N, holding previous state\n");
-                        bigint_copy(&cross_base_lcm, &cross_base_gcd);  /* fall back to GCD */
+                        /* Clamp: if LCM exceeds N, hold previous state */
+                        if (bigint_cmp(&cross_base_lcm, &N) >= 0) {
+                            printf("  [Cross-base] LCM exceeded N, holding previous state\n");
+                            bigint_copy(&cross_base_lcm, &prev_lcm);  /* fall back to prev_lcm */
+                        }
+                        bigint_clear(&prev_lcm);
                     }
 
                     uint32_t lcm_bits = bigint_bitlen(&cross_base_lcm);
@@ -3004,6 +3111,7 @@ int main(int argc, char **argv)
                     printf("  [Cross-base] Dumped invalid best_partial %s. It's not a period!\n", bp_str);
                 }
             }
+
             printf("\n");
         }
     }
