@@ -42,6 +42,62 @@
 #include "bigint.h"
 
 #define D 6
+#define CF_MAX_STEPS 200
+
+typedef struct {
+    /* try_period temporaries */
+    BigInt tp_one, tp_two, tp_r_half, tp_q_unused, tp_r_mod;
+    BigInt tp_half_pow, tp_h_minus, tp_p1, tp_dummy_rem;
+    BigInt tp_h_plus, tp_p2;
+
+    /* factor_with_hpc temporaries */
+    BigInt b6, one;
+    BigInt val_k_A, val_k_B, div_6_blk;
+    BigInt gc_b36, gc_next_A, gc_next_B, gc_next_div;
+    BigInt gc_gcd_check, gc_val_minus_1, gc_dummy_rem;
+    BigInt gc_powersA[6], gc_powersB[6];
+    BigInt gc_tmpA, gc_tmpB, gc_q_div;
+    BigInt gc_b6_mod, gc_shift_div_A, gc_shift_div_B, gc_dummy_rm2;
+    BigInt gc_qA, gc_qB, gc_rA_mod, gc_rB_mod;
+    BigInt gc_temp_N, gc_qN, gc_rN, gc_q_sh, gc_r_sh;
+    BigInt gc_six_pow_k, gc_d_bi;
+} MathWorkspace;
+
+static void init_workspace(MathWorkspace *ws) {
+    bigint_set_u64(&ws->tp_one, 1); bigint_set_u64(&ws->tp_two, 2);
+    bigint_set_u64(&ws->tp_r_half, 0); bigint_set_u64(&ws->tp_q_unused, 0);
+    bigint_set_u64(&ws->tp_r_mod, 0); bigint_set_u64(&ws->tp_half_pow, 0);
+    bigint_set_u64(&ws->tp_h_minus, 0); bigint_set_u64(&ws->tp_p1, 0);
+    bigint_set_u64(&ws->tp_dummy_rem, 0); bigint_set_u64(&ws->tp_h_plus, 0);
+    bigint_set_u64(&ws->tp_p2, 0);
+    
+    bigint_set_u64(&ws->b6, 6); bigint_set_u64(&ws->one, 1);
+    bigint_set_u64(&ws->val_k_A, 0); bigint_set_u64(&ws->val_k_B, 0); bigint_set_u64(&ws->div_6_blk, 0);
+    bigint_set_u64(&ws->gc_b36, 36); bigint_set_u64(&ws->gc_next_A, 0); bigint_set_u64(&ws->gc_next_B, 0); bigint_set_u64(&ws->gc_next_div, 0);
+    bigint_set_u64(&ws->gc_gcd_check, 0); bigint_set_u64(&ws->gc_val_minus_1, 0); bigint_set_u64(&ws->gc_dummy_rem, 0);
+    for (int i = 0; i < 6; i++) { bigint_set_u64(&ws->gc_powersA[i], 0); bigint_set_u64(&ws->gc_powersB[i], 0); }
+    bigint_set_u64(&ws->gc_tmpA, 0); bigint_set_u64(&ws->gc_tmpB, 0); bigint_set_u64(&ws->gc_q_div, 0);
+    bigint_set_u64(&ws->gc_b6_mod, 0); bigint_set_u64(&ws->gc_shift_div_A, 0); bigint_set_u64(&ws->gc_shift_div_B, 0); bigint_set_u64(&ws->gc_dummy_rm2, 0);
+    bigint_set_u64(&ws->gc_qA, 0); bigint_set_u64(&ws->gc_qB, 0); bigint_set_u64(&ws->gc_rA_mod, 0); bigint_set_u64(&ws->gc_rB_mod, 0);
+    bigint_set_u64(&ws->gc_temp_N, 0); bigint_set_u64(&ws->gc_qN, 0); bigint_set_u64(&ws->gc_rN, 0); bigint_set_u64(&ws->gc_q_sh, 0); bigint_set_u64(&ws->gc_r_sh, 0);
+    bigint_set_u64(&ws->gc_six_pow_k, 0); bigint_set_u64(&ws->gc_d_bi, 0);
+}
+
+static void clear_workspace(MathWorkspace *ws) {
+    bigint_clear(&ws->tp_one); bigint_clear(&ws->tp_two); bigint_clear(&ws->tp_r_half); bigint_clear(&ws->tp_q_unused); bigint_clear(&ws->tp_r_mod);
+    bigint_clear(&ws->tp_half_pow); bigint_clear(&ws->tp_h_minus); bigint_clear(&ws->tp_p1); bigint_clear(&ws->tp_dummy_rem);
+    bigint_clear(&ws->tp_h_plus); bigint_clear(&ws->tp_p2);
+    bigint_clear(&ws->b6); bigint_clear(&ws->one);
+    bigint_clear(&ws->val_k_A); bigint_clear(&ws->val_k_B); bigint_clear(&ws->div_6_blk);
+    bigint_clear(&ws->gc_b36); bigint_clear(&ws->gc_next_A); bigint_clear(&ws->gc_next_B); bigint_clear(&ws->gc_next_div);
+    bigint_clear(&ws->gc_gcd_check); bigint_clear(&ws->gc_val_minus_1); bigint_clear(&ws->gc_dummy_rem);
+    for (int i = 0; i < 6; i++) { bigint_clear(&ws->gc_powersA[i]); bigint_clear(&ws->gc_powersB[i]); }
+    bigint_clear(&ws->gc_tmpA); bigint_clear(&ws->gc_tmpB); bigint_clear(&ws->gc_q_div);
+    bigint_clear(&ws->gc_b6_mod); bigint_clear(&ws->gc_shift_div_A); bigint_clear(&ws->gc_shift_div_B); bigint_clear(&ws->gc_dummy_rm2);
+    bigint_clear(&ws->gc_qA); bigint_clear(&ws->gc_qB); bigint_clear(&ws->gc_rA_mod); bigint_clear(&ws->gc_rB_mod);
+    bigint_clear(&ws->gc_temp_N); bigint_clear(&ws->gc_qN); bigint_clear(&ws->gc_rN); bigint_clear(&ws->gc_q_sh); bigint_clear(&ws->gc_r_sh);
+    bigint_clear(&ws->gc_six_pow_k); bigint_clear(&ws->gc_d_bi);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FACTOR EXTRACTION — gcd(a^(r/2) ± 1, N)
@@ -2245,11 +2301,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Heap-allocate marginals — same format as before, just filled differently */
     int marginals_sz = (2 * n_blocks > n_sites_raw) ? 2 * n_blocks : n_sites_raw;
-    mpfr_t (*marginals)[6] = (mpfr_t (*)[6])malloc(marginals_sz * sizeof(mpfr_t[6]));
+    double (*marginals)[6] = (double (*)[6])malloc(marginals_sz * sizeof(double[6]));
     for (int i = 0; i < marginals_sz; i++) {
         for (int d = 0; d < 6; d++) {
-            mpfr_inits2(2048, marginals[i][d], (mpfr_ptr)0);
-            mpfr_set_d(marginals[i][d], 0.0, MPFR_RNDN);
+            marginals[i][d] = 0.0;
         }
     }
 
@@ -2266,9 +2321,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
         bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
         for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
-        for (int i = 0; i < marginals_sz; i++)
-            for (int d = 0; d < 6; d++)
-                mpfr_clear(marginals[i][d]);
         free(marginals);
         return 0.0;
     }
@@ -2454,7 +2506,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
         /* Store in marginals for downstream CF extraction */
         for (int d = 0; d < 6; d++) {
-            mpfr_set_d(marginals[k][d], probs[d], MPFR_RNDN);
+            marginals[k][d] = probs[d];
         }
 
         /* Display */
@@ -2482,7 +2534,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     for (int scale = 0; scale < n_sites_raw; scale++) {
         double max_p = 0.0;
         for (int d = 0; d < 6; d++) {
-            double p = mpfr_get_d(marginals[scale][d], MPFR_RNDN);
+            double p = marginals[scale][d];
             if (p > max_p) max_p = p;
         }
         /* A position has signal if its max probability is significantly above uniform (1/6 ≈ 0.167) */
@@ -2675,9 +2727,6 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     free(bp_has_signal);
     free(flippable);
 
-    for (int s = 0; s < marginals_sz; s++)
-        for (int d = 0; d < 6; d++)
-            mpfr_clear(marginals[s][d]);
     free(marginals);
 
     /* Cleanup — CF and frequency BigInts */
