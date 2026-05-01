@@ -1478,7 +1478,13 @@ static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
     uint64_t n_configs = 1;
     for (int i = 0; i < n_iqft; i++) n_configs *= 6;
 
-    if (n_configs > 100000000ULL || n_iqft > 12) {
+    if (n_configs > 100000000ULL || n_iqft > 20) {
+        /* Neighborhood too dense for exact enumeration.
+         * Fall back to analytical product-state marginal using
+         * local amplitudes × work register factor (below). */
+        /* NOTE: with the Griffiths-Niu semi-classical path, this
+         * bailout is rarely hit since measurements collapse sites
+         * sequentially, keeping neighborhoods bounded. */
         const TrialityQuhit *q = &graph->locals[target_site];
         double tot = 0.0;
         for (int v = 0; v < 6; v++) {
@@ -1980,14 +1986,17 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site1 = blk * 6 + 1;
 
         for (int d = 0; d < 6; d++) {
-            /* MPFR phase computation: handles arbitrary-size N without
-             * truncation.  Previous code used bigint_to_u64() which
-             * silently returned 0 for values > 2^64, destroying all
-             * oracle phase information for large N. */
-            mpfr_t mp_ratio, mp_phase, mp_2pi;
-            mpfr_init2(mp_ratio, 128);
-            mpfr_init2(mp_phase, 128);
-            mpfr_init2(mp_2pi, 128);
+            /* Full-precision phase computation: MPFR precision scales with N
+             * so no information is lost regardless of N's bitlength.
+             * cos/sin computed in MPFR domain — only the final trig values
+             * (bounded to [-1,1]) are cast to double. */
+            mpfr_prec_t phase_prec = (mpfr_prec_t)(nbits * 2 + 64);
+            mpfr_t mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin;
+            mpfr_init2(mp_ratio, phase_prec);
+            mpfr_init2(mp_phase, phase_prec);
+            mpfr_init2(mp_2pi, phase_prec);
+            mpfr_init2(mp_cos, phase_prec);
+            mpfr_init2(mp_sin, phase_prec);
             mpfr_const_pi(mp_2pi, MPFR_RNDN);
             mpfr_mul_ui(mp_2pi, mp_2pi, 2, MPFR_RNDN);
 
@@ -1995,18 +2004,21 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             mpfr_set_z(mp_ratio, gc_powersA[d].z, MPFR_RNDN);
             mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
             mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
-            double phaseA = mpfr_get_d(mp_phase, MPFR_RNDN);
+            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
+            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
+            double cosA = mpfr_get_d(mp_cos, MPFR_RNDN);
+            double sinA = mpfr_get_d(mp_sin, MPFR_RNDN);
 
             /* phaseB = 2π × gc_powersB[d] / N */
             mpfr_set_z(mp_ratio, gc_powersB[d].z, MPFR_RNDN);
             mpfr_div_z(mp_ratio, mp_ratio, N->z, MPFR_RNDN);
             mpfr_mul(mp_phase, mp_2pi, mp_ratio, MPFR_RNDN);
-            double phaseB = mpfr_get_d(mp_phase, MPFR_RNDN);
+            mpfr_cos(mp_cos, mp_phase, MPFR_RNDN);
+            mpfr_sin(mp_sin, mp_phase, MPFR_RNDN);
+            double cosB = mpfr_get_d(mp_cos, MPFR_RNDN);
+            double sinB = mpfr_get_d(mp_sin, MPFR_RNDN);
 
-            mpfr_clears(mp_ratio, mp_phase, mp_2pi, (mpfr_ptr)0);
-
-            double cosA = cos(phaseA), sinA = sin(phaseA);
-            double cosB = cos(phaseB), sinB = sin(phaseB);
+            mpfr_clears(mp_ratio, mp_phase, mp_2pi, mp_cos, mp_sin, (mpfr_ptr)0);
 
             double rA = graph->locals[site0].edge_re[d];
             double iA = graph->locals[site0].edge_im[d];
@@ -2040,14 +2052,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = bypass_sites[j];
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── Spectral Windowed PHASE Attenuation (Hann² window) ──
-             * Hann²(blk) = [0.5 * (1 - cos(2π * blk / (n_blocks - 1)))]²
-             * Squared Hann tapers boundaries more steeply, suppressing sidelobes. */
-            double hann_w = (n_blocks > 1)
-                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
-                : 1.0;
-            hann_w = 0.05 + 0.95 * hann_w;  /* Floor at 5% to prevent boundary zeroing */
-            double phase_scale = hann_w;     /* No 1/√n — BP damping controls stability */
+            /* Uniform phase coupling — no DSP windowing.
+             * A Hann/Hamming window destroys QFT unitarity and blurs
+             * the interference peaks.  All blocks contribute equally. */
+            double phase_scale = 1.0;
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -2110,12 +2118,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             edge->site_b = s_head;
             edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
-            /* ── Spectral Windowed PHASE Attenuation on bridge (Hann²) ── */
-            double hann_bridge = (n_blocks > 1)
-                ? 0.5 * (1.0 - cos(2.0 * 3.14159265358979323846 * blk / (n_blocks - 1)))
-                : 1.0;
-            hann_bridge = 0.05 + 0.95 * hann_bridge;  /* Floor at 5% */
-            double bridge_scale = hann_bridge;          /* No 1/√n */
+            /* Uniform bridge coupling — no DSP windowing.
+             * Same rationale as intra-block: tapering inter-block
+             * phase transfers destroys global QFT unitarity. */
+            double bridge_scale = 1.0;
             for (int va = 0; va < 6; va++) {
                 for (int vb = 0; vb < 6; vb++) {
                     int diff = (va - vb + 6) % 6;
@@ -2383,17 +2389,23 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
 
-        /* Step 3: Apply feed-forward phase correction from previously measured digits.
-         * The QFT phase is 2π F x / 6^n. For site k, the fractional phase from
-         * previously measured digit f_j (where j > k) is f_j / 6^{j-k+1}.
-         * So the power MUST start at 36.0 (6^2) for the immediately previous digit! */
-        double theta_k = 0.0;
-        {
-            double power = 36.0;
-            for (int j = k + 1; j < n_sites_raw; j++) {
-                theta_k += (double)measured_digits[j] / power;
-                power *= 6.0;
-            }
+        /* Step 3: Feed-forward phase correction via MPFR.
+         * theta_k = Σ_{j>k} measured_digits[j] / 6^{j-k+1}
+         * Using MPFR eliminates the double overflow at 6^397 and the
+         * 53-bit precision event horizon that blinds distant digits. */
+        mpfr_prec_t ff_prec = (mpfr_prec_t)(nbits * 2 + 64);
+        mpfr_t mp_theta, mp_power, mp_digit, mp_term;
+        mpfr_init2(mp_theta, ff_prec);
+        mpfr_init2(mp_power, ff_prec);
+        mpfr_init2(mp_digit, ff_prec);
+        mpfr_init2(mp_term, ff_prec);
+        mpfr_set_d(mp_theta, 0.0, MPFR_RNDN);
+        mpfr_set_d(mp_power, 36.0, MPFR_RNDN);  /* 6^2 for first previous digit */
+        for (int j = k + 1; j < n_sites_raw; j++) {
+            mpfr_set_ui(mp_digit, (unsigned long)measured_digits[j], MPFR_RNDN);
+            mpfr_div(mp_term, mp_digit, mp_power, MPFR_RNDN);
+            mpfr_add(mp_theta, mp_theta, mp_term, MPFR_RNDN);
+            mpfr_mul_ui(mp_power, mp_power, 6, MPFR_RNDN);
         }
 
         double corrected_re[6], corrected_im[6];
@@ -2402,12 +2414,26 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             double ac_re = alpha_re[d]*ck_re[d] - alpha_im[d]*ck_im[d];
             double ac_im = alpha_re[d]*ck_im[d] + alpha_im[d]*ck_re[d];
 
-            /* × e^{-2πi d θ_k} */
-            double angle = -2.0 * M_PI * d * theta_k;
-            double pr = cos(angle), pi = sin(angle);
+            /* × e^{-2πi d θ_k} — compute trig in MPFR then extract double */
+            mpfr_t mp_angle, mp_cos_ff, mp_sin_ff, mp_2pi_ff;
+            mpfr_init2(mp_angle, ff_prec);
+            mpfr_init2(mp_cos_ff, ff_prec);
+            mpfr_init2(mp_sin_ff, ff_prec);
+            mpfr_init2(mp_2pi_ff, ff_prec);
+            mpfr_const_pi(mp_2pi_ff, MPFR_RNDN);
+            mpfr_mul_ui(mp_2pi_ff, mp_2pi_ff, 2, MPFR_RNDN);
+            mpfr_mul(mp_angle, mp_2pi_ff, mp_theta, MPFR_RNDN);
+            mpfr_mul_si(mp_angle, mp_angle, -d, MPFR_RNDN);
+            mpfr_cos(mp_cos_ff, mp_angle, MPFR_RNDN);
+            mpfr_sin(mp_sin_ff, mp_angle, MPFR_RNDN);
+            double pr = mpfr_get_d(mp_cos_ff, MPFR_RNDN);
+            double pi = mpfr_get_d(mp_sin_ff, MPFR_RNDN);
+            mpfr_clears(mp_angle, mp_cos_ff, mp_sin_ff, mp_2pi_ff, (mpfr_ptr)0);
+
             corrected_re[d] = ac_re*pr - ac_im*pi;
             corrected_im[d] = ac_re*pi + ac_im*pr;
         }
+        mpfr_clears(mp_theta, mp_power, mp_digit, mp_term, (mpfr_ptr)0);
 
         /* Step 4: Apply IDFT6 to convert from phase basis → computational basis.
          * β(v) = (1/√6) Σ_{d=0}^{5} α'(d) × e^{2πi d v / 6}
@@ -2596,9 +2622,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     /* Scratch arrays for candidate expansion (max beam_width × 6 = 192) */
     int    cand_cap = beam_width * 6;
-    double *cand_probs  = (double*)malloc(cand_cap * sizeof(double));
-    int    *cand_parent = (int*)malloc(cand_cap * sizeof(int));
-    int    *cand_digit  = (int*)malloc(cand_cap * sizeof(int));
+    double *cand_probs  = (double*)calloc(cand_cap, sizeof(double));
+    int    *cand_parent = (int*)calloc(cand_cap, sizeof(int));
+    int    *cand_digit  = (int*)calloc(cand_cap, sizeof(int));
 
     for (int k = 0; k < n_sites_raw; k++) {
         double probs[6];
@@ -2610,7 +2636,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int n_cands = 0;
         for (int p = 0; p < current_paths; p++) {
             for (int d = 0; d < 6; d++) {
-                if (probs[d] > 0.05) {
+                if (probs[d] > 1e-6) {
                     cand_probs[n_cands]  = path_probs[p] + log(probs[d]);
                     cand_parent[n_cands] = p;
                     cand_digit[n_cands]  = d;
@@ -2691,8 +2717,11 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     printf("    CF expansion: a0 = %u bits\n", bigint_bitlen(&cf_a));
 
-    /* Continue CF: swap num ↔ den, compute next quotient */
-    for (int step = 0; step < 200 && !success; step++) {
+    /* CF steps scale with N: a 2048-bit period can require thousands
+     * of convergents.  2×nbits covers the worst case. */
+    int cf_max_steps = (int)(nbits * 2);
+    if (cf_max_steps < 200) cf_max_steps = 200;
+    for (int step = 0; step < cf_max_steps && !success; step++) {
         /* num = old den, den = old remainder */
         bigint_copy(&cf_num, &cf_den);
         bigint_copy(&cf_den, &cf_rem);
@@ -2775,8 +2804,12 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
             bigint_destroy(&oracle_base);
             
-            /* Record the largest valid denominator as the best partial period for LCM harvesting */
-            if (best_period && !success) {
+            /* Record best partial period: only save convergents where
+             * the denominator is nontrivial (>1 bit) and smaller than N.
+             * This prevents the LCM accumulator from harvesting garbage
+             * from the final overflowed convergent. */
+            if (best_period && !success && bigint_bitlen(&cf_q0) > 1
+                && bigint_cmp(&cf_q0, N) < 0) {
                 bigint_copy(best_period, &cf_q0);
             }
         }
