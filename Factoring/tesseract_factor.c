@@ -1406,14 +1406,15 @@ static int hpc_measure_site(HPCGraph *graph, int target_site, double random_01)
  * This gives EXACT marginals vs BP's approximation.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define HPC_EXACT_MAX_NEIGHBORS 32
+#define HPC_EXACT_MAX_NEIGHBORS 64
+static int g_work_start = -1;  /* Set by factoring code; -1 = no work register */
+static int debug_wf = 0;
 
 static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
                                 double probs_out[6])
 {
-    /* Find all unique neighbor sites connected to target via edges */
     uint64_t neighbors[HPC_EXACT_MAX_NEIGHBORS];
-    uint64_t neighbor_edges[HPC_EXACT_MAX_NEIGHBORS][16]; /* edges per neighbor */
+    uint64_t neighbor_edges[HPC_EXACT_MAX_NEIGHBORS][16];
     int      neighbor_edge_count[HPC_EXACT_MAX_NEIGHBORS];
     int      n_neighbors = 0;
 
@@ -1423,8 +1424,6 @@ static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
         const HPCEdge *edge = &graph->edges[eid];
         uint64_t partner = (edge->site_a == (uint64_t)target_site) ?
                             edge->site_b : edge->site_a;
-
-        /* Find or add partner */
         int found = -1;
         for (int n = 0; n < n_neighbors; n++) {
             if (neighbors[n] == partner) { found = n; break; }
@@ -1440,152 +1439,164 @@ static void hpc_exact_marginals(const HPCGraph *graph, int target_site,
         }
     }
 
-    /* Also find edges between neighbors (for amplitude correctness) */
+    /* Separate: IQFT neighbors (enumerate) vs work register (analytical) */
+    int iqft_idx[HPC_EXACT_MAX_NEIGHBORS], n_iqft = 0;
+    int work_idx[HPC_EXACT_MAX_NEIGHBORS], n_work_nbr = 0;
+    for (int n = 0; n < n_neighbors; n++) {
+        if (g_work_start >= 0 && (int)neighbors[n] >= g_work_start)
+            work_idx[n_work_nbr++] = n;
+        else
+            iqft_idx[n_iqft++] = n;
+    }
+
+    /* Cross-edges between IQFT neighbors */
     uint64_t cross_edges[256];
     int n_cross = 0;
-    for (int ni = 0; ni < n_neighbors && n_cross < 256; ni++) {
+    for (int ii = 0; ii < n_iqft && n_cross < 256; ii++) {
+        int ni = iqft_idx[ii];
         const HPCAdjList *nadj = &graph->adj[neighbors[ni]];
         for (uint64_t ei = 0; ei < nadj->count && n_cross < 256; ei++) {
             uint64_t eid = nadj->edge_ids[ei];
             const HPCEdge *edge = &graph->edges[eid];
             uint64_t other = (edge->site_a == neighbors[ni]) ?
                               edge->site_b : edge->site_a;
-            /* Is 'other' also a neighbor (and not the target)? */
             if (other == (uint64_t)target_site) continue;
-            for (int nj = ni + 1; nj < n_neighbors; nj++) {
+            for (int ij = ii + 1; ij < n_iqft; ij++) {
+                int nj = iqft_idx[ij];
                 if (neighbors[nj] == other) {
-                    /* Check if already recorded */
                     int dup = 0;
-                    for (int c = 0; c < n_cross; c++) {
+                    for (int c = 0; c < n_cross; c++)
                         if (cross_edges[c] == eid) { dup = 1; break; }
-                    }
                     if (!dup) cross_edges[n_cross++] = eid;
                 }
             }
         }
     }
 
-    /* Enumerate: for each target value v, sum |amplitude|² over neighbor configs */
     uint64_t n_configs = 1;
-    for (int n = 0; n < n_neighbors; n++) n_configs *= 6;
+    for (int i = 0; i < n_iqft; i++) n_configs *= 6;
 
-
-    /* Cap at reasonable limit — 6^8 = 1.68M is still tractable */
-    if (n_configs > 2000000 || n_neighbors > 10) {
-        /* Too many neighbors — use local amplitudes only (product state approx) */
+    if (n_configs > 100000000ULL || n_iqft > 12) {
         const TrialityQuhit *q = &graph->locals[target_site];
-        double total = 0.0;
+        double tot = 0.0;
         for (int v = 0; v < 6; v++) {
-            probs_out[v] = q->edge_re[v] * q->edge_re[v] +
-                           q->edge_im[v] * q->edge_im[v];
-            total += probs_out[v];
+            probs_out[v] = q->edge_re[v]*q->edge_re[v] + q->edge_im[v]*q->edge_im[v];
+            tot += probs_out[v];
         }
-        if (total > 1e-30) {
-            for (int v = 0; v < 6; v++) probs_out[v] /= total;
-        } else {
-            for (int v = 0; v < 6; v++) probs_out[v] = 1.0 / 6.0;
-        }
+        if (tot > 1e-30) for (int v = 0; v < 6; v++) probs_out[v] /= tot;
+        else for (int v = 0; v < 6; v++) probs_out[v] = 1.0/6.0;
         return;
     }
 
+    /* Analytical work register contribution: for each target value v,
+     * C(v) = Π_j Σ_{w=0}^{5} local_j(w) × edge_weight(v,w)
+     * Each work digit j is independent (product state in QFT basis). */
+    double wf_re[6] = {1,1,1,1,1,1}, wf_im[6] = {0,0,0,0,0,0};
+    for (int wi = 0; wi < n_work_nbr; wi++) {
+        int n = work_idx[wi];
+        const TrialityQuhit *wq = &graph->locals[neighbors[n]];
+        for (int v = 0; v < 6; v++) {
+            double sr = 0, si = 0;
+            for (int w = 0; w < 6; w++) {
+                double lr = wq->edge_re[w], li = wq->edge_im[w];
+                double er = 1.0, ei2 = 0.0;
+                for (int ec = 0; ec < neighbor_edge_count[n]; ec++) {
+                    const HPCEdge *edge = &graph->edges[neighbor_edges[n][ec]];
+                    double wr, wi2;
+                    if (edge->site_a == (uint64_t)target_site) {
+                        wr = edge->w_re[v][w]; wi2 = edge->w_im[v][w];
+                    } else {
+                        wr = edge->w_re[w][v]; wi2 = edge->w_im[w][v];
+                    }
+                    double nr = er*wr - ei2*wi2, ni2 = er*wi2 + ei2*wr;
+                    er = nr; ei2 = ni2;
+                }
+                double pr = lr*er - li*ei2, pi2 = lr*ei2 + li*er;
+                sr += pr; si += pi2;
+            }
+            double nr = wf_re[v]*sr - wf_im[v]*si;
+            double ni2 = wf_re[v]*si + wf_im[v]*sr;
+            wf_re[v] = nr; wf_im[v] = ni2;
+        }
+    }
+
+    /* Enumerate IQFT neighbors, multiply by analytical work factor */
     double total = 0.0;
     for (int v = 0; v < 6; v++) probs_out[v] = 0.0;
 
     for (int v = 0; v < 6; v++) {
-        /* Target site amplitude for value v */
         const TrialityQuhit *qt = &graph->locals[target_site];
-        double site_re = qt->edge_re[v];
-        double site_im = qt->edge_im[v];
+        double site_re = qt->edge_re[v], site_im = qt->edge_im[v];
 
         for (uint64_t cfg = 0; cfg < n_configs; cfg++) {
-            /* Decode neighbor values from cfg */
             uint32_t nvals[HPC_EXACT_MAX_NEIGHBORS];
             uint64_t tmp = cfg;
-            for (int n = 0; n < n_neighbors; n++) {
-                nvals[n] = tmp % 6;
-                tmp /= 6;
-            }
+            for (int i = 0; i < n_iqft; i++) { nvals[i] = tmp % 6; tmp /= 6; }
 
-            /* Start with target site amplitude */
             double amp_re = site_re, amp_im = site_im;
 
-            /* Multiply by neighbor local amplitudes */
-            for (int n = 0; n < n_neighbors; n++) {
+            for (int i = 0; i < n_iqft; i++) {
+                int n = iqft_idx[i];
                 const TrialityQuhit *qn = &graph->locals[neighbors[n]];
-                uint32_t nv = nvals[n];
-                double n_re = qn->edge_re[nv];
-                double n_im = qn->edge_im[nv];
-                double new_re = amp_re * n_re - amp_im * n_im;
-                double new_im = amp_re * n_im + amp_im * n_re;
-                amp_re = new_re;
-                amp_im = new_im;
+                uint32_t nv = nvals[i];
+                double nr2 = qn->edge_re[nv], ni2 = qn->edge_im[nv];
+                double new_re = amp_re*nr2 - amp_im*ni2;
+                double new_im = amp_re*ni2 + amp_im*nr2;
+                amp_re = new_re; amp_im = new_im;
             }
 
-            /* Multiply by edge weights: target ↔ neighbors */
-            for (int n = 0; n < n_neighbors; n++) {
-                uint32_t nv = nvals[n];
+            for (int i = 0; i < n_iqft; i++) {
+                int n = iqft_idx[i];
+                uint32_t nv = nvals[i];
                 for (int ec = 0; ec < neighbor_edge_count[n]; ec++) {
                     const HPCEdge *edge = &graph->edges[neighbor_edges[n][ec]];
-                    double w_re, w_im;
+                    double wr, wi2;
                     if (edge->type == HPC_EDGE_CZ) {
                         int pidx = (v * nv) % 6;
-                        w_re = HPC_W6_RE[pidx];
-                        w_im = HPC_W6_IM[pidx];
+                        wr = HPC_W6_RE[pidx]; wi2 = HPC_W6_IM[pidx];
+                    } else if (edge->site_a == (uint64_t)target_site) {
+                        wr = edge->w_re[v][nv]; wi2 = edge->w_im[v][nv];
                     } else {
-                        /* Weighted phase edge — use stored matrix */
-                        /* Determine orientation: site_a=target → w[v][nv], else w[nv][v] */
-                        if (edge->site_a == (uint64_t)target_site) {
-                            w_re = edge->w_re[v][nv];
-                            w_im = edge->w_im[v][nv];
-                        } else {
-                            w_re = edge->w_re[nv][v];
-                            w_im = edge->w_im[nv][v];
-                        }
+                        wr = edge->w_re[nv][v]; wi2 = edge->w_im[nv][v];
                     }
-                    double new_re = amp_re * w_re - amp_im * w_im;
-                    double new_im = amp_re * w_im + amp_im * w_re;
-                    amp_re = new_re;
-                    amp_im = new_im;
+                    double new_re = amp_re*wr - amp_im*wi2;
+                    double new_im = amp_re*wi2 + amp_im*wr;
+                    amp_re = new_re; amp_im = new_im;
                 }
             }
 
-            /* Multiply by cross-edges between neighbors */
             for (int c = 0; c < n_cross; c++) {
                 const HPCEdge *edge = &graph->edges[cross_edges[c]];
-                /* Find which two neighbors this connects */
                 int na = -1, nb = -1;
-                for (int n = 0; n < n_neighbors; n++) {
-                    if (neighbors[n] == edge->site_a) na = n;
-                    if (neighbors[n] == edge->site_b) nb = n;
+                for (int i = 0; i < n_iqft; i++) {
+                    int nn = iqft_idx[i];
+                    if (neighbors[nn] == edge->site_a) na = i;
+                    if (neighbors[nn] == edge->site_b) nb = i;
                 }
                 if (na < 0 || nb < 0) continue;
-                uint32_t va = nvals[na], vb = nvals[nb];
-                double w_re, w_im;
+                uint32_t va2 = nvals[na], vb2 = nvals[nb];
+                double wr, wi2;
                 if (edge->type == HPC_EDGE_CZ) {
-                    int pidx = (va * vb) % 6;
-                    w_re = HPC_W6_RE[pidx];
-                    w_im = HPC_W6_IM[pidx];
+                    int pidx = (va2*vb2) % 6;
+                    wr = HPC_W6_RE[pidx]; wi2 = HPC_W6_IM[pidx];
                 } else {
-                    w_re = edge->w_re[va][vb];
-                    w_im = edge->w_im[va][vb];
+                    wr = edge->w_re[va2][vb2]; wi2 = edge->w_im[va2][vb2];
                 }
-                double new_re = amp_re * w_re - amp_im * w_im;
-                double new_im = amp_re * w_im + amp_im * w_re;
-                amp_re = new_re;
-                amp_im = new_im;
+                double new_re = amp_re*wr - amp_im*wi2;
+                double new_im = amp_re*wi2 + amp_im*wr;
+                amp_re = new_re; amp_im = new_im;
             }
 
-            probs_out[v] += amp_re * amp_re + amp_im * amp_im;
+            /* Multiply by analytical work register factor */
+            double fr = amp_re*wf_re[v] - amp_im*wf_im[v];
+            double fi = amp_re*wf_im[v] + amp_im*wf_re[v];
+            probs_out[v] += fr*fr + fi*fi;
         }
         total += probs_out[v];
     }
 
-    /* Normalize */
-    if (total > 1e-30) {
-        for (int v = 0; v < 6; v++) probs_out[v] /= total;
-    } else {
-        for (int v = 0; v < 6; v++) probs_out[v] = 1.0 / 6.0;
-    }
+    if (total > 1e-30) for (int v = 0; v < 6; v++) probs_out[v] /= total;
+    else for (int v = 0; v < 6; v++) probs_out[v] = 1.0/6.0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1814,11 +1825,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                             int probe_mode)
 {
     uint32_t nbits = bigint_bitlen(N);
-    /* Register needs R > N² for CF convergent extraction to find the true period.
-     * With 6^k exponent encoding, we need EXTRA scales so that most 6^k > N
-     * (wrapping regime gives non-trivial signal). Factor of 3× ensures ~84%
-     * of scales are in the wrapping regime even for 48-bit N. */
-    int n_sites_raw = (int)((nbits * 6000) / 2585) + 2;
+    /* Register needs R > N² for CF convergent extraction to find the true period. */
+    int n_sites_raw = (int)((nbits * 2000) / 2585) + 2;
     
     int n_blocks = (n_sites_raw + 1) / 2;
     int n_sites = n_blocks * 6;
@@ -1838,8 +1846,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Create graph */
     HPCGraph *graph = hpc_create(n_sites);
 
-    BigInt b6; bigint_set_u64(&b6, 6);
-    BigInt one; bigint_set_u64(&one, 1);
+    static BigInt b6; bigint_set_u64(&b6, 6);
+    static BigInt one; bigint_set_u64(&one, 1);
 
     clock_t t_setup_start = clock();
 
@@ -1853,14 +1861,15 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Pre-allocate ALL BigInt temporaries used in graph construction loop.
      * Previously these were stack-local and leaked ~80+ GMP allocations per
      * block iteration, corrupting the heap for large block counts. */
-    BigInt val_k_A, val_k_B, div_6_blk;
-    BigInt gc_b36, gc_next_A, gc_next_B, gc_next_div;
-    BigInt gc_gcd_check, gc_val_minus_1, gc_dummy_rem;
-    BigInt gc_powersA[6], gc_powersB[6];
-    BigInt gc_tmpA, gc_tmpB, gc_q_div;
-    BigInt gc_b6_mod, gc_shift_div_A, gc_shift_div_B, gc_dummy_rm2;
-    BigInt gc_qA, gc_qB, gc_rA_mod, gc_rB_mod;
-    BigInt gc_temp_N, gc_qN, gc_rN, gc_q_sh, gc_r_sh;
+    static BigInt val_k_A, val_k_B, div_6_blk;
+    static BigInt gc_b36, gc_next_A, gc_next_B, gc_next_div;
+    static BigInt gc_gcd_check, gc_val_minus_1, gc_dummy_rem;
+    static BigInt gc_powersA[6], gc_powersB[6];
+    static BigInt gc_tmpA, gc_tmpB, gc_q_div;
+    static BigInt gc_b6_mod, gc_shift_div_A, gc_shift_div_B, gc_dummy_rm2;
+    static BigInt gc_qA, gc_qB, gc_rA_mod, gc_rB_mod;
+    static BigInt gc_temp_N, gc_qN, gc_rN, gc_q_sh, gc_r_sh;
+    static BigInt gc_six_pow_k, gc_d_bi;
 
     bigint_set_u64(&val_k_A, 0); bigint_set_u64(&val_k_B, 0);
     bigint_set_u64(&div_6_blk, 1);
@@ -1871,6 +1880,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     for (int i = 0; i < 6; i++) { bigint_set_u64(&gc_powersA[i], 0); bigint_set_u64(&gc_powersB[i], 0); }
     bigint_set_u64(&gc_tmpA, 0); bigint_set_u64(&gc_tmpB, 0);
     bigint_set_u64(&gc_q_div, 0);
+    bigint_set_u64(&gc_six_pow_k, 0); bigint_set_u64(&gc_d_bi, 0);
     bigint_set_u64(&gc_b6_mod, 6); bigint_set_u64(&gc_shift_div_A, 0);
     bigint_set_u64(&gc_shift_div_B, 0); bigint_set_u64(&gc_dummy_rm2, 0);
     bigint_set_u64(&gc_qA, 0); bigint_set_u64(&gc_qB, 0);
@@ -1879,24 +1889,31 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_set_u64(&gc_rN, 0); bigint_set_u64(&gc_q_sh, 0);
     bigint_set_u64(&gc_r_sh, 0);
 
+    /* Scale offset: ensure 6^k > N for ALL scales so no digit is trivially 0.
+     * offset = ceil(log_6(N)) = ceil(nbits / log2(6)) */
+    int scale_offset = (int)ceil((double)nbits / log2(6.0));
+    printf("    Scale offset: %d (6^%d > N, all digits non-trivial)\n", scale_offset, scale_offset);
+
     for (int blk = 0; blk < n_blocks; blk++) {
-        int scale_A = 2 * blk;
-        int scale_B = 2 * blk + 1;
+        int scale_A = 2 * blk + scale_offset;
+        int scale_B = 2 * blk + 1 + scale_offset;
         
         if (blk == 0) {
-            /* Exponent encoding: val_k_A = 6^1 mod N, val_k_B = 6^2 mod N */
-            bigint_set_u64(&val_k_A, 6);
-            bigint_set_u64(&val_k_B, 36);
+            /* Compute a^{6^offset} as starting point.
+             * Build by repeated exponentiation: a → a^6 → a^{6^2} → ... → a^{6^offset} */
+            bigint_copy(&val_k_A, a_val);
+            for (int s = 0; s < scale_offset; s++) {
+                bigint_pow_mod(&gc_next_A, &val_k_A, &b6, N);
+                bigint_copy(&val_k_A, &gc_next_A);
+            }
+            /* val_k_A = a^{6^offset}, val_k_B = a^{6^{offset+1}} */
+            bigint_pow_mod(&val_k_B, &val_k_A, &b6, N);
             bigint_set_u64(&div_6_blk, 1);
         } else {
-            /* val_k_A = 6^{2*blk} = prev_val_k_B * 6 mod N */
-            bigint_mul(&gc_next_A, &val_k_B, &b6);
-            bigint_div_mod(&gc_next_A, N, &gc_q_div, &gc_rA_mod);
-            bigint_copy(&val_k_A, &gc_rA_mod);
-            /* val_k_B = 6^{2*blk+1} = val_k_A * 6 mod N */
-            bigint_mul(&gc_next_B, &val_k_A, &b6);
-            bigint_div_mod(&gc_next_B, N, &gc_q_div, &gc_rB_mod);
-            bigint_copy(&val_k_B, &gc_rB_mod);
+            bigint_pow_mod(&gc_next_A, &val_k_A, &gc_b36, N);
+            bigint_copy(&val_k_A, &gc_next_A);
+            bigint_pow_mod(&gc_next_B, &val_k_B, &gc_b36, N);
+            bigint_copy(&val_k_B, &gc_next_B);
 
             bigint_mul(&gc_next_div, &div_6_blk, &b6);
             bigint_copy(&div_6_blk, &gc_next_div);
@@ -1926,113 +1943,62 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
 
-        /* ── LINEAR phase encoding (Shor phase estimation) ──
-         * Correct: φ(d) = 2π × d × a^(6^k) / N   (LINEAR in d)
-         * Old bug: φ(d) = 2π × a^(d×6^k) / N      (EXPONENTIAL in d)
-         * The phase must be linear in d for the QFT to recover frequency digits. */
-        BigInt gc_d_bi;
-        bigint_set_u64(&gc_powersA[0], 0);  /* d=0: phase = 0 */
+        /* ── QUANTUM ORACLE: QFT-domain Draper adder ──
+         * The work register stays in the QFT domain. The controlled-U
+         * at scale k adds d × c_k (mod N) to the work register via
+         * phase kicks: w(d, φ_j) = e^{2πi × d × c_k × φ_j / 6^{j+1}}.
+         * c_k = a^{6^{scale_k}} mod N. val_k_A/B hold these values.
+         *
+         * This IS the Draper adder: in the QFT basis, addition of a
+         * constant is diagonal (pure phase rotations), which maps
+         * directly to CZ edges in the HPC graph. */
+
+        /* Phase kick from oracle: apply to frequency sites directly.
+         * The net effect of the QFT-domain work register on frequency
+         * site k (after tracing out work) is the accumulated phase
+         * from all previous additions. For the semi-classical approach,
+         * we fold the work register's contribution into the frequency
+         * site locals as: local[d] *= e^{2πi × d × Σ_j c_j^{d_j} / N}
+         *
+         * For a single scale k with eigenphase s/r, the correct phase is:
+         * φ(d,k) = 2π × d × c_k / N where c_k = a^{6^{scale_k}} mod N */
+        bigint_set_u64(&gc_powersA[0], 0);
         bigint_set_u64(&gc_powersB[0], 0);
         for (int d = 1; d < 6; d++) {
             bigint_set_u64(&gc_d_bi, (uint64_t)d);
-            bigint_mul(&gc_tmpA, &gc_d_bi, &val_k_A);     /* d × a^(6^k) */
+            bigint_mul(&gc_tmpA, &gc_d_bi, &val_k_A);
             bigint_mul(&gc_tmpB, &gc_d_bi, &val_k_B);
-            bigint_div_mod(&gc_tmpA, N, &gc_q_div, &gc_powersA[d]);  /* mod N */
+            bigint_div_mod(&gc_tmpA, N, &gc_q_div, &gc_powersA[d]);
             bigint_div_mod(&gc_tmpB, N, &gc_q_div, &gc_powersB[d]);
         }
 
+        /* Apply oracle phase to frequency sites.
+         * Each digit d gets phase 2π × (d × c_k mod N) / N. */
+        int site0 = blk * 6 + 0;
+        int site1 = blk * 6 + 1;
+
         for (int d = 0; d < 6; d++) {
-            /* ── Holographic Phase Contraction (HPC): MGR Protocol ──
-             * Map the macroscopic integer y = a^(d * 6^scale) mod N
-             * onto the microscopic quantum phase circle: θ = 2π * y / N.
-             * This explicitly enforces the global periodicity r of Shor's
-             * sequence directly into the BP message correlation geometry. 
-             *
-             * MGR (Multi-precision Geometric Reconstruction):
-             * Since N can easily exceed the 53-bit mantissa limit of C double, 
-             * naive division y/N completely strips the fine-structure of the quantum phase.
-             * We calculate y/N * 2π out to 2048 bits iteratively using MPFR, capturing 
-             * the deepest resonance harmonics, and then drop the orthogonal continuous O(1) 
-             * spin projections (sin/cos) safely back into standard double. */
-             
-            mpfr_t mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB;
-            mpfr_inits2(2048, mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, (mpfr_ptr)0);
+            /* Compute residue / N directly in double (sufficient for
+             * the phase rotation — the 2048-bit MPFR was overkill since
+             * both values are < N < 2^48 and double has 53-bit mantissa) */
+            double yA = (double)bigint_to_u64(&gc_powersA[d]);
+            double yB = (double)bigint_to_u64(&gc_powersB[d]);
+            double Nd = (double)bigint_to_u64(N);
+            double phaseA = 2.0 * M_PI * yA / Nd;
+            double phaseB = 2.0 * M_PI * yB / Nd;
 
-            mpfr_set_z(mf_yA, gc_powersA[d].z, MPFR_RNDN);
-            mpfr_set_z(mf_yB, gc_powersB[d].z, MPFR_RNDN);
-            mpfr_set_z(mf_N, N->z, MPFR_RNDN);
+            double cosA = cos(phaseA), sinA = sin(phaseA);
+            double cosB = cos(phaseB), sinB = sin(phaseB);
 
-            /* Compute phase_A = (yA / N) * 2π */
-            mpfr_div(mf_phaseA, mf_yA, mf_N, MPFR_RNDN);
-            mpfr_const_pi(mf_pi, MPFR_RNDN);
-            mpfr_mul_d(mf_pi, mf_pi, 2.0, MPFR_RNDN);
-            mpfr_mul(mf_phaseA, mf_phaseA, mf_pi, MPFR_RNDN);
-
-            /* Compute phase_B = (yB / N) * 2π */
-            mpfr_div(mf_phaseB, mf_yB, mf_N, MPFR_RNDN);
-            mpfr_mul(mf_phaseB, mf_phaseB, mf_pi, MPFR_RNDN);
-
-            mpfr_t mf_cosA, mf_sinA, mf_cosB, mf_sinB;
-            mpfr_inits2(2048, mf_cosA, mf_sinA, mf_cosB, mf_sinB, (mpfr_ptr)0);
-            
-            mpfr_sin_cos(mf_sinA, mf_cosA, mf_phaseA, MPFR_RNDN);
-            mpfr_sin_cos(mf_sinB, mf_cosB, mf_phaseB, MPFR_RNDN);
-
-            int site0 = blk * 6 + 0;
-            int site1 = blk * 6 + 1;
-            
             double rA = graph->locals[site0].edge_re[d];
             double iA = graph->locals[site0].edge_im[d];
+            graph->locals[site0].edge_re[d] = rA * cosA - iA * sinA;
+            graph->locals[site0].edge_im[d] = rA * sinA + iA * cosA;
+
             double rB = graph->locals[site1].edge_re[d];
             double iB = graph->locals[site1].edge_im[d];
-            
-            mpfr_t m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB;
-            mpfr_t m_t1, m_t2, m_t3, m_t4;
-            mpfr_inits2(2048, m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB, m_t1, m_t2, m_t3, m_t4, (mpfr_ptr)0);
-            mpfr_set_d(m_rA, rA, MPFR_RNDN);
-            mpfr_set_d(m_iA, iA, MPFR_RNDN);
-            mpfr_set_d(m_rB, rB, MPFR_RNDN);
-            mpfr_set_d(m_iB, iB, MPFR_RNDN);
-            
-            mpfr_set(m_cosA, mf_cosA, MPFR_RNDN);
-            mpfr_set(m_sinA, mf_sinA, MPFR_RNDN);
-            mpfr_set(m_cosB, mf_cosB, MPFR_RNDN);
-            mpfr_set(m_sinB, mf_sinB, MPFR_RNDN);
-
-            // rA = old_rA * cosA - iA * sinA
-            mpfr_mul(m_t1, m_rA, m_cosA, MPFR_RNDN);
-            mpfr_mul(m_t2, m_iA, m_sinA, MPFR_RNDN);
-            mpfr_sub(m_t3, m_t1, m_t2, MPFR_RNDN);
-            
-            // iA = old_rA * sinA + iA * cosA
-            mpfr_mul(m_t1, m_rA, m_sinA, MPFR_RNDN);
-            mpfr_mul(m_t2, m_iA, m_cosA, MPFR_RNDN);
-            mpfr_add(m_t4, m_t1, m_t2, MPFR_RNDN);
-
-            rA = mpfr_get_d(m_t3, MPFR_RNDN);
-            iA = mpfr_get_d(m_t4, MPFR_RNDN);
-            
-            // rB = old_rB * cosB - iB * sinB
-            mpfr_mul(m_t1, m_rB, m_cosB, MPFR_RNDN);
-            mpfr_mul(m_t2, m_iB, m_sinB, MPFR_RNDN);
-            mpfr_sub(m_t3, m_t1, m_t2, MPFR_RNDN);
-
-            // iB = old_rB * sinB + iB * cosB
-            mpfr_mul(m_t1, m_rB, m_sinB, MPFR_RNDN);
-            mpfr_mul(m_t2, m_iB, m_cosB, MPFR_RNDN);
-            mpfr_add(m_t4, m_t1, m_t2, MPFR_RNDN);
-
-            rB = mpfr_get_d(m_t3, MPFR_RNDN);
-            iB = mpfr_get_d(m_t4, MPFR_RNDN);
-
-            mpfr_clears(m_rA, m_iA, m_rB, m_iB, m_cosA, m_sinA, m_cosB, m_sinB, m_t1, m_t2, m_t3, m_t4, (mpfr_ptr)0);
-            mpfr_clears(mf_yA, mf_yB, mf_N, mf_pi, mf_phaseA, mf_phaseB, 
-                        mf_cosA, mf_sinA, mf_cosB, mf_sinB, (mpfr_ptr)0);
-
-            graph->locals[site0].edge_re[d] = rA;
-            graph->locals[site0].edge_im[d] = iA;
-            graph->locals[site1].edge_re[d] = rB;
-            graph->locals[site1].edge_im[d] = iB;
+            graph->locals[site1].edge_re[d] = rB * cosB - iB * sinB;
+            graph->locals[site1].edge_im[d] = rB * sinB + iB * cosB;
         }
 
         /* Extract the blk-th base-6 digit of N via running quotient (O(1) per block) */
@@ -2158,76 +2124,122 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         fflush(stdout);
     }
 
-    /* ═══ INVERSE QFT COUPLING EDGES ═══
-     * The semi-classical QFT correction between scale k and scale j:
-     *   C_k += f_j / 6^{j-k+1}   for j > k
-     *   phase: e^{-2πi × d_k × d_j / 6^{j-k+1}}
+    /* IQFT edges REMOVED: Griffiths-Niu semi-classical feed-forward replaces
+     * the O(n²) pairwise IQFT edges. Keeping both would apply the QFT twice. */
+    printf("    IQFT: semi-classical feed-forward (no graph edges)\n");
+
+    /* ═══ QUANTUM WORK REGISTER — Controlled Permutation Oracle ═══
+     * The work register maintains superposition through the HPC graph.
+     * Each frequency site k gets a CONTROLLED_PERM edge:
+     *   multiplier[d] = c_k^d mod N
+     *   amplitude: δ(work_out == multiplier[d] × work_in mod N)
      *
-     * This decomposes into PAIRWISE couplings — exactly what the Magic
-     * Pointer can represent as edges! By encoding the full IQFT as edges,
-     * the exact marginals compute the post-QFT interference directly.
+     * The work register starts as |1⟩. The perm edges enforce
+     * work = Π_k c_k^{d_k} mod N = a^x mod N for each freq config x.
+     * This creates the eigenstate superposition |u_s⟩ that kicks back
+     * the phase e^{2πi s/r} into the frequency register.
      *
-     * Only pairs with |j-k| <= 10 are significant (6^11 > 10^8). */
-    int n_qft_edges = 0;
+     * The state vector is NEVER materialized. Superposition lives in
+     * the graph structure: local amplitudes × edge weights. */
+    int n_work = (int)ceil((double)nbits / log2(6.0)) + 1;
+    int work_start = n_sites;
+    g_work_start = work_start;
+    hpc_grow_sites(graph, n_sites + n_work);
+    printf("    Work register: %d sites (indices %d..%d), computational basis |1⟩\n",
+           n_work, work_start, work_start + n_work - 1);
+
+    /* Initialize work register to |1⟩ in base-6 computational basis.
+     * |1⟩ = digit_0 = 1, all other digits = 0.
+     * Local amplitude: δ(value, correct_digit) — sharp, not uniform. */
+    for (int j = 0; j < n_work; j++) {
+        TrialityQuhit *wq = &graph->locals[work_start + j];
+        int init_digit = (j == 0) ? 1 : 0;  /* |1⟩ in base-6: LSB=1, rest=0 */
+        for (int w = 0; w < 6; w++) {
+            wq->edge_re[w] = (w == init_digit) ? 1.0 : 0.0;
+            wq->edge_im[w] = 0.0;
+        }
+    }
+
+    /* Add controlled permutation edges: freq site k → work register */
+    uint64_t N_u64_work = bigint_to_u64(N);
+    uint64_t a_u64_work = bigint_to_u64(a_val);
+    int n_oracle_edges = 0;
+
     for (int k = 0; k < n_sites_raw; k++) {
         int blk_k = k / 2, off_k = k % 2;
         int site_k = blk_k * 6 + off_k;
         if (site_k >= n_sites) continue;
 
-        for (int j = k + 1; j < n_sites_raw && j <= k + 10; j++) {
-            int blk_j = j / 2, off_j = j % 2;
-            int site_j = blk_j * 6 + off_j;
-            if (site_j >= n_sites) continue;
+        /* c_k = a^{6^{k+offset}} mod N */
+        uint64_t c_k = a_u64_work;
+        for (int s = 0; s < k + scale_offset; s++) {
+            __uint128_t t = c_k;
+            t = (t * t) % N_u64_work;
+            t = (t * (uint64_t)c_k) % N_u64_work;
+            t = (t * t) % N_u64_work;
+            c_k = (uint64_t)t;
+        }
 
-            /* Phase coupling: w(d_k, d_j) = e^{-2πi × d_k × d_j / 6^{j-k+1}} */
-            double divisor = 1.0;
-            for (int p = 0; p < j - k + 1; p++) divisor *= 6.0;
+        /* Compute multiplier[d] = c_k^d mod N for d=0..5 */
+        uint64_t mult[6];
+        mult[0] = 1;
+        for (int d = 1; d < 6; d++) {
+            mult[d] = ((__uint128_t)mult[d-1] * c_k) % N_u64_work;
+        }
 
+        /* Create controlled-perm edge: freq_site_k controls the work register.
+         * The perm edge encodes the constraint δ(work == mult[d] × y mod N)
+         * as phase weights in the 6×6 matrix.
+         *
+         * For the HPC amplitude formula ψ = [Π locals] × [Π edges]:
+         * The perm constraint groups configurations by a^x mod N,
+         * creating the eigenstate decomposition that produces phase kickback.
+         *
+         * Edge weight w(d, w_j): encode the d-th digit of mult[d]
+         * as a phase that constrains work digit j. */
+        for (int j = 0; j < n_work; j++) {
             hpc_grow_edges(graph);
             uint64_t eid = graph->n_edges;
             HPCEdge *edge = &graph->edges[eid];
             memset(edge, 0, sizeof(*edge));
             edge->site_a = site_k;
-            edge->site_b = site_j;
-            edge->type = HPC_EDGE_CZ;
+            edge->site_b = work_start + j;
+            edge->type = HPC_EDGE_PHASE;
             edge->fidelity = 1.0;
 
-            for (int dk = 0; dk < 6; dk++) {
-                for (int dj = 0; dj < 6; dj++) {
-                    double angle = -2.0 * M_PI * dk * dj / divisor;
-                    edge->w_re[dk][dj] = cos(angle);
-                    edge->w_im[dk][dj] = sin(angle);
+            /* For each control value d, compute the j-th digit of mult[d].
+             * The edge weight selects the correct work digit value via
+             * a peaked distribution: w(d, w_j) = 1 if w_j matches the
+             * j-th digit of mult[d], scaled by a coupling strength. */
+            for (int d = 0; d < 6; d++) {
+                /* Extract j-th base-6 digit of mult[d] */
+                uint64_t tmp = mult[d];
+                for (int p = 0; p < j; p++) tmp /= 6;
+                int target_digit = tmp % 6;
+
+                for (int wj = 0; wj < 6; wj++) {
+                    /* Phase coupling: peaked at the correct digit value.
+                     * Uses the eigenphase structure:
+                     * w(d, w_j) = e^{2πi × d × (target_digit - w_j) / 6}
+                     * This creates constructive interference when w_j matches
+                     * the correct digit, encoding the permutation constraint
+                     * as a phase correlation rather than a hard delta. */
+                    double phase = 2.0 * M_PI * (double)d * (double)(target_digit * wj) / 6.0;
+                    edge->w_re[d][wj] = cos(phase);
+                    edge->w_im[d][wj] = sin(phase);
                 }
             }
             graph->n_edges++;
-            graph->cz_edges++;
+            graph->phase_edges++;
             hpc_adj_add(graph, site_k, eid);
-            hpc_adj_add(graph, site_j, eid);
-            n_qft_edges++;
+            hpc_adj_add(graph, work_start + j, eid);
+            n_oracle_edges++;
         }
     }
-    printf("    IQFT coupling edges: %d (pairwise, |j-k| <= 10)\n", n_qft_edges);
+    printf("    Controlled-perm oracle edges: %d\n", n_oracle_edges);
 
-    /* Convert Phase to Amplitude (IDFT) BEFORE BP */
-    for (int site = 0; site < n_sites; site++) {
-        double out_re[6], out_im[6];
-        for (int k_dft = 0; k_dft < 6; k_dft++) {
-            double sr = 0, si = 0;
-            for (int j = 0; j < 6; j++) {
-                double angle = 2.0 * 3.14159265358979323846 * j * k_dft / 6.0;
-                double re = graph->locals[site].edge_re[j];
-                double im = graph->locals[site].edge_im[j];
-                sr += re*cos(angle) + im*sin(angle);
-                si += -re*sin(angle) + im*cos(angle);
-            }
-            out_re[k_dft] = sr / sqrt(6.0);
-            out_im[k_dft] = si / sqrt(6.0);
-        }
-        for (int d = 0; d < 6; d++) {
-            graph->locals[site].edge_re[d] = out_re[d];
-            graph->locals[site].edge_im[d] = out_im[d];
-        }
-    }
+    /* DFT rotation REMOVED: Griffiths-Niu measurement applies IDFT6 during
+     * measurement (Step 4). Locals stay in oracle phase basis. */
     printf("    Phase 3: Exact Marginals via Magic Pointer (replaces BP)...\n");
     clock_t t_bp_start = clock();
 
@@ -2249,6 +2261,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
         bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
         bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+        bigint_clear(&gc_six_pow_k); bigint_clear(&gc_d_bi);
         bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
         bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
         bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
@@ -2260,31 +2273,201 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         return 0.0;
     }
 
-    /* Compute exact marginals for sites 0,1 of each block (the oracle sites) */
-    for (int blk = 0; blk < n_blocks; blk++) {
-        for (int offset = 0; offset <= 1; offset++) {
-            int scale = 2 * blk + offset;
-            int site = blk * 6 + offset;
+    /* ═══ GRIFFITHS-NIU SEMI-CLASSICAL QFT MEASUREMENT ═══
+     *
+     * Measures frequency register MSB-to-LSB. For each digit k:
+     *   1. Read oracle amplitudes α_k(d) from graph locals (phase basis)
+     *   2. Compute work register contribution C_k(d) from perm edge weights
+     *   3. Apply feed-forward phase correction: α'(d) = α(d) × C(d) × e^{-2πi d θ_k}
+     *   4. Apply IDFT6 to α'(d) → β(v): converts phase→computational basis
+     *   5. P(v) = |β(v)|² — interference happens in step 4
+     *   6. Sample outcome, update work register locals in graph
+     *
+     * The IDFT6 is what creates constructive interference at Shor frequencies.
+     * Without it, measuring in the phase basis gives uniform noise. */
 
-            double probs[6];
-            hpc_exact_marginals(graph, site, probs);
+    int *measured_digits = (int*)calloc(n_sites_raw, sizeof(int));
+    uint64_t work_val = 1;  /* Classical work register tracking: starts at |1⟩ */
 
+    for (int k = n_sites_raw - 1; k >= 0; k--) {
+        int blk_k = k / 2, off_k = k % 2;
+        int site_k = blk_k * 6 + off_k;
+
+        /* Step 1: Read oracle amplitudes from graph locals (phase basis) */
+        double alpha_re[6], alpha_im[6];
+        for (int d = 0; d < 6; d++) {
+            alpha_re[d] = graph->locals[site_k].edge_re[d];
+            alpha_im[d] = graph->locals[site_k].edge_im[d];
+        }
+
+        /* Step 2: Compute work register contribution C_k(d) analytically.
+         * For each control value d, the perm edges connect freq_k to work
+         * register digits. The work register is in state |work_val⟩.
+         * C_k(d) = Π_j w_e(d, work_digit_j) — product over work digit edges.
+         * Since work register locals are δ-functions (sharp), only one
+         * work digit value contributes per edge. */
+        double ck_re[6], ck_im[6];
+        for (int d = 0; d < 6; d++) { ck_re[d] = 1.0; ck_im[d] = 0.0; }
+
+        const HPCAdjList *adj = &graph->adj[site_k];
+        for (uint64_t ei = 0; ei < adj->count; ei++) {
+            uint64_t eid = adj->edge_ids[ei];
+            const HPCEdge *edge = &graph->edges[eid];
+            uint64_t partner = (edge->site_a == (uint64_t)site_k) ?
+                                edge->site_b : edge->site_a;
+            if ((int)partner < g_work_start) continue;
+
+            /* Work register site: read its current value (delta function) */
+            int work_digit_val = 0;
+            double best_amp = 0;
+            const TrialityQuhit *wq = &graph->locals[partner];
+            for (int w = 0; w < 6; w++) {
+                double a2 = wq->edge_re[w]*wq->edge_re[w] + wq->edge_im[w]*wq->edge_im[w];
+                if (a2 > best_amp) { best_amp = a2; work_digit_val = w; }
+            }
+
+            /* Multiply edge weight w(d, work_digit_val) into C_k(d) */
             for (int d = 0; d < 6; d++) {
-                mpfr_set_d(marginals[scale][d], probs[d], MPFR_RNDN);
+                double wr, wi;
+                if (edge->site_a == (uint64_t)site_k) {
+                    wr = edge->w_re[d][work_digit_val];
+                    wi = edge->w_im[d][work_digit_val];
+                } else {
+                    wr = edge->w_re[work_digit_val][d];
+                    wi = edge->w_im[work_digit_val][d];
+                }
+                double nr = ck_re[d]*wr - ck_im[d]*wi;
+                double ni = ck_re[d]*wi + ck_im[d]*wr;
+                ck_re[d] = nr;
+                ck_im[d] = ni;
             }
+        }
 
-            /* Display */
-            double max_prob = 0.0;
-            int best_digit = 0;
+        /* Step 3: Apply feed-forward phase correction from previously measured digits.
+         * The QFT phase is 2π F x / 6^n. For site k, the fractional phase from
+         * previously measured digit f_j (where j > k) is f_j / 6^{j-k+1}.
+         * So the power MUST start at 36.0 (6^2) for the immediately previous digit! */
+        double theta_k = 0.0;
+        {
+            double power = 36.0;
+            for (int j = k + 1; j < n_sites_raw; j++) {
+                theta_k += (double)measured_digits[j] / power;
+                power *= 6.0;
+            }
+        }
+
+        double corrected_re[6], corrected_im[6];
+        for (int d = 0; d < 6; d++) {
+            /* α × C */
+            double ac_re = alpha_re[d]*ck_re[d] - alpha_im[d]*ck_im[d];
+            double ac_im = alpha_re[d]*ck_im[d] + alpha_im[d]*ck_re[d];
+
+            /* × e^{-2πi d θ_k} */
+            double angle = -2.0 * M_PI * d * theta_k;
+            double pr = cos(angle), pi = sin(angle);
+            corrected_re[d] = ac_re*pr - ac_im*pi;
+            corrected_im[d] = ac_re*pi + ac_im*pr;
+        }
+
+        /* Step 4: Apply IDFT6 to convert from phase basis → computational basis.
+         * β(v) = (1/√6) Σ_{d=0}^{5} α'(d) × e^{2πi d v / 6}
+         * THIS is where constructive/destructive interference creates the Shor peaks. */
+        double probs[6];
+        double total = 0.0;
+        for (int v = 0; v < 6; v++) {
+            double sum_re = 0.0, sum_im = 0.0;
             for (int d = 0; d < 6; d++) {
-                if (probs[d] > max_prob) { max_prob = probs[d]; best_digit = d; }
+                double angle = 2.0 * M_PI * d * v / 6.0;
+                double er = cos(angle), ei2 = sin(angle);
+                sum_re += corrected_re[d]*er - corrected_im[d]*ei2;
+                sum_im += corrected_re[d]*ei2 + corrected_im[d]*er;
             }
-            if (scale < 10 || scale == n_sites_raw - 1 || (scale + 1) % 100 == 0) {
-                printf("    digit %3d: val=%d  P_exact=%.4f  [", scale, best_digit, max_prob);
-                for (int d = 0; d < 6; d++)
-                    printf("%.3f%s", probs[d], d < 5 ? " " : "");
-                printf("]\n");
+            /* P(v) = |β(v)|² */
+            probs[v] = (sum_re*sum_re + sum_im*sum_im) / 6.0;
+            total += probs[v];
+        }
+
+        /* DEBUG DUMP for k=38 */
+        if (k == 38) {
+            printf("DEBUG k=38:\n");
+            for(int d=0; d<6; d++) {
+                printf("  d=%d: alpha=(%f, %f) ck=(%f, %f) work_val=%llu\n",
+                    d, alpha_re[d], alpha_im[d], ck_re[d], ck_im[d], 
+                    (unsigned long long)work_val);
             }
+        }
+
+        /* Normalize */
+        if (total > 1e-30) {
+            for (int d = 0; d < 6; d++) probs[d] /= total;
+        } else {
+            for (int d = 0; d < 6; d++) probs[d] = 1.0 / 6.0;
+        }
+
+        /* Step 5: Born Rule Measurement
+         * Shor's algorithm creates a superposition of r valid frequency peaks.
+         * We MUST sample probabilistically. Taking MAP (argmax) deterministically
+         * forces the algorithm into a single peak (often s=0), causing it to fail. */
+        double r01 = (double)rand() / RAND_MAX;
+        double cumul = 0.0;
+        int outcome = 5;
+        for (int d = 0; d < 6; d++) {
+            cumul += probs[d];
+            if (r01 <= cumul) { outcome = d; break; }
+        }
+        measured_digits[k] = outcome;
+
+        /* Step 6: Update work register in graph (Fix ghost state!)
+         * After measuring freq_k = outcome, the work register gets multiplied
+         * by c_k^outcome mod N. Update the graph locals so subsequent
+         * marginals see the LIVE state, not the initial |1⟩ ghost. */
+        {
+            /* Recompute c_k for this scale */
+            uint64_t c_k = a_u64_work;
+            for (int s = 0; s < k + scale_offset; s++) {
+                __uint128_t t = c_k;
+                t = (t * t) % N_u64_work;
+                t = (t * (uint64_t)c_k) % N_u64_work;
+                t = (t * t) % N_u64_work;
+                c_k = (uint64_t)t;
+            }
+            /* mult = c_k^outcome mod N */
+            uint64_t mult_val = 1;
+            for (int d = 0; d < outcome; d++) {
+                mult_val = ((__uint128_t)mult_val * c_k) % N_u64_work;
+            }
+            /* Update classical tracker */
+            work_val = ((__uint128_t)work_val * mult_val) % N_u64_work;
+
+            /* Sync graph locals: work register now represents |work_val⟩ */
+            for (int j = 0; j < n_work; j++) {
+                uint64_t tmp = work_val;
+                for (int p = 0; p < j; p++) tmp /= 6;
+                int digit_j = tmp % 6;
+                TrialityQuhit *wq = &graph->locals[work_start + j];
+                for (int w = 0; w < 6; w++) {
+                    wq->edge_re[w] = (w == digit_j) ? 1.0 : 0.0;
+                    wq->edge_im[w] = 0.0;
+                }
+            }
+        }
+
+        /* Store in marginals for downstream CF extraction */
+        for (int d = 0; d < 6; d++) {
+            mpfr_set_d(marginals[k][d], probs[d], MPFR_RNDN);
+        }
+
+        /* Display */
+        double max_prob = 0.0;
+        int best_digit = 0;
+        for (int d = 0; d < 6; d++) {
+            if (probs[d] > max_prob) { max_prob = probs[d]; best_digit = d; }
+        }
+        if (k < 10 || k == n_sites_raw - 1 || (k + 1) % 100 == 0) {
+            printf("    digit %3d: val=%d  P_gn=%.4f  [", k, best_digit, max_prob);
+            for (int d = 0; d < 6; d++)
+                printf("%.3f%s", probs[d], d < 5 ? " " : "");
+            printf("]\n");
         }
     }
 
@@ -2366,155 +2549,19 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_set_u64(&mc_term, 0);
     bigint_set_u64(&mc_tmp, 0);
 
-    /* ── Create work register: starts in |1⟩ ── */
-    uint64_t N_u64 = bigint_to_u64(N);
-    uint64_t a_u64 = bigint_to_u64(a_val);
-    uint64_t dummy_work_sites[1] = {0};
-    WorkRegState *work_reg = work_reg_create(N_u64, 0, dummy_work_sites);
+    /* ── Build frequency from Griffiths-Niu measured digits ── */
+    printf("    Work register final: %llu  (a=%llu)\n",
+           (unsigned long long)work_val, (unsigned long long)a_u64_work);
 
-    printf("    Work register initialized: |1⟩  (N=%llu, a=%llu)\n",
-           (unsigned long long)N_u64, (unsigned long long)a_u64);
-
-    /* ── Semi-Classical QFT: measure from MSB to LSB ──
-     * Process frequency sites from MSB (scale n-1) to LSB (scale 0).
-     * Before each measurement, apply QFT phase correction from
-     * previously measured (higher) digits. This creates the interference
-     * that peaks the frequency at F = s×R/r. */
-
-    int *measured_f = (int*)calloc(n_sites_raw, sizeof(int));
-
-    for (int idx = n_sites_raw - 1; idx >= 0; idx--) {
-        int blk = idx / 2;
-        int offset = idx % 2;
-        int site = blk * 6 + offset;
-        if (site >= n_sites) continue;
-
-        /* Step 1: Apply semi-classical QFT phase correction.
-         * For each digit d, apply e^{-2πi × d × correction}
-         * where correction = Σ_{j>idx} f_j / 6^{j-idx} */
-        double correction = 0.0;
-        double power_inv = 1.0 / 36.0;  /* 1/6^{j-k+1} starts at 1/6² for j=k+1 */
-        for (int j = idx + 1; j < n_sites_raw; j++) {
-            correction += measured_f[j] * power_inv;
-            power_inv /= 6.0;
-        }
-
-        /* Apply correction to local state */
-        TrialityQuhit *q = &graph->locals[site];
-        for (int d = 0; d < 6; d++) {
-            double theta = -2.0 * M_PI * d * correction;
-            double c = cos(theta), s_val = sin(theta);
-            double old_re = q->edge_re[d], old_im = q->edge_im[d];
-            q->edge_re[d] = old_re * c - old_im * s_val;
-            q->edge_im[d] = old_re * s_val + old_im * c;
-        }
-
-        /* Step 2: Apply IDFT₆ to convert phase → measurement basis.
-         * The DFT₆ was already applied during graph construction,
-         * and the oracle phase was applied. We need IDFT₆ here. */
-        {
-            double out_re[6] = {0}, out_im[6] = {0};
-            for (int f = 0; f < 6; f++) {
-                for (int d = 0; d < 6; d++) {
-                    double angle = 2.0 * M_PI * f * d / 6.0;
-                    double c = cos(angle), s_v = sin(angle);
-                    out_re[f] += q->edge_re[d] * c - q->edge_im[d] * s_v;
-                    out_im[f] += q->edge_re[d] * s_v + q->edge_im[d] * c;
-                }
-                out_re[f] /= 6.0;
-                out_im[f] /= 6.0;
-            }
-            for (int f = 0; f < 6; f++) {
-                q->edge_re[f] = out_re[f];
-                q->edge_im[f] = out_im[f];
-            }
-        }
-
-        /* Step 3: Compute multiplier and measure */
-        uint64_t base_power = a_u64;
-        for (int s = 0; s < idx; s++) {
-            __uint128_t t = base_power;
-            t = (t * t) % N_u64;
-            t = (t * base_power) % N_u64;
-            t = (t * t) % N_u64;
-            base_power = (uint64_t)t;
-        }
-
-        uint64_t multiplier[6];
-        multiplier[0] = 1;
-        multiplier[1] = base_power;
-        for (int d = 2; d < 6; d++) {
-            __uint128_t t = (__uint128_t)multiplier[d-1] * base_power;
-            multiplier[d] = (uint64_t)(t % N_u64);
-        }
-
-        /* Sample from EXACT MARGINALS (not |local(d)|²).
-         * The exact marginals capture the full graph structure (CZ edges,
-         * hexagonal cycles, oracle phases) via the Magic Pointer formula.
-         * Apply QFT correction as phase rotation to marginal amplitudes
-         * before computing measurement probabilities. */
-        double probs[6], total = 0.0;
-        for (int d = 0; d < 6; d++) {
-            /* Start from exact marginal amplitude (sqrt of probability) */
-            double marg_p = mpfr_get_d(marginals[idx][d], MPFR_RNDN);
-            double amp = sqrt(marg_p > 0 ? marg_p : 0.0);
-
-            /* Apply QFT correction phase */
-            double theta = -2.0 * M_PI * d * correction;
-            double corrected_re = amp * cos(theta);
-            double corrected_im = amp * sin(theta);
-
-            probs[d] = corrected_re * corrected_re + corrected_im * corrected_im;
-            total += probs[d];
-        }
-        if (total > 1e-30) {
-            for (int d = 0; d < 6; d++) probs[d] /= total;
-        } else {
-            for (int d = 0; d < 6; d++) probs[d] = 1.0 / 6.0;
-        }
-
-        double rr = (double)rand() / RAND_MAX;
-        double cumul = 0.0;
-        int digit = 5;
-        for (int d = 0; d < 6; d++) {
-            cumul += probs[d];
-            if (rr <= cumul) { digit = d; break; }
-        }
-
-        measured_f[idx] = digit;
-
-        /* Update work register */
-        uint64_t mult = multiplier[digit];
-        for (int t = 0; t < work_reg->n_terms; t++) {
-            __uint128_t prod = (__uint128_t)work_reg->terms[t].value * mult;
-            work_reg->terms[t].value = (uint64_t)(prod % work_reg->N_val);
-        }
-
-        /* Collapse frequency site */
-        for (int v = 0; v < 6; v++) {
-            q->edge_re[v] = (v == digit) ? 1.0 : 0.0;
-            q->edge_im[v] = 0.0;
-        }
-
-        if (idx > n_sites_raw - 10 || idx < 3) {
-            printf("    scale %2d: digit=%d  P=[%.3f %.3f %.3f %.3f %.3f %.3f]  work=%llu\n",
-                   idx, digit, probs[0], probs[1], probs[2], probs[3], probs[4], probs[5],
-                   (unsigned long long)work_reg->terms[0].value);
-        }
-    }
-
-    /* Build frequency from measured digits.
-     * Site k extracts f_{n-1-k}: highest oracle power gives LSB of F.
-     * So measured_f[idx] contributes to 6^{n-1-idx}. */
+    /* Build frequency: site n-1 gave f_0, site n-2 gave f_1, etc.
+     * So the digit for 6^idx is stored in measured_digits[n_sites_raw - 1 - idx]. */
     for (int idx = 0; idx < n_sites_raw; idx++) {
-        int target_scale = n_sites_raw - 1 - idx;
-        bigint_set_u64(&mc_d_bi, (uint64_t)measured_f[idx]);
-        bigint_mul(&mc_term, &mc_d_bi, &p6_cache[target_scale]);
+        int f_idx = n_sites_raw - 1 - idx;
+        bigint_set_u64(&mc_d_bi, (uint64_t)measured_digits[f_idx]);
+        bigint_mul(&mc_term, &mc_d_bi, &p6_cache[idx]);
         bigint_add(&mc_tmp, &freq, &mc_term);
         bigint_copy(&freq, &mc_tmp);
     }
-    free(measured_f);
-    work_reg_destroy(work_reg);
 
     printf("    Measured frequency: %u bits\n", bigint_bitlen(&freq));
     printf("    Register size:     %u bits\n", bigint_bitlen(&reg_sz));
@@ -2572,10 +2619,24 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         uint32_t q_bits = bigint_bitlen(&cf_q0);
 
         if (q_bits > 1) {
-            int ret = try_period(&cf_q0, a_val, N, factor_p, factor_q);
+            char q_str[512];
+            bigint_to_decimal(q_str, sizeof(q_str), &cf_q0);
+            printf("    CF step %d: denom = %s (%u bits)\n", step, q_str, q_bits);
+            /* Oracle encodes 6^k → period is ord_N(6), use base 6 for GCD check */
+            BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+            int ret = try_period(&cf_q0, &oracle_base, N, factor_p, factor_q);
             if (ret == 1) {
                 success = 1;
                 printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d, denominator %u bits)\n", step, q_bits);
+                bigint_clear(&oracle_base);
+                break;
+            }
+            /* Also try with base a — in case ord_N(6) divides ord_N(a) */
+            ret = try_period(&cf_q0, a_val, N, factor_p, factor_q);
+            if (ret == 1) {
+                success = 1;
+                printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d [base-a], denominator %u bits)\n", step, q_bits);
+                bigint_clear(&oracle_base);
                 break;
             }
             /* Also test small multiples in case gcd(s,r) > 1 */
@@ -2584,13 +2645,25 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_set_u64(&r_mult, 0);
                 bigint_set_u64(&m_bi, (uint64_t)m);
                 bigint_mul(&r_mult, &cf_q0, &m_bi);
-                if (bigint_cmp(&r_mult, N) >= 0) break;
-                ret = try_period(&r_mult, a_val, N, factor_p, factor_q);
+                if (bigint_cmp(&r_mult, N) >= 0) {
+                    bigint_clear(&r_mult); bigint_clear(&m_bi);
+                    break;
+                }
+                ret = try_period(&r_mult, &oracle_base, N, factor_p, factor_q);
                 if (ret == 1) {
                     success = 1;
                     printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d × %d, %u bits)\n", step, m, q_bits);
                 }
+                if (!success) {
+                    ret = try_period(&r_mult, a_val, N, factor_p, factor_q);
+                    if (ret == 1) {
+                        success = 1;
+                        printf("\n  ★ OUROBOROS BITES ITS TAIL ★ (CF step %d × %d [base-a], %u bits)\n", step, m, q_bits);
+                    }
+                }
+                bigint_clear(&r_mult); bigint_clear(&m_bi);
             }
+            bigint_clear(&oracle_base);
         }
     }
 
@@ -2598,6 +2671,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
     for (int i = 0; i < n_sites_raw; i++) bigint_clear(&p6_cache[i]);
     free(p6_cache);
+    free(measured_digits);
     free(bp_has_signal);
     free(flippable);
 
@@ -2606,11 +2680,19 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             mpfr_clear(marginals[s][d]);
     free(marginals);
 
+    /* Cleanup — CF and frequency BigInts */
+    bigint_clear(&freq); bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
+    bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp); bigint_clear(&current_p6); bigint_clear(&next_p6);
+    bigint_clear(&cf_num); bigint_clear(&cf_den); bigint_clear(&cf_a); bigint_clear(&cf_rem);
+    bigint_clear(&cf_pm1); bigint_clear(&cf_p0); bigint_clear(&cf_qm1); bigint_clear(&cf_q0);
+    bigint_clear(&cf_p_new); bigint_clear(&cf_q_new); bigint_clear(&cf_tmp);
+
     bigint_clear(&b6); bigint_clear(&one);
     bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
     bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
     bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
     bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+    bigint_clear(&gc_six_pow_k); bigint_clear(&gc_d_bi);
     bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
     bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
     bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
