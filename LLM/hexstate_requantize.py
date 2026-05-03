@@ -240,7 +240,7 @@ def quantize_tensor_q2k_hpc(f32_data, opt_mode=2, importance=None):
         ctypes.byref(error),
         ctypes.c_int(opt_mode),
         imat_ptr,
-        ctypes.c_int(0),  # not verbose
+        ctypes.c_int(1),  # verbose
     )
 
     return output.tobytes(), n_blocks
@@ -1025,7 +1025,7 @@ def main():
                             output_buf.ctypes.data_as(ctypes.c_void_p),
                             ctypes.byref(error),
                             imat_ptr,
-                            ctypes.c_int(0),  # verbose
+                            ctypes.c_int(1),  # verbose
                         )
                         fout.write(output_buf.tobytes())
                         print(f"\n  [Q4_0·HPC] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e}")
