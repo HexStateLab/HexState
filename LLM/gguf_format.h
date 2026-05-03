@@ -68,6 +68,9 @@ typedef enum {
     GGML_TYPE_F64     = 28,
     GGML_TYPE_IQ1_M   = 29,
     GGML_TYPE_BF16    = 30,
+    GGML_TYPE_TQ1_0   = 34,
+    GGML_TYPE_TQ2_0   = 35,
+    GGML_TYPE_Q1_0    = 41,
     GGML_TYPE_COUNT
 } GGMLType;
 
@@ -90,6 +93,26 @@ typedef enum {
     GGUF_TYPE_INT64   = 11,
     GGUF_TYPE_FLOAT64 = 12
 } GGUFValueType;
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Q1_0 BLOCK STRUCTURE (1-bit sign quantization)
+ *
+ * 128 weights per block with 1-bit (sign) quantization.
+ * Layout: 1 fp16 scale + 16 bytes packed sign bits (1 weight per bit)
+ * Total: 18 bytes per block = 1.125 bits per weight.
+ *
+ * Dequantization: w_i = (bit_i ? +d : -d)
+ *   where bit_i ∈ {0, 1}, d = mean(|weights|)
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define QK1_0 128  /* Block size for Q1_0 */
+
+typedef struct {
+    uint16_t d;              /* fp16 scale (delta = mean absolute value)    */
+    uint8_t  qs[QK1_0 / 8]; /* 16 bytes: 128 sign bits (1 = positive)     */
+} BlockQ1_0;
+
+/* sizeof(BlockQ1_0) = 2 + 16 = 18 bytes for 128 weights = 1.125 BPW */
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Q8_0 BLOCK STRUCTURE
@@ -668,6 +691,7 @@ static inline int64_t ggml_type_block_size(GGMLType type)
     switch (type) {
         case GGML_TYPE_F32:   return 1;
         case GGML_TYPE_F16:   return 1;
+        case GGML_TYPE_Q1_0:  return QK1_0;
         case GGML_TYPE_Q8_0:  return QK8_0;
         case GGML_TYPE_Q2_K:  return QK_K;
         case GGML_TYPE_Q4_0:  return 32;
@@ -687,6 +711,7 @@ static inline int64_t ggml_type_bytes_per_block(GGMLType type)
     switch (type) {
         case GGML_TYPE_F32:   return 4;
         case GGML_TYPE_F16:   return 2;
+        case GGML_TYPE_Q1_0:  return sizeof(BlockQ1_0);  /* 18: 2 + 16 */
         case GGML_TYPE_Q8_0:  return sizeof(BlockQ8_0);  /* 34 */
         case GGML_TYPE_Q2_K:  return sizeof(BlockQ2K);   /* 84 */
         case GGML_TYPE_Q4_0:  return 18;   /* 2 + 16 */
@@ -702,6 +727,73 @@ static inline int64_t ggml_type_size(GGMLType type, int64_t n_elements)
     int64_t bytes_per_block = ggml_type_bytes_per_block(type);
     int64_t n_blocks = (n_elements + block_size - 1) / block_size;
     return n_blocks * bytes_per_block;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Q1_0 QUANTIZATION — Reference Implementation
+ *
+ * For each block of 128 floats:
+ *   1. Compute d = mean(|x_i|)
+ *   2. Store sign bit per weight: 1 = positive, 0 = negative
+ *   3. Dequant: w_i = (bit ? +d : -d)
+ *
+ * The HExState Shor-optimized pipeline replaces step 1 with
+ * WLS-guided scale search and uses the D₆ vesica gate to select
+ * which signs to flip for computation-aligned error minimization.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static inline void gguf_quantize_q1_0_reference(const float *x,
+                                                  BlockQ1_0 *y,
+                                                  int64_t n_elements)
+{
+    int64_t n_blocks = n_elements / QK1_0;
+
+    for (int64_t i = 0; i < n_blocks; i++) {
+        float sum_abs = 0.0f;
+        for (int j = 0; j < QK1_0; j++) {
+            sum_abs += fabsf(x[i * QK1_0 + j]);
+        }
+        float d = sum_abs / (float)QK1_0;
+        y[i].d = gguf_fp32_to_fp16(d);
+
+        /* Clear all bits first */
+        for (int j = 0; j < QK1_0 / 8; j++) {
+            y[i].qs[j] = 0;
+        }
+
+        /* Store sign: bit=1 means positive, bit=0 means negative */
+        for (int j = 0; j < QK1_0; j++) {
+            if (x[i * QK1_0 + j] >= 0.0f) {
+                y[i].qs[j / 8] |= (1 << (j % 8));
+            }
+        }
+    }
+}
+
+/* Dequantize a single Q1_0 block back to float (for error measurement) */
+static inline void gguf_dequantize_q1_0_block(const BlockQ1_0 *block,
+                                                float *out)
+{
+    float d = gguf_fp16_to_fp32(block->d);
+    float neg_d = -d;
+    for (int j = 0; j < QK1_0; j++) {
+        uint8_t bit = (block->qs[j / 8] >> (j % 8)) & 1;
+        out[j] = bit ? d : neg_d;
+    }
+}
+
+/* Compute L2 reconstruction error for a Q1_0 quantized block */
+static inline float gguf_q1_0_block_error(const float *original,
+                                            const BlockQ1_0 *block)
+{
+    float deq[QK1_0];
+    gguf_dequantize_q1_0_block(block, deq);
+    float err = 0.0f;
+    for (int j = 0; j < QK1_0; j++) {
+        float diff = original[j] - deq[j];
+        err += diff * diff;
+    }
+    return err;
 }
 
 #endif /* GGUF_FORMAT_H */
