@@ -904,8 +904,12 @@ def main():
         else:
             for key, vtype, raw_value in kv_pairs:
                 if key == 'general.file_type' and vtype == 4:  # UINT32
-                    # file_type=10 means Q2_K in llama.cpp
-                    updated_kv.append((key, vtype, struct.pack('<I', 10)))
+                    # GGML_FTYPE: Q2_K=10, Q1_0=27
+                    if q1full or q1all:
+                        ftype = 27  # GGML_FTYPE_MOSTLY_Q1_0
+                    else:
+                        ftype = 10  # GGML_FTYPE_MOSTLY_Q2_K
+                    updated_kv.append((key, vtype, struct.pack('<I', ftype)))
                 elif key == 'general.quantization_version' and vtype == 4:
                     updated_kv.append((key, vtype, struct.pack('<I', 2)))
                 elif key == 'tokenizer.ggml.token_type' and vtype == 9:
