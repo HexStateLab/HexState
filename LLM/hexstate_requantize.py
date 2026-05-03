@@ -82,6 +82,18 @@ def _load_hexstate_lib():
                 ctypes.c_int,                     # verbose
             ]
 
+        # Q1_0 Shor quantizer (for expert/all tensors)
+        if hasattr(lib, 'hexstate_quantize_tensor_q1_0_shor'):
+            lib.hexstate_quantize_tensor_q1_0_shor.restype = None
+            lib.hexstate_quantize_tensor_q1_0_shor.argtypes = [
+                ctypes.POINTER(ctypes.c_float),  # weights
+                ctypes.c_int64,                   # n_elements
+                ctypes.c_void_p,                  # output
+                ctypes.POINTER(ctypes.c_float),   # out_error
+                ctypes.POINTER(ctypes.c_float),   # imat_importance (can be NULL)
+                ctypes.c_int,                     # verbose
+            ]
+
         lib.hexstate_init()
         _HEXSTATE_LIB = lib
         return lib
@@ -257,23 +269,26 @@ GGML_TYPE_F16   = 1
 GGML_TYPE_Q4_0  = 2
 GGML_TYPE_Q2_K  = 10
 GGML_TYPE_BF16  = 30
+GGML_TYPE_Q1_0  = 41
+
+QK1_0 = 128  # Q1_0 block size
 
 TYPE_NAME = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
     8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-    13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 30: "BF16",
+    13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 30: "BF16", 41: "Q1_0",
 }
 
 # Block sizes and byte sizes for each type
 TYPE_BLOCK_SIZE = {
     0: 1, 1: 1, 2: 32, 3: 32, 6: 32, 7: 32,
     8: 32, 9: 32, 10: 256, 11: 256, 12: 256,
-    13: 256, 14: 256, 15: 256, 30: 1,
+    13: 256, 14: 256, 15: 256, 30: 1, 41: 128,
 }
 TYPE_BLOCK_BYTES = {
     0: 4, 1: 2, 2: 18, 3: 20, 6: 20, 7: 22,
     8: 34, 9: 36, 10: 84, 11: 110, 12: 144,
-    13: 176, 14: 210, 15: 292, 30: 2,
+    13: 176, 14: 210, 15: 292, 30: 2, 41: 18,
 }
 
 
@@ -600,6 +615,20 @@ def is_attention_tensor(name):
     return False
 
 
+def is_expert_tensor(name):
+    """Detect MoE expert FFN tensors (gate/up/down inside expert blocks).
+    These are the largest tensors by total volume but only a fraction
+    fire per token, making them ideal Q1_0 candidates."""
+    expert_patterns = [
+        'ffn_gate_exps.weight', 'ffn_up_exps.weight', 'ffn_down_exps.weight',
+        'experts.', '.expert.',
+    ]
+    for pat in expert_patterns:
+        if pat in name:
+            return True
+    return False
+
+
 def should_quantize(name, n_dims, dims, tied_embeddings=False):
     """Should this tensor be quantized to Q2_K?
 
@@ -658,6 +687,9 @@ def main():
     keep_metadata = '--keep-metadata' in sys.argv
     quantize_none = '--quantize-none' in sys.argv
     q2all = '--q2all' in sys.argv
+    q1_experts = '--q1-experts' in sys.argv
+    q1all = '--q1all' in sys.argv
+    q1full = '--q1full' in sys.argv
 
     # Check for imatrix
     imatrix_data = None
@@ -758,6 +790,7 @@ def main():
         quant_plan = []
         total_quant = 0
         total_attn = 0
+        total_q1 = 0
         total_keep = 0
         for ti in tensor_infos:
             if quantize_none:
@@ -766,6 +799,15 @@ def main():
                 if tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
                     will_quant = 'ATTN_Q4'  # Promote tied embedding to Q4_0
                     total_attn += 1
+                elif q1full:
+                    will_quant = 'Q1_0'  # --q1full: everything to Q1_0 (like --q2all)
+                    total_q1 += 1
+                elif q1all and not is_attention_tensor(ti['name']):
+                    will_quant = 'Q1_0'  # --q1all: all non-attention to Q1_0
+                    total_q1 += 1
+                elif q1_experts and is_expert_tensor(ti['name']):
+                    will_quant = 'Q1_0'  # --q1-experts: experts to Q1_0
+                    total_q1 += 1
                 elif q2all:
                     will_quant = True  # --q2all: everything to Q2_K
                     total_quant += 1
@@ -782,6 +824,8 @@ def main():
 
         print(f"  Tensors to quantize (Q2_K):     {total_quant}")
         print(f"  Tensors to promote (Q4_0·HPC):  {total_attn}")
+        if total_q1 > 0:
+            print(f"  Tensors to compress (Q1_0·Shor): {total_q1}")
         print(f"  Tensors to keep as-is:          {total_keep}")
         print()
 
@@ -794,7 +838,26 @@ def main():
                 out_dims = list(ti['dims'])
                 dim0 = out_dims[0] if ti['n_dims'] >= 2 else ti['n_elements']
 
-                if quant_plan[i] == 'ATTN_Q4':
+                if quant_plan[i] == 'Q1_0':
+                    # Q1_0 Shor (1.125 bpw, block_size=128)
+                    if ti['n_elements'] % QK1_0 == 0:
+                        out_type = GGML_TYPE_Q1_0
+                        n_blocks = ti['n_elements'] // QK1_0
+                        out_size = n_blocks * 18
+                        print(f"  [Q1_0·Shor] {ti['name']} ({ti['n_elements']} elements)")
+                    elif dim0 % QK_K == 0:
+                        # Fallback to Q2_K if not Q1_0-alignable
+                        out_type = GGML_TYPE_Q2_K
+                        n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
+                        out_size = n_blocks * 84
+                        quant_plan[i] = True  # revert to Q2_K
+                        print(f"  [Q2_K fallback] {ti['name']} (not Q1_0-aligned)")
+                    else:
+                        out_type = ti['type']
+                        out_size = ti['data_size']
+                        quant_plan[i] = False
+                        print(f"  Keep: {ti['name']} (not alignable)")
+                elif quant_plan[i] == 'ATTN_Q4':
                     # Attention tensor → Q4_0 HPC (4.5 bpw)
                     out_type = GGML_TYPE_Q4_0
                     n_blocks = (ti['n_elements'] + 31) // 32
@@ -980,7 +1043,74 @@ def main():
                 fin.seek(abs_offset)
                 raw_data = fin.read(ti['data_size'])
 
-                if quant_plan[i] in ('Q4_0', 'ATTN_Q4'):
+                if quant_plan[i] == 'Q1_0':
+                    # ── Q1_0 Shor quantization (1.125 bpw) ──
+                    if ti['type'] == GGML_TYPE_BF16:
+                        f32 = bf16_to_f32(raw_data, ti['n_elements'])
+                    elif ti['type'] == GGML_TYPE_F16:
+                        f32 = f16_to_f32(raw_data, ti['n_elements'])
+                    elif ti['type'] == GGML_TYPE_F32:
+                        f32 = np.frombuffer(raw_data, dtype=np.float32).copy()
+                    else:
+                        fout.write(raw_data)
+                        pad = align_offset(fout.tell()) - fout.tell()
+                        if pad > 0: fout.write(b'\x00' * pad)
+                        continue
+
+                    # Pad to 128-element boundary
+                    n_el = len(f32)
+                    pad_to = ((n_el + QK1_0 - 1) // QK1_0) * QK1_0
+                    if pad_to > n_el:
+                        f32 = np.concatenate([f32, np.zeros(pad_to - n_el, dtype=np.float32)])
+                        n_el = pad_to
+
+                    n_blocks_q1 = n_el // QK1_0
+
+                    if use_hpc and hasattr(_HEXSTATE_LIB, 'hexstate_quantize_tensor_q1_0_shor'):
+                        output_buf = np.zeros(n_blocks_q1 * 18, dtype=np.uint8)
+                        error = ctypes.c_float(0.0)
+                        f32_c = np.ascontiguousarray(f32, dtype=np.float32)
+
+                        # Look up imatrix importance
+                        imat_ptr = None
+                        if imatrix_data and ti['name'] in imatrix_data:
+                            iw = imatrix_data[ti['name']]
+                            n_cols = iw.shape[0]
+                            n_rows = n_el // n_cols if n_cols > 0 else 1
+                            imat_full = np.tile(iw, n_rows)[:n_el].astype(np.float32)
+                            imat_c = np.ascontiguousarray(imat_full)
+                            imat_ptr = imat_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+                        _HEXSTATE_LIB.hexstate_quantize_tensor_q1_0_shor(
+                            f32_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                            ctypes.c_int64(n_el),
+                            output_buf.ctypes.data_as(ctypes.c_void_p),
+                            ctypes.byref(error),
+                            imat_ptr,
+                            ctypes.c_int(1),
+                        )
+                        fout.write(output_buf.tobytes())
+                        print(f"\n  [Q1_0·Shor] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e}")
+                    else:
+                        # Python fallback: naive sign quantization
+                        out_buf = bytearray(n_blocks_q1 * 18)
+                        for b in range(n_blocks_q1):
+                            bw = f32[b * QK1_0:(b + 1) * QK1_0]
+                            d = float(np.mean(np.abs(bw)))
+                            d_fp16 = np.float16(d)
+                            off = b * 18
+                            import struct as st2
+                            st2.pack_into('<e', out_buf, off, float(d_fp16))
+                            for j in range(QK1_0):
+                                if bw[j] >= 0.0:
+                                    out_buf[off + 2 + j // 8] |= (1 << (j % 8))
+                        fout.write(bytes(out_buf))
+                        print(f"\n  [Q1_0·Py] {ti['name']}")
+
+                    quant_count += 1
+                    total_quant_bytes += n_blocks_q1 * 18
+
+                elif quant_plan[i] in ('Q4_0', 'ATTN_Q4'):
                     # ── Q4_0 quantization (fallback or attention HPC) ──
                     if ti['type'] == GGML_TYPE_BF16:
                         f32 = bf16_to_f32(raw_data, ti['n_elements'])
