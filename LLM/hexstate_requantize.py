@@ -799,6 +799,9 @@ def main():
                 if tied_embeddings and ti['name'] in ('token_embd.weight', 'output.weight'):
                     will_quant = 'ATTN_Q4'  # Promote tied embedding to Q4_0
                     total_attn += 1
+                elif ti['name'] in ('token_embd.weight', 'output.weight') and (q1full or q1all):
+                    will_quant = 'ATTN_Q4'  # Embeddings/LM-head need precision, Q1 would destroy logits
+                    total_attn += 1
                 elif q1full:
                     will_quant = 'Q1_0'  # --q1full: everything to Q1_0 (like --q2all)
                     total_q1 += 1
@@ -840,23 +843,31 @@ def main():
 
                 if quant_plan[i] == 'Q1_0':
                     # Q1_0 Shor (1.125 bpw, block_size=128)
-                    if ti['n_elements'] % QK1_0 == 0:
+                    # Must check dim0 (row length), not total elements — quantization is per-row
+                    if dim0 % QK1_0 == 0:
                         out_type = GGML_TYPE_Q1_0
                         n_blocks = ti['n_elements'] // QK1_0
                         out_size = n_blocks * 18
                         print(f"  [Q1_0·Shor] {ti['name']} ({ti['n_elements']} elements)")
                     elif dim0 % QK_K == 0:
-                        # Fallback to Q2_K if not Q1_0-alignable
+                        # Fallback to Q2_K if not Q1_0-alignable but Q2_K-alignable
                         out_type = GGML_TYPE_Q2_K
                         n_blocks = (ti['n_elements'] + QK_K - 1) // QK_K
                         out_size = n_blocks * 84
                         quant_plan[i] = True  # revert to Q2_K
-                        print(f"  [Q2_K fallback] {ti['name']} (not Q1_0-aligned)")
+                        print(f"  [Q2_K fallback] {ti['name']} (dim0={dim0} not %128)")
+                    elif dim0 % 32 == 0:
+                        # Fallback to Q4_0 if not Q2_K-alignable
+                        out_type = GGML_TYPE_Q4_0
+                        n_blocks = ti['n_elements'] // 32
+                        out_size = n_blocks * 18
+                        quant_plan[i] = 'Q4_0'
+                        print(f"  [Q4_0 fallback] {ti['name']} (dim0={dim0})")
                     else:
                         out_type = ti['type']
                         out_size = ti['data_size']
                         quant_plan[i] = False
-                        print(f"  Keep: {ti['name']} (not alignable)")
+                        print(f"  Keep: {ti['name']} (dim0={dim0} not alignable)")
                 elif quant_plan[i] == 'ATTN_Q4':
                     # Attention tensor → Q4_0 HPC (4.5 bpw)
                     out_type = GGML_TYPE_Q4_0
@@ -1069,6 +1080,7 @@ def main():
                         n_el = pad_to
 
                     n_blocks_q1 = n_el // QK1_0
+                    expected_blocks = ti['n_elements'] // QK1_0  # must match header
 
                     if use_hpc and hasattr(_HEXSTATE_LIB, 'hexstate_quantize_tensor_q1_0_shor'):
                         output_buf = np.zeros(n_blocks_q1 * 18, dtype=np.uint8)
@@ -1093,12 +1105,13 @@ def main():
                             imat_ptr,
                             ctypes.c_int(1),
                         )
-                        fout.write(output_buf.tobytes())
+                        # Only write the blocks declared in the header (truncate padding)
+                        fout.write(output_buf.tobytes()[:expected_blocks * 18])
                         print(f"\n  [Q1_0·Shor] {ti['name']} RMSE={np.sqrt(error.value / ti['n_elements']):.6e}")
                     else:
                         # Python fallback: naive sign quantization
-                        out_buf = bytearray(n_blocks_q1 * 18)
-                        for b in range(n_blocks_q1):
+                        out_buf = bytearray(expected_blocks * 18)
+                        for b in range(expected_blocks):
                             bw = f32[b * QK1_0:(b + 1) * QK1_0]
                             d = float(np.mean(np.abs(bw)))
                             d_fp16 = np.float16(d)
@@ -1112,7 +1125,7 @@ def main():
                         print(f"\n  [Q1_0·Py] {ti['name']}")
 
                     quant_count += 1
-                    total_quant_bytes += n_blocks_q1 * 18
+                    total_quant_bytes += expected_blocks * 18
 
                 elif quant_plan[i] in ('Q4_0', 'ATTN_Q4'):
                     # ── Q4_0 quantization (fallback or attention HPC) ──
