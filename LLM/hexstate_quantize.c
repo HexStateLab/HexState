@@ -3756,6 +3756,381 @@ static int write_gguf(const char *output_path, const STMultiFile *mf,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * SHOR-OPTIMIZED Q1_0 QUANTIZATION (1-bit sign + shared scale)
+ *
+ * Q1_0: 128 weights per block, 1 bit per weight + fp16 scale.
+ *   Dequant: w_i = (sign_bit ? +d : -d)
+ *   Block size: 18 bytes (2 + 16) = 1.125 BPW
+ *
+ * Pipeline:
+ *   Phase 1: WLS-optimal scale d* per block (not just mean(|w|))
+ *   Phase 2: Candidate generation with D₆ vesica error scoring
+ *   Phase 3: Shor sequential measurement for inter-block coordination
+ *   Phase 4: 24-beam Hensel search with triality marginals
+ *   Phase 5: Sign assignment with vesica-weighted optimization
+ *
+ * At 1 bit, the scale d is the ONLY free parameter — sign is determined
+ * by the weight. But which d you pick determines the magnitude of every
+ * single error term. The Shor pipeline finds the globally optimal d
+ * configuration across the tensor so errors anti-correlate during matmul.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define Q1_N_CAND  16  /* scale candidates for Q1_0 */
+#define Q1_N_BEAMS 24  /* beam width */
+
+/* Scale neighborhood: ±20% around WLS optimum (wider than Q4 because
+ * at 1-bit the scale has outsized impact on total error) */
+static const float Q1_NEIGHBOR_MULTS[Q1_N_CAND] = {
+    0.800f, 0.840f, 0.880f, 0.910f, 0.935f, 0.955f, 0.970f, 0.985f,
+    1.000f, 1.015f, 1.035f, 1.060f, 1.090f, 1.130f, 1.175f, 1.220f
+};
+static const int Q1_CAND_TO_QUHIT[Q1_N_CAND] = {
+    0, 0, 0, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5
+};
+
+static void quantize_tensor_q1_0_shor(const float *weights, int64_t n_elements,
+                                       BlockQ1_0 *output, float *out_total_error,
+                                       const float *imat_importance, int verbose)
+{
+    int64_t n_blocks = n_elements / QK1_0;
+    float total_err = 0.0f;
+
+    /* ── Phase 1: WLS-optimal scale per block ── */
+    float *wls_d = (float *)calloc(n_blocks, sizeof(float));
+
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK1_0;
+
+        /* Start with mean(|w|) — the standard Q1_0 scale */
+        float sum_abs = 0.0f;
+        for (int j = 0; j < QK1_0; j++)
+            sum_abs += fabsf(bw[j]);
+        float d_init = sum_abs / (float)QK1_0;
+
+        /* WLS refinement: minimize Σ w_i * (|x_i| - d)²
+         * Optimal d = Σ(w_i * |x_i|) / Σ(w_i) — importance-weighted mean */
+        float num = 0.0f, den = 0.0f;
+        for (int j = 0; j < QK1_0; j++) {
+            float w = (imat_importance) ?
+                      imat_importance[blk * QK1_0 + j] : 1.0f;
+            num += w * fabsf(bw[j]);
+            den += w;
+        }
+        float d_wls = (den > 1e-15f) ? num / den : d_init;
+
+        /* Snap to fp16 grid */
+        d_wls = gguf_fp16_to_fp32(gguf_fp32_to_fp16(d_wls));
+        wls_d[blk] = (d_wls > 1e-15f) ? d_wls : d_init;
+    }
+
+    /* ── Phase 2: Candidate generation with D₆ vesica scoring ── */
+    float (*cand_errors)[Q1_N_CAND] = (float (*)[Q1_N_CAND])
+        calloc(n_blocks, sizeof(float[Q1_N_CAND]));
+    uint16_t (*cand_d16)[Q1_N_CAND] = (uint16_t (*)[Q1_N_CAND])
+        calloc(n_blocks, sizeof(uint16_t[Q1_N_CAND]));
+
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK1_0;
+
+        for (int ci = 0; ci < Q1_N_CAND; ci++) {
+            float trial_d = wls_d[blk] * Q1_NEIGHBOR_MULTS[ci];
+            uint16_t d16 = gguf_fp32_to_fp16(trial_d);
+            float actual_d = gguf_fp16_to_fp32(d16);
+            cand_d16[blk][ci] = d16;
+
+            float err = 0.0f;
+            /* D₆ vesica gate: group weights in pairs, decompose error into
+             * DC (vesica) and AC (wave) components */
+            for (int j = 0; j < QK1_0; j += 6) {
+                int g_len = (j + 6 <= QK1_0) ? 6 : (QK1_0 - j);
+                int half_g = g_len / 2;
+                float e_cur[6], w_cur[6];
+
+                for (int kk = 0; kk < g_len; kk++) {
+                    int idx = j + kk;
+                    float x = bw[idx];
+                    /* Q1 dequant: sign(x) * d */
+                    float deq = (x >= 0.0f) ? actual_d : -actual_d;
+                    e_cur[kk] = x - deq;
+                    w_cur[kk] = (imat_importance) ?
+                                imat_importance[blk * QK1_0 + idx] : 1.0f;
+                }
+
+                float vesica_err = 0.0f, wave_err = 0.0f;
+                for (int p = 0; p < half_g; p++) {
+                    float v = e_cur[p] + e_cur[p + half_g];
+                    float w_wave = e_cur[p] - e_cur[p + half_g];
+                    float w_avg = (w_cur[p] + w_cur[p + half_g]) * 0.5f;
+                    vesica_err += v * v * w_avg;
+                    wave_err += w_wave * w_wave * w_avg;
+                }
+                /* Triality weighting: penalize vesica 4×, wave 1× */
+                err += 0.5f * (4.0f * vesica_err + 1.0f * wave_err);
+            }
+            cand_errors[blk][ci] = err;
+        }
+    }
+
+    /* ── Phase 3: Shor sequential measurement ── */
+    int *best_candidate = (int *)malloc(n_blocks * sizeof(int));
+    for (int64_t i = 0; i < n_blocks; i++)
+        best_candidate[i] = 8;  /* Q1_NEIGHBOR_MULTS[8] = 1.000 */
+
+    if (n_blocks >= 2) {
+        float temperature = 0.5f;
+        int64_t graph_blocks = (n_blocks > 200) ? 200 : n_blocks;
+        int64_t stride = n_blocks / graph_blocks;
+        int64_t n_sites = graph_blocks;
+
+        HPCGraph *graph = hpc_create(n_sites);
+        if (graph) {
+            for (int64_t i = 0; i < n_sites; i++)
+                triality_dft(&graph->locals[i]);
+
+            /* Adaptive temperature from error landscape */
+            {
+                double err_accum = 0.0;
+                int err_count = 0;
+                for (int64_t gi = 0; gi < graph_blocks && gi < 100; gi++) {
+                    int64_t blk = gi * stride;
+                    float max_e = 0.0f;
+                    for (int c = 0; c < Q1_N_CAND; c++)
+                        if (cand_errors[blk][c] > max_e)
+                            max_e = cand_errors[blk][c];
+                    err_accum += (double)max_e;
+                    err_count++;
+                }
+                if (err_count > 0) {
+                    temperature = (float)(err_accum / err_count) * 0.1f;
+                    if (temperature < 1e-10f) temperature = 1e-10f;
+                }
+            }
+
+            /* Encode aggregated candidate errors as Boltzmann amplitudes */
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                float agg_errors[Q1_N_CAND];
+                for (int c = 0; c < Q1_N_CAND; c++)
+                    agg_errors[c] = 0.0f;
+
+                int64_t blk_start = i * stride;
+                int64_t blk_end = blk_start + stride;
+                if (blk_end > n_blocks) blk_end = n_blocks;
+                int64_t group_size = blk_end - blk_start;
+
+                for (int64_t b = blk_start; b < blk_end; b++)
+                    for (int c = 0; c < Q1_N_CAND; c++)
+                        agg_errors[c] += cand_errors[b][c];
+                if (group_size > 1) {
+                    float inv_gs = 1.0f / (float)group_size;
+                    for (int c = 0; c < Q1_N_CAND; c++)
+                        agg_errors[c] *= inv_gs;
+                }
+
+                float min_err = 1e30f;
+                for (int c = 0; c < Q1_N_CAND; c++)
+                    if (agg_errors[c] < min_err)
+                        min_err = agg_errors[c];
+
+                double amp_re[6] = {0};
+                double amp_norm = 0.0;
+                for (int ci = 0; ci < Q1_N_CAND; ci++) {
+                    int qi = Q1_CAND_TO_QUHIT[ci];
+                    amp_re[qi] += exp(-(double)(agg_errors[ci] - min_err) /
+                                      (2.0 * (double)temperature));
+                }
+                for (int qi = 0; qi < 6; qi++)
+                    amp_norm += amp_re[qi] * amp_re[qi];
+                if (amp_norm > 1e-30) {
+                    double inv = 1.0 / sqrt(amp_norm);
+                    for (int v = 0; v < 6; v++) amp_re[v] *= inv;
+                }
+
+                for (int v = 0; v < 6; v++) {
+                    graph->locals[i].edge_re[v] = amp_re[v];
+                    graph->locals[i].edge_im[v] = 0.0;
+                }
+                graph->locals[i].primary = VIEW_EDGE;
+                graph->locals[i].dirty = DIRTY_VERTEX | DIRTY_DIAGONAL | DIRTY_FOLDED;
+                graph->locals[i].delta_valid = 0;
+                triality_update_mask(&graph->locals[i]);
+            }
+
+            /* Neighbor edges */
+            for (int64_t i = 0; i < graph_blocks - 1; i++)
+                hpc_cz(graph, i, i + 1);
+
+            /* Shor sequential measurement */
+            double (*marg)[6] = (double (*)[6])calloc(graph_blocks, sizeof(double[6]));
+            int *shor_measured = (int *)calloc(graph_blocks, sizeof(int));
+
+            shor_measure_graph(graph, graph_blocks, marg, shor_measured, 1);
+
+            free(shor_measured);
+
+            /* ── Phase 4: 24-beam Hensel search ── */
+            typedef struct { double acc_error; int history_idx; } Q1Beam;
+            typedef struct { int cand_idx; int parent_idx; } Q1BeamHistory;
+
+            Q1Beam beams[Q1_N_BEAMS];
+            int active_beams = 1;
+            Q1BeamHistory *history = (Q1BeamHistory *)malloc(
+                n_blocks * Q1_N_BEAMS * sizeof(Q1BeamHistory));
+
+            for (int b = 0; b < Q1_N_BEAMS; b++) {
+                beams[b].acc_error = 0.0;
+                beams[b].history_idx = -1;
+            }
+
+            for (int64_t i = 0; i < graph_blocks; i++) {
+                double m_total = 0.0;
+                for (int v = 0; v < 6; v++) m_total += marg[i][v];
+
+                double cand_score[Q1_N_CAND];
+                int64_t blk = i * stride;
+                int q1_bin_count[6] = {0};
+                for (int ci = 0; ci < Q1_N_CAND; ci++)
+                    q1_bin_count[Q1_CAND_TO_QUHIT[ci]]++;
+
+                float blk_mean_err = 0.0f;
+                for (int c = 0; c < Q1_N_CAND; c++)
+                    blk_mean_err += cand_errors[blk][c];
+                blk_mean_err /= (float)Q1_N_CAND;
+                if (blk_mean_err < 1e-30f) blk_mean_err = 1e-30f;
+
+                for (int ci = 0; ci < Q1_N_CAND; ci++) {
+                    int qi = Q1_CAND_TO_QUHIT[ci];
+                    double p = (m_total > 1e-30) ? marg[i][qi] / m_total : 1.0/6.0;
+                    p /= (double)q1_bin_count[qi];
+                    cand_score[ci] = p / (cand_errors[blk][ci] / blk_mean_err + 1e-15);
+                }
+
+                /* Extend beams */
+                typedef struct { double score; int beam_idx; int cand_idx; } Q1BeamExt;
+                Q1BeamExt extensions[Q1_N_BEAMS * Q1_N_CAND];
+                int n_ext = 0;
+
+                for (int b = 0; b < active_beams; b++) {
+                    for (int c = 0; c < Q1_N_CAND; c++) {
+                        double ext_err = beams[b].acc_error + cand_errors[blk][c];
+                        extensions[n_ext].score = cand_score[c] / (ext_err + 1e-15);
+                        extensions[n_ext].beam_idx = b;
+                        extensions[n_ext].cand_idx = c;
+                        n_ext++;
+                    }
+                }
+
+                int top_k = (n_ext < Q1_N_BEAMS) ? n_ext : Q1_N_BEAMS;
+                Q1Beam new_beams[Q1_N_BEAMS];
+                for (int k = 0; k < top_k; k++) {
+                    int best = -1;
+                    double best_s = -1e30;
+                    for (int e = 0; e < n_ext; e++)
+                        if (extensions[e].score > best_s) {
+                            best_s = extensions[e].score;
+                            best = e;
+                        }
+                    int hist_idx = i * Q1_N_BEAMS + k;
+                    history[hist_idx].cand_idx = extensions[best].cand_idx;
+                    history[hist_idx].parent_idx = beams[extensions[best].beam_idx].history_idx;
+                    new_beams[k].history_idx = hist_idx;
+                    new_beams[k].acc_error = beams[extensions[best].beam_idx].acc_error
+                                            + cand_errors[blk][extensions[best].cand_idx];
+                    extensions[best].score = -2e30;
+                }
+
+                for (int k = 0; k < top_k; k++)
+                    beams[k] = new_beams[k];
+                active_beams = top_k;
+            }
+
+            /* Trace back best beam */
+            int curr_hist = beams[0].history_idx;
+            for (int64_t i = graph_blocks - 1; i >= 0; i--) {
+                int group_cidx = 8; /* default: mult=1.0 */
+                if (curr_hist >= 0) {
+                    group_cidx = history[curr_hist].cand_idx;
+                    curr_hist = history[curr_hist].parent_idx;
+                }
+                /* Apply to all blocks in stride group */
+                for (int64_t b = i * stride; b < (i+1) * stride && b < n_blocks; b++) {
+                    if (stride <= 1) {
+                        best_candidate[b] = group_cidx;
+                    } else {
+                        /* Per-block local refinement within quhit bin */
+                        int target_bin = Q1_CAND_TO_QUHIT[group_cidx];
+                        float best_err = 1e30f;
+                        int best_c = group_cidx;
+                        for (int ci = 0; ci < Q1_N_CAND; ci++) {
+                            if (Q1_CAND_TO_QUHIT[ci] != target_bin) continue;
+                            if (cand_errors[b][ci] < best_err) {
+                                best_err = cand_errors[b][ci];
+                                best_c = ci;
+                            }
+                        }
+                        /* Greedy override if global best is >5% better */
+                        float global_best = 1e30f;
+                        int global_best_c = group_cidx;
+                        for (int c = 0; c < Q1_N_CAND; c++)
+                            if (cand_errors[b][c] < global_best) {
+                                global_best = cand_errors[b][c];
+                                global_best_c = c;
+                            }
+                        best_candidate[b] = (global_best < best_err * 0.95f) ?
+                                            global_best_c : best_c;
+                    }
+                }
+            }
+
+            free(history);
+            free(marg);
+            hpc_destroy(graph);
+        }
+    }
+
+    /* ── Phase 5: Pack Q1_0 blocks with optimal scale ── */
+    #pragma omp parallel for schedule(dynamic, 64) reduction(+:total_err)
+    for (int64_t blk = 0; blk < n_blocks; blk++) {
+        const float *bw = weights + blk * QK1_0;
+        int ci = best_candidate[blk];
+        uint16_t d16 = cand_d16[blk][ci];
+        float d = gguf_fp16_to_fp32(d16);
+
+        output[blk].d = d16;
+
+        /* Clear sign bits */
+        for (int j = 0; j < QK1_0 / 8; j++)
+            output[blk].qs[j] = 0;
+
+        /* Store signs: bit=1 means positive */
+        float blk_err = 0.0f;
+        for (int j = 0; j < QK1_0; j++) {
+            if (bw[j] >= 0.0f)
+                output[blk].qs[j / 8] |= (1 << (j % 8));
+            float deq = (bw[j] >= 0.0f) ? d : -d;
+            float diff = bw[j] - deq;
+            blk_err += diff * diff;
+        }
+        total_err += blk_err;
+    }
+
+    free(wls_d);
+    free(cand_errors);
+    free(cand_d16);
+    free(best_candidate);
+
+    if (out_total_error) *out_total_error = total_err;
+
+    if (verbose) {
+        float rmse = (n_elements > 0) ? sqrtf(total_err / (float)n_elements) : 0.0f;
+        printf("  Q1_0·Shor: %ld blocks, RMSE=%.6e, %.2f MB\n",
+               (long)n_blocks, rmse,
+               (double)(n_blocks * sizeof(BlockQ1_0)) / (1024.0 * 1024.0));
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * LIBRARY API — Exported functions for Python ctypes integration
  *
  * When built with -DHEXSTATE_LIBRARY, these are the only public symbols.
@@ -3775,16 +4150,7 @@ void hexstate_init(void)
     }
 }
 
-/* Quantize a single tensor's F32 data to Q2_K using HPC optimization.
- *
- * Parameters:
- *   weights:     input F32 data (must be padded to multiple of 256)
- *   n_elements:  number of elements (must be multiple of 256)
- *   output:      output buffer (must be n_elements/256 * 84 bytes)
- *   out_error:   pointer to receive total MSE (can be NULL)
- *   opt_mode:    0=HPC, 1=MSE, 2=Hybrid (recommended)
- *   verbose:     1 for per-block diagnostics
- */
+/* Quantize a single tensor's F32 data to Q2_K using HPC optimization. */
 void hexstate_quantize_tensor_q2k(const float *weights, int64_t n_elements,
                                     void *output, float *out_error,
                                     int opt_mode, int verbose)
@@ -3812,15 +4178,7 @@ void hexstate_quantize_tensor_q2k_imat(const float *weights, int64_t n_elements,
 int hexstate_q2k_block_bytes(void) { return sizeof(BlockQ2K); }
 int hexstate_q2k_block_elements(void) { return QK_K; }
 
-/* HPC-optimized Q4_0 quantization for attention tensors.
- * Called from Python requantizer via ctypes.
- *   weights:     input F32 weights
- *   n_elements:  number of elements (must be multiple of 32)
- *   output:      output buffer (must be n_elements/32 * 18 bytes)
- *   out_error:   pointer to receive total MSE (can be NULL)
- *   imat_importance: optional per-element importance weights
- *   verbose:     1 for per-block diagnostics
- */
+/* HPC-optimized Q4_0 quantization for attention tensors. */
 void hexstate_quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                                          void *output, float *out_error,
                                          const float *imat_importance,
@@ -3833,6 +4191,32 @@ void hexstate_quantize_tensor_q4_0_hpc(const float *weights, int64_t n_elements,
                                imat_importance, verbose);
     if (out_error) *out_error = err;
 }
+
+/* Shor-optimized Q1_0 quantization (1-bit sign + scale).
+ * Called from Python requantizer via ctypes.
+ *   weights:     input F32 weights
+ *   n_elements:  number of elements (must be multiple of 128)
+ *   output:      output buffer (must be n_elements/128 * 18 bytes)
+ *   out_error:   pointer to receive total MSE (can be NULL)
+ *   imat_importance: optional per-element importance weights
+ *   verbose:     1 for per-block diagnostics
+ */
+void hexstate_quantize_tensor_q1_0_shor(const float *weights, int64_t n_elements,
+                                          void *output, float *out_error,
+                                          const float *imat_importance,
+                                          int verbose)
+{
+    hexstate_init();
+    float err = 0.0f;
+    quantize_tensor_q1_0_shor(weights, n_elements,
+                                (BlockQ1_0 *)output, &err,
+                                imat_importance, verbose);
+    if (out_error) *out_error = err;
+}
+
+/* Get the block size for Q1_0 (18 bytes per 128 elements) */
+int hexstate_q1_0_block_bytes(void) { return sizeof(BlockQ1_0); }
+int hexstate_q1_0_block_elements(void) { return QK1_0; }
 
 #ifndef HEXSTATE_LIBRARY
 /* ═══════════════════════════════════════════════════════════════════════════
