@@ -225,6 +225,29 @@ static inline void hpc_grow_edges(HPCGraph *g)
     g->edges = (HPCEdge *)realloc(g->edges, g->edge_cap * sizeof(HPCEdge));
 }
 
+/* Grow the graph to accommodate new_n_sites total sites.
+ * Reallocates locals[] and adj[] arrays, initializes new entries.
+ * If new_n_sites <= g->n_sites, this is a no-op. */
+static inline void hpc_grow_sites(HPCGraph *g, uint64_t new_n_sites)
+{
+    if (new_n_sites <= g->n_sites) return;
+
+    g->locals = (TrialityQuhit *)realloc(g->locals,
+                                          new_n_sites * sizeof(TrialityQuhit));
+    g->adj = (HPCAdjList *)realloc(g->adj,
+                                    new_n_sites * sizeof(HPCAdjList));
+
+    /* Initialize the new sites */
+    for (uint64_t i = g->n_sites; i < new_n_sites; i++) {
+        triality_init(&g->locals[i]);
+        g->adj[i].capacity = HPC_ADJ_INIT;
+        g->adj[i].edge_ids = (uint64_t *)calloc(HPC_ADJ_INIT, sizeof(uint64_t));
+        g->adj[i].count = 0;
+    }
+
+    g->n_sites = new_n_sites;
+}
+
 static inline void hpc_grow_adj(HPCAdjList *a)
 {
     if (a->count < a->capacity) return;
