@@ -6,10 +6,10 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 CC       = gcc
-CFLAGS   = -O2 -std=gnu99 -shared -fPIC -Wall -Wno-unused-function -Wno-unused-variable
-LDFLAGS  = -lm -lgmp -lmpfr
+CFLAGS   = -O2 -std=gnu99 -shared -fPIC -Wall -Wno-unused-function -Wno-unused-variable -fopenmp
+LDFLAGS  = -lm -lgmp -lmpfr -fopenmp
 
-# Include parent directory for HExState headers
+# Include parent directory for HexState headers
 INCLUDES = -I..
 
 # Source files — quantizer + HExState engine dependencies (no bigint)
