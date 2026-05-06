@@ -1003,10 +1003,10 @@ static void demo_hexagram(void)
     triality_init_basis(&tq, 1);
     triality_dft(&tq);
     HexagramQuhit hq_from_tri;
-    triality_to_hexagram(&tq, &hq_from_tri);
+    triality_to_hexagram(&tq, (struct HexagramQuhit *)&hq_from_tri);
     printf("  Converted triality → hexagram via H₆\n");
 
-    hexagram_to_triality(&hq_from_tri, &tq);
+    hexagram_to_triality((struct HexagramQuhit *)&hq_from_tri, &tq);
     printf("  Converted hexagram → triality via H₆†\n");
 
     /* ── 6.8 Diagnostics ── */
@@ -1251,29 +1251,29 @@ static void demo_tensor_networks(void)
     printf("  ── 8.3 TNS 3D (χ=256) ──\n\n");
 
     int L3 = 3;
-    Peps3dGrid *tns3 = peps3d_init(L3, L3, L3);
+    Tns3dGrid *tns3 = tns3d_init(L3, L3, L3);
     printf("  Created 3D TNS grid: %d×%d×%d = %d sites\n",
            L3, L3, L3, L3*L3*L3);
 
     /* 1-site gate */
-    peps3d_gate_1site(tns3, 0, 0, 0, U_re, U_im);
+    tns3d_gate_1site(tns3, 0, 0, 0, U_re, U_im);
     printf("  Applied 1-site gate at (0,0,0)\n");
 
     /* 2-site bond gates along each axis */
-    peps3d_gate_x(tns3, 0, 0, 0, G_re, G_im);   /* x-axis bond */
-    peps3d_gate_y(tns3, 0, 0, 0, G_re, G_im);   /* y-axis bond */
-    peps3d_gate_z(tns3, 0, 0, 0, G_re, G_im);   /* z-axis bond */
+    tns3d_gate_x(tns3, 0, 0, 0, G_re, G_im);   /* x-axis bond */
+    tns3d_gate_y(tns3, 0, 0, 0, G_re, G_im);   /* y-axis bond */
+    tns3d_gate_z(tns3, 0, 0, 0, G_re, G_im);   /* z-axis bond */
     printf("  Applied bond gates along x, y, z axes at origin\n");
 
     /* Local density */
-    peps3d_local_density(tns3, 1, 1, 1, probs);
+    tns3d_local_density(tns3, 1, 1, 1, probs);
     print_probs("3D TNS center density", probs);
 
     /* Measurement */
-    int tns3_out = peps3d_measure_site(tns3, 0, 0, 0);
+    int tns3_out = tns3d_measure_site(tns3, 0, 0, 0);
     printf("  Measured 3D site (0,0,0) → %d\n", tns3_out);
 
-    peps3d_free(tns3);
+    tns3d_free(tns3);
     printf("  3D TNS grid freed.\n");
 
     /* NOTE: 4D, 5D, 6D follow the exact same pattern:
