@@ -2,10 +2,6 @@
 HEAP COMPILE. Otherwise you will get segfault!
 </p>
 
-<p align="center">
-  <img src="docs/hexstate_logo.png" alt="HexState" width="200"/>
-</p>
-
 <h1 align="center">HexState</h1>
 
 <p align="center">
