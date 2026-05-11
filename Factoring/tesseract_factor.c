@@ -1049,7 +1049,6 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
     if (n_edges == 0) return 1e30;
 
     ComplexEdgeMsg *msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
-    ComplexEdgeMsg *new_msgs = (ComplexEdgeMsg*)calloc(n_edges, sizeof(ComplexEdgeMsg));
 
     /* Initialize messages: seed 0 = uniform, others = random complex to break symmetry */
     srand(seed * 12345 + 42);
@@ -1094,15 +1093,18 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
                 for (int v_src = 0; v_src < 6; v_src++) {
                     prod_re[v_src] = g->locals[src].edge_re[v_src];
                     prod_im[v_src] = g->locals[src].edge_im[v_src];
+                }
 
-                    const HPCAdjList *adj = &g->adj[src];
-                    for (uint64_t mi = 0; mi < adj->count; mi++) {
-                        uint64_t in_eid = adj->edge_ids[mi];
-                        if (in_eid == (uint64_t)eid) continue;
+                const HPCAdjList *adj = &g->adj[src];
+                for (uint64_t mi = 0; mi < adj->count; mi++) {
+                    uint64_t in_eid = adj->edge_ids[mi];
+                    if (in_eid == (uint64_t)eid) continue;
 
-                        /* Which direction does this message flow INTO src? */
-                        int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1;
+                    /* Which direction does this message flow INTO src? */
+                    int in_dir = (g->edges[in_eid].site_b == src) ? 0 : 1;
 
+                    double max_mag = 0.0;
+                    for (int v_src = 0; v_src < 6; v_src++) {
                         double mr = msgs[in_eid].re[in_dir][v_src];
                         double mi_v = msgs[in_eid].im[in_dir][v_src];
 
@@ -1111,6 +1113,18 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
                         double ni = prod_re[v_src] * mi_v + prod_im[v_src] * mr;
                         prod_re[v_src] = nr;
                         prod_im[v_src] = ni;
+                        
+                        double mag = nr*nr + ni*ni;
+                        if (mag > max_mag) max_mag = mag;
+                    }
+                    
+                    /* Dynamic normalization to prevent underflow for high-degree nodes */
+                    if (max_mag > 0.0 && max_mag < 1e-10) {
+                        double scale = 1e5;
+                        for (int v_src = 0; v_src < 6; v_src++) {
+                            prod_re[v_src] *= scale;
+                            prod_im[v_src] *= scale;
+                        }
                     }
                 }
 
@@ -1239,7 +1253,6 @@ static double z6_complex_amplitude_bp(MobiusAmplitudeSheet *ms, unsigned int see
     printf("\n");
 
     free(msgs);
-    free(new_msgs);
     return prev_residual;
 }
 
@@ -1687,6 +1700,16 @@ static void work_reg_destroy(WorkRegState *w)
     if (w) { free(w->terms); free(w->site_ids); free(w); }
 }
 
+static int cmp_work_reg_term_mag_desc(const void *a, const void *b) {
+    const WorkRegTerm *ta = (const WorkRegTerm*)a;
+    const WorkRegTerm *tb = (const WorkRegTerm*)b;
+    double ma = ta->amp_re * ta->amp_re + ta->amp_im * ta->amp_im;
+    double mb = tb->amp_re * tb->amp_re + tb->amp_im * tb->amp_im;
+    if (ma < mb) return 1;
+    if (ma > mb) return -1;
+    return 0;
+}
+
 /* Apply controlled-U: for control value d, multiply each work register
  * value by multiplier[d] mod N. This creates up to 6× more terms
  * (one branch per control value), but deferred until measurement. */
@@ -1757,26 +1780,8 @@ static void work_reg_apply_oracle(WorkRegState *work_reg,
     /* Prune near-zero terms if too many */
     if (new_n > WORK_REG_MAX_TERMS) {
         /* Sort by amplitude magnitude, keep top MAX_TERMS */
-        /* Simple approach: find threshold and discard small terms */
-        double *mags = (double*)malloc(new_n * sizeof(double));
-        for (int i = 0; i < new_n; i++)
-            mags[i] = work_reg->terms[i].amp_re * work_reg->terms[i].amp_re +
-                      work_reg->terms[i].amp_im * work_reg->terms[i].amp_im;
-
-        /* Find the WORK_REG_MAX_TERMS-th largest magnitude */
-        /* Simple O(n) selection not needed — just keep terms above mean */
-        double total_mag = 0;
-        for (int i = 0; i < new_n; i++) total_mag += mags[i];
-        double threshold = total_mag / (2.0 * WORK_REG_MAX_TERMS);
-
-        int kept = 0;
-        for (int i = 0; i < new_n; i++) {
-            if (mags[i] >= threshold) {
-                work_reg->terms[kept++] = work_reg->terms[i];
-            }
-        }
-        work_reg->n_terms = kept;
-        free(mags);
+        qsort(work_reg->terms, new_n, sizeof(WorkRegTerm), cmp_work_reg_term_mag_desc);
+        work_reg->n_terms = WORK_REG_MAX_TERMS;
     }
 }
 
@@ -1786,35 +1791,34 @@ static void work_reg_apply_oracle(WorkRegState *work_reg,
 static int shor_measure_freq_site(HPCGraph *graph, int freq_site,
                                   WorkRegState *work_reg,
                                   const uint64_t multiplier[6],
-                                  double random_01)
+                                  double random_01,
+                                  MobiusAmplitudeSheet *ms)
 {
-    /* The work register already has the full superposition from
-     * work_reg_apply_oracle. The measurement probability for digit d
-     * is proportional to the norm² of work register terms that would
-     * result from choosing d.
-     *
-     * But since the oracle was already applied (branching all d values),
-     * we need to UN-branch: for each d, compute which terms belong to
-     * the d-branch and their total probability. */
-
-    /* Simpler approach: the measurement probability is just |local(d)|².
-     * The work register interference is already encoded in the branched
-     * state. After measurement of d=d*, we keep only the terms from
-     * the d*-branch (those whose value = mult[d*] × old_value mod N). */
-
-    /* Actually, for the semi-classical QFT, the probability IS determined
-     * by the local amplitude (which encodes the eigenphase after corrections).
-     * The work register tracks the entanglement but doesn't affect P(d). */
+    /* FIXED: We must use the DRESSED amplitudes from Belief Propagation (ms->sheets) 
+     * which encode the interference phase kickback from the entanglement graph, 
+     * rather than the un-interfered local graph states (q->edge_re).
+     * The work register and multiplier arguments are kept for API compatibility 
+     * but BP natively handles the entanglement without explicit tracking. */
 
     double probs[6];
     double total = 0.0;
-    const TrialityQuhit *q = &graph->locals[freq_site];
-
-    for (int d = 0; d < 6; d++) {
-        probs[d] = q->edge_re[d] * q->edge_re[d] +
-                   q->edge_im[d] * q->edge_im[d];
-        total += probs[d];
+    
+    /* Fallback to local if ms is not provided, though it won't have interference */
+    if (ms) {
+        for (int d = 0; d < 6; d++) {
+            probs[d] = ms->sheets[freq_site].dressed_re[d] * ms->sheets[freq_site].dressed_re[d] +
+                       ms->sheets[freq_site].dressed_im[d] * ms->sheets[freq_site].dressed_im[d];
+            total += probs[d];
+        }
+    } else {
+        const TrialityQuhit *q = &graph->locals[freq_site];
+        for (int d = 0; d < 6; d++) {
+            probs[d] = q->edge_re[d] * q->edge_re[d] +
+                       q->edge_im[d] * q->edge_im[d];
+            total += probs[d];
+        }
     }
+
     if (total > 1e-30) {
         for (int d = 0; d < 6; d++) probs[d] /= total;
     } else {
