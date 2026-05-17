@@ -139,7 +139,7 @@ static uint64_t get_physical_flash_entropy(void) {
     return elapsed_ns;
 }
 
-static void get_physical_draws(double *r_A, double *r_B) {
+static uint64_t get_physical_draws(double *r_A, double *r_B) {
     uint64_t ns = get_physical_flash_entropy();
     
     /* Mix for detector A */
@@ -159,6 +159,8 @@ static void get_physical_draws(double *r_A, double *r_B) {
     seed_B *= 0x94d049bb133111ebULL;
     seed_B ^= seed_B >> 31;
     *r_B = (double)(seed_B >> 11) / (double)(1ULL << 53);
+
+    return ns;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -348,7 +350,7 @@ int main(void) {
 
     /* Draw two completely independent random numbers from the physical X11 monitor flash! */
     double r_A, r_B;
-    get_physical_draws(&r_A, &r_B);
+    uint64_t elapsed_ns = get_physical_draws(&r_A, &r_B);
 
     /* Measure Photon A (Physical User) */
     uint32_t outcome_A = hpc_measure(original, 0, r_A);
@@ -374,7 +376,18 @@ int main(void) {
     printf("╠══════════════════════════════════════════════════════════════════╣\n");
 
     int correlated = (outcome_A == outcome_B);
+    int chooser_user = (elapsed_ns % 2 == 1);
+    const char *chooser_str = chooser_user ? "Photon A (Physical User)" : "Photon B (Digital Twin)";
 
+    printf("║                                                                  ║\n");
+    printf("║   Active Wave Collapse Analysis:                                 ║\n");
+    printf("║     Collapse Initiator:  %-38s  ║\n", chooser_str);
+    printf("║     Physical Timing:     %-12lu ns                           ║\n", elapsed_ns);
+    printf("║     Initiating Channel:  %-38s  ║\n", 
+           chooser_user ? "Odd rendering latency (photon emission priority)" : 
+                          "Even rendering latency (motherboard thermal jitter)");
+    printf("║                                                                  ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
     printf("║                                                                  ║\n");
     printf("║   Quantum Photonic Correlation:                                 ║\n");
     printf("║     User == Twin ?  %s  (QM: ALWAYS yes for |Φ⁺⟩)          ║\n",
@@ -445,15 +458,20 @@ int main(void) {
         original = prepare_entangled_photons();
 
         double t_rA, t_rB;
-        get_physical_draws(&t_rA, &t_rB);
+        uint64_t t_ns = get_physical_draws(&t_rA, &t_rB);
 
         uint32_t t_A = hpc_measure(original, 0, t_rA);
         triality_idft(&original->locals[1]);
         triality_update_mask(&original->locals[1]);
         uint32_t t_B = hpc_measure(original, 1, t_rB);
 
-        printf("  Original:  A=|%u⟩  B=|%u⟩   correlated=%s\n",
+        int t_chooser_user = (t_ns % 2 == 1);
+
+        printf("  Original:   A=|%u⟩  B=|%u⟩   correlated=%s\n",
                t_A, t_B, t_A == t_B ? "YES ✓" : "NO ✗");
+        printf("  Initiator:  %s  (Timing: %lu ns)\n",
+               t_chooser_user ? "Photon A (Physical User)" : "Photon B (Digital Twin)",
+               t_ns);
 
         hpc_destroy(original);
         printf("\n  Press ENTER for another trial, Ctrl-C to exit.\n");
