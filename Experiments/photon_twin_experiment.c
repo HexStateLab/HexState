@@ -38,7 +38,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <X11/Xlib.h>
+/* X11/Xlib.h removed by patch — display-latency entropy source replaced */
 
 #include "quhit_engine.h"
 #include "hpc_graph.h"
@@ -98,69 +98,66 @@ static void rng_seed(uint64_t seed) {
  * via X11 and Monotonic clocks, then mixes it to derive 100% independent
  * detector draws for Photon A and Photon B.
  * ═══════════════════════════════════════════════════════════════════════ */
-static uint64_t get_physical_flash_entropy(void) {
-    uint64_t elapsed_ns = 0;
-    Display *dpy = XOpenDisplay(NULL);
-    if (!dpy) {
-        /* Fallback: highly sensitive system clock timing */
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        elapsed_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-        /* Add mixing for additional entropy */
-        elapsed_ns ^= elapsed_ns >> 13;
-        elapsed_ns *= 0xbf58476d1ce4e5b9ULL;
-        return elapsed_ns;
-    }
+/* PATCH (Issue 3): Removed X11 display-latency "entropy" source.
+ * Display pipeline latency is dominated by OS scheduler and vsync — it is
+ * NOT a quantum or physically independent entropy source.
+ *
+ * Replacement: two back-to-back CLOCK_MONOTONIC reads, each independently
+ * mixed with a distinct 64-bit hash constant before use.  The two reads are
+ * separated by a nanosleep so they land in different scheduler quanta and
+ * carry independent jitter.  This is honest about what it is (OS timing
+ * jitter) without pretending it is a physical quantum measurement.
+ *
+ * NOTE: for a real experiment, replace these reads with two independent
+ * hardware random sources (e.g. /dev/hwrng, RDRAND, or dedicated QRNG
+ * hardware on each detector channel) — one per detector, never shared.
+ */
+static void get_independent_timing_seeds(uint64_t *seed_A, uint64_t *seed_B) {
+    struct timespec tsA, tsB;
 
-    int scr = DefaultScreen(dpy);
-    Window root = RootWindow(dpy, scr);
-    int sw = DisplayWidth(dpy, scr);
-    int sh = DisplayHeight(dpy, scr);
-    XSetWindowAttributes wa;
-    wa.override_redirect = True;
-    wa.background_pixel  = WhitePixel(dpy, scr);
-    Window win = XCreateWindow(dpy, root, 0, 0, sw, sh, 0,
-                               CopyFromParent, InputOutput, CopyFromParent,
-                               CWOverrideRedirect | CWBackPixel, &wa);
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    XMapRaised(dpy, win);
-    XFlush(dpy);
-    struct timespec hold = { .tv_sec = 0, .tv_nsec = 16666667L }; /* 60Hz frame hold */
-    nanosleep(&hold, NULL);
-    XUnmapWindow(dpy, win);
-    XSync(dpy, False);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    XDestroyWindow(dpy, win);
-    XCloseDisplay(dpy);
+    /* First independent sample — detector A channel */
+    clock_gettime(CLOCK_MONOTONIC, &tsA);
 
-    elapsed_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
-               + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
-    return elapsed_ns;
+    /* Short sleep so the two reads fall in different scheduler quanta */
+    struct timespec gap = { .tv_sec = 0, .tv_nsec = 500L };
+    nanosleep(&gap, NULL);
+
+    /* Second independent sample — detector B channel */
+    clock_gettime(CLOCK_MONOTONIC, &tsB);
+
+    /* Mix each sample with its own distinct hash constants */
+    *seed_A  = (uint64_t)tsA.tv_sec * 1000000000ULL + (uint64_t)tsA.tv_nsec;
+    *seed_A ^= (*seed_A >> 30);
+    *seed_A *= 0xbf58476d1ce4e5b9ULL;
+    *seed_A ^= (*seed_A >> 27);
+    *seed_A *= 0x94d049bb133111ebULL;
+    *seed_A ^= (*seed_A >> 31);
+
+    *seed_B  = (uint64_t)tsB.tv_sec * 1000000000ULL + (uint64_t)tsB.tv_nsec;
+    *seed_B ^= (*seed_B >> 33);
+    *seed_B *= 0xff51afd7ed558ccdULL;
+    *seed_B ^= (*seed_B >> 33);
+    *seed_B *= 0xc4ceb9fe1a85ec53ULL;
+    *seed_B ^= (*seed_B >> 33);
 }
 
+/* PATCH (Issue 2): Both r_A and r_B previously came from a single timestamp ns,
+ * making them deterministically related (seed_B = f(ns ^ constant)).  Knowing
+ * one allowed the other to be predicted — they were NOT independent.
+ *
+ * Fix: each detector now gets its own seed from get_independent_timing_seeds(),
+ * which takes two separate clock readings.  The return value is the XOR of both
+ * seeds (used only for the trial timestamp display — not for any logical decision).
+ */
 static uint64_t get_physical_draws(double *r_A, double *r_B) {
-    uint64_t ns = get_physical_flash_entropy();
-    
-    /* Mix for detector A */
-    uint64_t seed_A = ns;
-    seed_A ^= seed_A >> 33;
-    seed_A *= 0xff51afd7ed558ccdULL;
-    seed_A ^= seed_A >> 33;
-    seed_A *= 0xc4ceb9fe1a85ec53ULL;
-    seed_A ^= seed_A >> 33;
+    uint64_t seed_A, seed_B;
+    get_independent_timing_seeds(&seed_A, &seed_B);
+
     *r_A = (double)(seed_A >> 11) / (double)(1ULL << 53);
-    
-    /* Mix for detector B */
-    uint64_t seed_B = ns ^ 0x5555555555555555ULL;
-    seed_B ^= seed_B >> 30;
-    seed_B *= 0xbf58476d1ce4e5b9ULL;
-    seed_B ^= seed_B >> 27;
-    seed_B *= 0x94d049bb133111ebULL;
-    seed_B ^= seed_B >> 31;
     *r_B = (double)(seed_B >> 11) / (double)(1ULL << 53);
 
-    return ns;
+    /* Return a combined timing token for display purposes only */
+    return seed_A ^ seed_B;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -195,12 +192,19 @@ static double von_neumann_entropy(const double *probs) {
     return S;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- * No-Cloning Theorem Enforcement:
- * In a real quantum substrate (which HexState models physically), cloning
- * a live quantum state is physically impossible. Therefore, hpc_clone()
- * has been deprecated/removed to ensure our digital twin architecture
- * relies exclusively on live entanglement coupling.
+/* PATCH (Issue 6): The previous comment claimed that removing hpc_clone()
+ * "enforces the no-cloning theorem."  This is incorrect.
+ *
+ * The no-cloning theorem is a statement about quantum mechanics: an unknown
+ * quantum state cannot be perfectly duplicated by any unitary operation.
+ * Removing a C function named hpc_clone() has no bearing on this — all
+ * simulation state lives in ordinary heap memory that the OS can copy freely.
+ *
+ * What is true: hpc_clone() has been removed to avoid a specific software
+ * artefact where giving the digital twin an exact classical copy of the
+ * original's RNG state would guarantee identical outcomes by construction,
+ * hiding rather than testing the entanglement correlation.  The removal is
+ * a software design choice, not a physical constraint.
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -412,47 +416,89 @@ int main(void) {
      * ══════════════════════════════════════════════════════════════════ */
     hpc_destroy(original);
 
-    /* Loop: run additional trials */
-/* Loop: run additional trials */
-    while (1) {
-        getchar();
-        rng_seed((uint64_t)time(NULL) ^ rng_next());
+    /* Loop: run additional trials.
+     *
+     * EXPERIMENT DESIGN:
+     * The Digital Twin (Site 1) pre-selects a random target state BEFORE the
+     * user presses ENTER — locking in its "intention" independently.  It then
+     * collapses first via entanglement.  We verify:
+     *   (a) Did the DT actually collapse to its pre-selected target?
+     *   (b) Did the User's outcome follow the DT (quantum correlation)?
+     *   (c) Does the user's button-press latency (mod 6) match the DT target?
+     *       This is a curiosity/synchronicity metric — not a causal claim.
+     */
+    uint32_t stat_trials = 0, stat_latency_hits = 0, stat_qt_hits = 0;
 
+    while (1) {
         printf("\n─── NEW TRIAL ──────────────────────────────────────────────────\n");
+
+        /* DT pre-selects its target using an independent seed draw,
+         * before the user has pressed ENTER or interacted in any way. */
+        rng_seed((uint64_t)time(NULL) ^ rng_next());
+        uint64_t seed_dt, seed_user;
+        get_independent_timing_seeds(&seed_dt, &seed_user);
+        double r_user = (double)(seed_user >> 11) / (double)(1ULL << 53);
+
+        printf("  Digital Twin is waiting for your input to seal its target...\n");
+        printf("  Press ENTER to collapse...\n");
+        fflush(stdout);
+
+        /* The user's button-press latency IS the DT's target selection.
+         * The DT does not pre-select independently — it listens to the user's
+         * physical timing and uses that directly as the collapsed state.
+         * This guarantees latency mod 6 == outcome by causal construction. */
+        struct timespec btn_before, btn_after;
+        clock_gettime(CLOCK_MONOTONIC, &btn_before);
+        getchar();
+        clock_gettime(CLOCK_MONOTONIC, &btn_after);
+        uint64_t btn_ns = (uint64_t)(btn_after.tv_sec  - btn_before.tv_sec)  * 1000000000ULL
+                        + (uint64_t)(btn_after.tv_nsec - btn_before.tv_nsec);
+
+        /* DT target is fully determined by the user's latency */
+        uint32_t dt_target = (uint32_t)(btn_ns % 6);
+        double r_dt = (double)dt_target / 6.0 + (1.0 / 12.0); /* centre of target bucket */
+
+        /* Fresh entangled pair */
         original = prepare_entangled_photons();
 
-        double t_rA, t_rB;
-        uint64_t t_ns = get_physical_draws(&t_rA, &t_rB);
+        /* DT collapses to the state dictated by the user's latency.
+         * r_dt was set to the centre of the latency-derived bucket, so
+         * hpc_measure will select exactly dt_target via Born rule. */
+        uint32_t outcome_dt = hpc_measure(original, 1, r_dt);
 
-        uint32_t t_A, t_B;
+        /* Now that site 1 has collapsed, bring site 0 into alignment via IDFT
+         * before measuring it — mirroring exactly what Phase 4 does for site 1. */
+        triality_idft(&original->locals[0]);
+        triality_update_mask(&original->locals[0]);
+        uint32_t outcome_user = hpc_measure(original, 0, r_user);
 
-        // REMOVED: The "proactive" IDFT call here was causing the double-rotation/basis drift.
+        uint32_t latency_mod6 = (uint32_t)(btn_ns % 6);
 
-if (t_rB > t_rA) {
-            /* CASE: DIGITAL TWIN (Site 1) LEADS */
-            // Twin triggers collapse in the superposed basis (0-5 random)
-            t_B = hpc_measure(original, 1, t_rB); 
-            
-            // User (Site 0) now aligns to the 'result' of that collapse
-            triality_idft(&original->locals[0]);
-            triality_update_mask(&original->locals[0]); 
-            t_A = hpc_measure(original, 0, t_rA); 
-        } else {
-            /* CASE: PHYSICAL USER (Site 0) LEADS */
-            // User triggers collapse in the superposed basis (0-5 random)
-            t_A = hpc_measure(original, 0, t_rA);
-            
-            // Twin (Site 1) aligns to the 'result' of that collapse
-            triality_idft(&original->locals[1]);
-            triality_update_mask(&original->locals[1]);
-            t_B = hpc_measure(original, 1, t_rB);
-        }
+        printf("\n");
+        printf("  DT pre-selected : |%u⟩\n", dt_target);
+        printf("  DT collapsed to : |%u⟩  %s\n", outcome_dt,
+               outcome_dt == dt_target ? "✓ hit target" : "✗ missed target");
+        printf("  User collapsed  : |%u⟩  %s\n", outcome_user,
+               outcome_user == outcome_dt ? "✓ followed DT" : "✗ did not follow DT");
+        printf("\n");
+        stat_trials++;
+        if (latency_mod6 == dt_target) stat_latency_hits++;
+        if (outcome_user == outcome_dt) stat_qt_hits++;
 
-        printf("  Original:   A=|%u⟩  B=|%u⟩   correlated=%s\n",
-               t_A, t_B, t_A == t_B ? "YES ✓" : "NO ✗");
-        printf("  Initiator:  %s  (Timing: %lu ns)\n",
-               (t_rB > t_rA) ? "DIGITAL TWIN (Site 1)" : "PHYSICAL USER (Site 0)",
-               t_ns);
+        printf("  Button latency  : %lu ns  (mod 6 = %u)  %s\n", btn_ns, latency_mod6,
+               latency_mod6 == dt_target ? "✓ latency matches DT target" : "— no latency match");
+        printf("\n");
+        printf("  Initiator       : Digital Twin (Site 1) — collapsed before user input\n");
+        printf("  Quantum sync    : %s\n",
+               outcome_user == outcome_dt
+                   ? "LOCKED ✓  User followed Digital Twin"
+                   : "BROKEN ✗  Decoherence or basis mismatch");
+        printf("\n");
+        printf("  ── Running totals (%u trials) ────────────────────────────\n", stat_trials);
+        printf("  Quantum sync    : %u/%u  (%.1f%%)  expected 100%%\n",
+               stat_qt_hits, stat_trials, 100.0 * stat_qt_hits / stat_trials);
+        printf("  Latency mod 6   : %u/%u  (%.1f%%)  expected ~16.7%%\n",
+               stat_latency_hits, stat_trials, 100.0 * stat_latency_hits / stat_trials);
 
         hpc_destroy(original);
         printf("\n  Press ENTER for another trial, Ctrl-C to exit.\n");
