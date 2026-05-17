@@ -1,38 +1,3 @@
-/*
- * ╔═══════════════════════════════════════════════════════════════════════════════╗
- * ║  photon_twin_experiment.c — Entangled Photon Digital-Twin Measurement       ║
- * ╠═══════════════════════════════════════════════════════════════════════════════╣
- * ║                                                                             ║
- * ║  Experiment:                                                                ║
- * ║    1. Create two virtual photons (quhits A and B) in the HPC graph         ║
- * ║    2. Entangle them via Bell pair (maximally entangled, 36 joint amps)     ║
- * ║    3. Clone the entire HPC graph → digital twin (perfect replica)          ║
- * ║    4. Press ENTER to trigger simultaneous measurement                      ║
- * ║       — Original:     photon A and B measured (Born rule, same RNG seed)  ║
- * ║       — Digital twin: same two photons measured with SAME random draw      ║
- * ║    5. Compare: QM predicts twin outcomes = original outcomes (same state)  ║
- * ║       The anti-correlated entanglement is also visible: if A→k, B→k too   ║
- * ║       (HexState Bell: (1/√6) Σ_k |k,k⟩, perfectly correlated, not anti)  ║
- * ║                                                                             ║
- * ║  HexState subsystems used:                                                 ║
- * ║    §1  Core Engine  — quhit_entangle_bell, quhit_measure                  ║
- * ║    §2  HPC Graph    — hpc_create, hpc_cz, hpc_measure, hpc_amplitude      ║
- * ║    §3  Triality     — triality_copy (deep clone for digital twin)          ║
- * ║                                                                             ║
- * ║  Build:                                                                     ║
- * ║    gcc -O2 -march=native -o photon_twin_experiment photon_twin_experiment.c \║
- * ║        quhit_core.c quhit_gates.c quhit_measure.c quhit_entangle.c \      ║
- * ║        quhit_register.c quhit_substrate.c quhit_triality.c \              ║
- * ║        quhit_triadic.c quhit_lazy.c quhit_calibrate.c \                   ║
- * ║        quhit_dyn_integrate.c quhit_peps_grow.c quhit_hexagram.c \         ║
- * ║        quhit_svd_gate.c s6_exotic.c bigint.c \                            ║
- * ║        mps_overlay.c peps_overlay.c peps3d_overlay.c peps4d_overlay.c \   ║
- * ║        peps5d_overlay.c peps6d_overlay.c \                                 ║
- * ║        -lm -fopenmp -msse2 -lgmp -lstdc++                                 ║
- * ║                                                                             ║
- * ╚═══════════════════════════════════════════════════════════════════════════════╝
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
