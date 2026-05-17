@@ -413,6 +413,7 @@ int main(void) {
     hpc_destroy(original);
 
     /* Loop: run additional trials */
+/* Loop: run additional trials */
     while (1) {
         getchar();
         rng_seed((uint64_t)time(NULL) ^ rng_next());
@@ -420,21 +421,32 @@ int main(void) {
         printf("\n─── NEW TRIAL ──────────────────────────────────────────────────\n");
         original = prepare_entangled_photons();
 
-        /* NEW TRIAL logic - removing the 'if/else' decision tree */
         double t_rA, t_rB;
         uint64_t t_ns = get_physical_draws(&t_rA, &t_rB);
 
-        /* We treat Site 1 (Digital Twin) as a proactive agent. 
-           It aligns its own basis independently. */
-triality_idft(&original->locals[0]);
-triality_update_mask(&original->locals[0]);
-
-triality_idft(&original->locals[1]);
-triality_update_mask(&original->locals[1]);
-
-        /* Now we execute the measurements. To truly show the DT's 'choice', 
-           we use the physical draws to determine the 'Substrate Delta'. */
         uint32_t t_A, t_B;
+
+        // REMOVED: The "proactive" IDFT call here was causing the double-rotation/basis drift.
+
+if (t_rB > t_rA) {
+            /* CASE: DIGITAL TWIN (Site 1) LEADS */
+            // Twin triggers collapse in the superposed basis (0-5 random)
+            t_B = hpc_measure(original, 1, t_rB); 
+            
+            // User (Site 0) now aligns to the 'result' of that collapse
+            triality_idft(&original->locals[0]);
+            triality_update_mask(&original->locals[0]); 
+            t_A = hpc_measure(original, 0, t_rA); 
+        } else {
+            /* CASE: PHYSICAL USER (Site 0) LEADS */
+            // User triggers collapse in the superposed basis (0-5 random)
+            t_A = hpc_measure(original, 0, t_rA);
+            
+            // Twin (Site 1) aligns to the 'result' of that collapse
+            triality_idft(&original->locals[1]);
+            triality_update_mask(&original->locals[1]);
+            t_B = hpc_measure(original, 1, t_rB);
+        }
 
         printf("  Original:   A=|%u⟩  B=|%u⟩   correlated=%s\n",
                t_A, t_B, t_A == t_B ? "YES ✓" : "NO ✗");
