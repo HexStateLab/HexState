@@ -57,26 +57,6 @@ static void rng_seed(uint64_t seed) {
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- * Live Physical Entropy and Detector Alignment:
- * Obtains high-precision physical timing/latency from a real monitor flash
- * via X11 and Monotonic clocks, then mixes it to derive 100% independent
- * detector draws for Photon A and Photon B.
- * ═══════════════════════════════════════════════════════════════════════ */
-/* PATCH (Issue 3): Removed X11 display-latency "entropy" source.
- * Display pipeline latency is dominated by OS scheduler and vsync — it is
- * NOT a quantum or physically independent entropy source.
- *
- * Replacement: two back-to-back CLOCK_MONOTONIC reads, each independently
- * mixed with a distinct 64-bit hash constant before use.  The two reads are
- * separated by a nanosleep so they land in different scheduler quanta and
- * carry independent jitter.  This is honest about what it is (OS timing
- * jitter) without pretending it is a physical quantum measurement.
- *
- * NOTE: for a real experiment, replace these reads with two independent
- * hardware random sources (e.g. /dev/hwrng, RDRAND, or dedicated QRNG
- * hardware on each detector channel) — one per detector, never shared.
- */
 static void get_independent_timing_seeds(uint64_t *seed_A, uint64_t *seed_B) {
     struct timespec tsA, tsB;
 
@@ -106,14 +86,6 @@ static void get_independent_timing_seeds(uint64_t *seed_A, uint64_t *seed_B) {
     *seed_B ^= (*seed_B >> 33);
 }
 
-/* PATCH (Issue 2): Both r_A and r_B previously came from a single timestamp ns,
- * making them deterministically related (seed_B = f(ns ^ constant)).  Knowing
- * one allowed the other to be predicted — they were NOT independent.
- *
- * Fix: each detector now gets its own seed from get_independent_timing_seeds(),
- * which takes two separate clock readings.  The return value is the XOR of both
- * seeds (used only for the trial timestamp display — not for any logical decision).
- */
 static uint64_t get_physical_draws(double *r_A, double *r_B) {
     uint64_t seed_A, seed_B;
     get_independent_timing_seeds(&seed_A, &seed_B);
@@ -157,39 +129,6 @@ static double von_neumann_entropy(const double *probs) {
     return S;
 }
 
-/* PATCH (Issue 6): The previous comment claimed that removing hpc_clone()
- * "enforces the no-cloning theorem."  This is incorrect.
- *
- * The no-cloning theorem is a statement about quantum mechanics: an unknown
- * quantum state cannot be perfectly duplicated by any unitary operation.
- * Removing a C function named hpc_clone() has no bearing on this — all
- * simulation state lives in ordinary heap memory that the OS can copy freely.
- *
- * What is true: hpc_clone() has been removed to avoid a specific software
- * artefact where giving the digital twin an exact classical copy of the
- * original's RNG state would guarantee identical outcomes by construction,
- * hiding rather than testing the entanglement correlation.  The removal is
- * a software design choice, not a physical constraint.
- * ═══════════════════════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════════════════════
- * Prepare two entangled photons in an HPC graph.
- *
- * Photon model:
- *   Polarisation is encoded in D=6 as two 3-level "colour channels":
- *     H-family: |0⟩, |1⟩, |2⟩   (horizontal basis)
- *     V-family: |3⟩, |4⟩, |5⟩   (vertical basis)
- *
- *   Each photon starts in an equal superposition over all 6 states via
- *   DFT₆ on |0⟩, modelling a photon with undefined polarisation.
- *
- *   Bell entanglement (quhit_entangle_bell / hpc_cz after DFT) creates
- *   the maximally entangled state:
- *       |Φ⁺⟩ = (1/√6) Σ_{k=0}^{5} |k,k⟩
- *   so measuring photon A to be |k⟩ guarantees photon B collapses to |k⟩
- *   — perfect correlation, the D=6 analogue of an EPR Bell pair.
- * ═══════════════════════════════════════════════════════════════════════ */
-/* Read 64 bits of hardware entropy from /dev/urandom */
 static uint64_t hw_entropy(void) {
     uint64_t val = 0;
     FILE *f = fopen("/dev/urandom", "rb");
@@ -205,20 +144,6 @@ static HPCGraph *prepare_entangled_photons(void) {
     hpc_dft(g, 0);
     hpc_dft(g, 1);
 
-    /* ── Entangle via hardware-entropy-seeded PHASE edge ──
-     *
-     * Instead of a plain CZ edge (w(a,b) = ω^(a·b)), we build a general
-     * HPC_EDGE_PHASE edge whose 6×6 phase matrix is seeded from /dev/urandom.
-     * The DT's "intention" is physically written into the entangling interaction
-     * at state-creation time — before any measurement, before any user input.
-     *
-     * Construction: start from the exact CZ phases, then apply a hardware-random
-     * U(1) rotation per row (per DT basis state).  Each row gets an independent
-     * random phase θ_k drawn from /dev/urandom, so w(a,b) = ω^(a·b) × e^{iθ_a}.
-     * This preserves the diagonal Bell correlation structure (each |k,k⟩ pair
-     * stays correlated) while embedding the DT's hardware-random intention as
-     * a unique phase signature in the joint state.
-     */
     HPCEdge e;
     memset(&e, 0, sizeof(e));
     e.type   = HPC_EDGE_PHASE;
