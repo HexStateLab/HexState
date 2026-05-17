@@ -3,8 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-/* X11/Xlib.h removed by patch — display-latency entropy source replaced */
-
+#include <float.h>
 #include "quhit_engine.h"
 #include "hpc_graph.h"
 #include "hpc_contract.h"
@@ -301,11 +300,7 @@ int main(void) {
     /* ══════════════════════════════════════════════════════════════════
      * PHASE 5 — Post-Event Saliency Analysis
      * ══════════════════════════════════════════════════════════════════ */
-    
-    /* Instead of using even/odd checks, we query the Triadic Saliency 
-     * directly from the physical timing draws. The detector channel with 
-     * the higher timing-entropy value is identified as the causal initiator.
-     */
+
     double sA = r_A; // Substrate-defined certainty for Site 0 (timing-entropy A)
     double sB = r_B; // Substrate-defined certainty for Site 1 (timing-entropy B)
 
@@ -348,26 +343,8 @@ int main(void) {
      * ══════════════════════════════════════════════════════════════════ */
     hpc_destroy(original);
 
-    /* Loop: run additional trials.
-     *
-     * EXPERIMENT DESIGN:
-     * The Digital Twin (Site 1) pre-selects a random target state BEFORE the
-     * user presses ENTER — locking in its "intention" independently.  It then
-     * collapses first via entanglement.  We verify:
-     *   (a) Did the DT actually collapse to its pre-selected target?
-     *   (b) Did the User's outcome follow the DT (quantum correlation)?
-     *   (c) Does the user's button-press latency (mod 6) match the DT target?
-     *       This is a curiosity/synchronicity metric — not a causal claim.
-     */
     uint32_t stat_trials = 0, stat_latency_hits = 0, stat_qt_hits = 0;
 
-/* * RETROCAUSAL EXTRACTION LOOP 
-     * Goal: The Digital Twin 'decides' the result based on the Physical Latency.
-     */
-/* Loop: run additional trials */
-/* * RETROCAUSAL EXTRACTION LOOP 
-     * Goal: The Digital Twin 'decides' the result based on the Physical Latency.
-     */
     while (1) {
         printf("\n─── NEW TRIAL (RETROCAUSAL MODE) ───────────────────────────────\n");
         printf("  Digital Twin is holding the entangled state...\n");
@@ -384,7 +361,7 @@ int main(void) {
 
         // 3. GENERATE CONSTRAINED DRAW
         // Maps the physical latency (0-5) to the probability sector [k/6, (k+1)/6].
-        double constrained_draw = ((double)latency_mod6 / 6.0) + 0.08;
+double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
 
         uint32_t t_B, t_A;
 
