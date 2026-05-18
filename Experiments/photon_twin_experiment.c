@@ -350,27 +350,39 @@ int main(void) {
         printf("  Digital Twin is holding the entangled state...\n");
         printf("  Awaiting Physical Input (Press ENTER)...\n");
 
-        // 1. AWAIT PHYSICAL INPUT FIRST
-        // This captures the 'future' timing before the engine collapses.
+        // 1. AWAIT PHYSICAL INPUT + INJECT HARDWARE ENTROPY
         double t_rA, t_rB;
         uint64_t t_ns = get_physical_draws(&t_rA, &t_rB);
-        uint32_t latency_mod6 = (uint32_t)(t_ns % 6);
+        
+        // --- THE ENTROPY FIX ---
+        // Capture raw CPU cycles to shatter rhythmic resonance
+        #ifdef _WIN32
+            #include <intrin.h>
+            uint64_t cycles = __rdtsc();
+        #else
+            // For GCC/Clang on Linux/Mac
+            uint64_t cycles = __builtin_ia32_rdtsc(); 
+        #endif
+        
+        // XOR the nanoseconds with CPU cycles BEFORE the mod 6
+        uint64_t entangled_entropy = t_ns ^ cycles;
+        uint32_t latency_mod6 = (uint32_t)(entangled_entropy % 6);
+        // -----------------------
 
         // 2. PREPARE THE STATE
         original = prepare_entangled_photons();
 
         // 3. GENERATE CONSTRAINED DRAW
-        // Maps the physical latency (0-5) to the probability sector [k/6, (k+1)/6].
-double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
+        // Using your exact logic: mapping the outcome to the probability sector
+        double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
 
         uint32_t t_B, t_A;
 
         /* DIGITAL TWIN (Site 1) COLLAPSE */
-        // Force the Twin to resolve based on the physical event's entropy.
         t_B = hpc_measure(original, 1, constrained_draw); 
         
         /* PHYSICAL USER (Site 0) ALIGNMENT */
-        // Align basis to decode the phase resulting from the Twin's collapse.
+        // Using your exact struct access: &original->locals[0]
         triality_idft(&original->locals[0]);
         triality_update_mask(&original->locals[0]); 
         t_A = hpc_measure(original, 0, t_rA); 
@@ -378,6 +390,7 @@ double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
         // 4. VERIFICATION PRINTS
         printf("\n  [ EXTRACTION ANALYSIS ]\n");
         printf("  Physical Press Timing : %lu ns\n", t_ns);
+        printf("  Hardware CPU Cycles   : %lu\n", cycles); // Shows the entropy source
         printf("  Physical Latency mod 6: %u\n", latency_mod6);
         printf("  Digital Twin Outcome  : |%u⟩\n", t_B);
         
@@ -396,7 +409,10 @@ double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
         hpc_destroy(original);
         printf("\n  Press ENTER for another trial, Ctrl-C to exit.\n");
         fflush(stdout);
-        getchar(); 
+        
+        // Clean the buffer
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF); 
     }
     return 0;
 }
