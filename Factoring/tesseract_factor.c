@@ -149,7 +149,7 @@ static double hw_epr_reality(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define MAX_DT_SITES    65536
-#define DT_RESOLVE_MIN   2       /* minimum pos_count before trusting prior */
+#define DT_RESOLVE_MIN   1       /* minimum pos_count before trusting prior */
 #define RESOLVED_THRESHOLD  0.40   /* position considered resolved above 40% lock */
 
 static double pos_prior[MAX_DT_SITES][6];  /* positional prior */
@@ -157,6 +157,17 @@ static int    pos_hits [MAX_DT_SITES];     /* positional hits   */
 static int    pos_count[MAX_DT_SITES];     /* positional counts */
 static int    pos_memory_ready = 0;        /* 0 = uninitialised                        */
 static int    g_n_sites_raw    = 0;        /* register size set on first call          */
+
+/* Reset positional memory (called when base changes to prevent cross-contamination) */
+static void pos_memory_reset(void)
+{
+    int sz = (g_n_sites_raw < MAX_DT_SITES) ? g_n_sites_raw : MAX_DT_SITES;
+    for (int k = 0; k < sz; k++) {
+        for (int d = 0; d < 6; d++) pos_prior[k][d] = 1.0 / 6.0;
+        pos_hits [k] = 0;
+        pos_count[k] = 0;
+    }
+}
 
 /* Initialise or verify positional memory for a given register size.
  * Called once per engine run (not per base). */
@@ -246,7 +257,7 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     double oracle_raw = hw_epr_oracle();
     dt->oracle_raw    = oracle_raw;
 
-    /* Combined score: CABP × positional prior + oracle tiebreak */
+    /* Combined score: CABP × positional prior */
     double scores[6], score_total = 0.0;
     for (int d = 0; d < 6; d++) {
         scores[d]    = cabp_probs[d] * dt->priors[d];
@@ -257,12 +268,11 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     else
         for (int d = 0; d < 6; d++) scores[d] /= score_total;
 
-    /* Stochastic draw from scores distribution using oracle (channel A) */
-    double cumul = 0.0;
-    int    best_digit = 5;
-    for (int d = 0; d < 6; d++) {
-        cumul += scores[d];
-        if (oracle_raw <= cumul) { best_digit = d; break; }
+    /* Argmax: pick the digit with highest score (deterministic prediction) */
+    int    best_digit = 0;
+    double best_score = scores[0];
+    for (int d = 1; d < 6; d++) {
+        if (scores[d] > best_score) { best_score = scores[d]; best_digit = d; }
     }
     dt->dt_prediction = best_digit;
 
@@ -319,9 +329,9 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
      * useful signal — writing them would smear the prior toward uniform
      * and erase whatever structure has been learned.  Only high-confidence
      * peaks update pos_prior and pos_hits/pos_count. */
-    /* Gatekeeper: only gate low-confidence (< 95%). Only very high-confidence
-     * signals update positional memory to avoid noise contamination. */
-    if (amplitude < 0.95) {
+    /* Gatekeeper: only gate low-confidence (< 25%). Just above 1.5× uniform floor of 1/6 ≈ 0.167.
+     * Only high-confidence signals update positional memory to avoid noise contamination. */
+    if (amplitude < 0.75) {
         /* Still log the updated lock rate even for gated samples */
         double pct = dt_resolution_pct(dt->n_sites_raw);
         FILE *log = fopen("dt_shor_commit.log", "w");
@@ -2965,7 +2975,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     BigInt mc_d_bi, mc_term, mc_tmp;
     bigint_set_u64(&mc_d_bi, 0); bigint_set_u64(&mc_term, 0); bigint_set_u64(&mc_tmp, 0);
 
-    if (n_resolved_strong > n_sites_raw / 4) {
+    if (n_resolved_strong > n_sites_raw / 8) {
         printf("  Attempting direct frequency reconstruction from positional memory...\n");
 
         /* Build base frequency: argmax of blended pos_prior × CABP per position */
@@ -3547,8 +3557,15 @@ int main(int argc, char **argv)
     BigInt cf_history[200];
     for (int i = 0; i < 200; i++) bigint_set_u64(&cf_history[i], 0);
     int cf_hist_count = 0;
+    int first_base = 1;  /* Track first base to avoid resetting initial state */
     for (int bi = active_base_idx; !success; bi = (auto_a ? (bi + 1) % 200 : bi)) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
+
+        /* Reset positional memory when base changes to prevent cross-contamination */
+        if (!first_base && pos_memory_ready) {
+            pos_memory_reset();
+        }
+        first_base = 0;
 
         char a_str[1300];
         bigint_to_decimal(a_str, sizeof(a_str), &a_val);
