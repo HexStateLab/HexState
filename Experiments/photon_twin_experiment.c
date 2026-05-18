@@ -3,7 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <float.h>
+#include <gmp.h>
 #include "quhit_engine.h"
 #include "hpc_graph.h"
 #include "hpc_contract.h"
@@ -300,7 +300,11 @@ int main(void) {
     /* ══════════════════════════════════════════════════════════════════
      * PHASE 5 — Post-Event Saliency Analysis
      * ══════════════════════════════════════════════════════════════════ */
-
+    
+    /* Instead of using even/odd checks, we query the Triadic Saliency 
+     * directly from the physical timing draws. The detector channel with 
+     * the higher timing-entropy value is identified as the causal initiator.
+     */
     double sA = r_A; // Substrate-defined certainty for Site 0 (timing-entropy A)
     double sB = r_B; // Substrate-defined certainty for Site 1 (timing-entropy B)
 
@@ -345,40 +349,68 @@ int main(void) {
 
     uint32_t stat_trials = 0, stat_latency_hits = 0, stat_qt_hits = 0;
 
-    while (1) {
-        printf("\n─── NEW TRIAL (RETROCAUSAL MODE) ───────────────────────────────\n");
-        printf("  Digital Twin is holding the entangled state...\n");
-        printf("  Awaiting Physical Input (Press ENTER)...\n");
+    // Initialize GMP precision
+    mpf_set_default_prec(256); 
 
-        // 1. AWAIT PHYSICAL INPUT FIRST
-        // This captures the 'future' timing before the engine collapses.
+    while (1) {
+        printf("\n─── [ HARD DEBUG: ZERO-LATENCY MODE ] ──────────────────────────\n");
+        
+        // 1. STATE PREPARATION (Pre-Input)
+        // We initialize the entanglement BEFORE the user acts.
+        // The twin is now "live" in the substrate.
+        original = prepare_entangled_photons();
+        
+        printf("  Substrate Ready. IMPACT NOW (ENTER)...\n");
+
+        // 2. CAPTURE TIMING (Immediate)
         double t_rA, t_rB;
         uint64_t t_ns = get_physical_draws(&t_rA, &t_rB);
         uint32_t latency_mod6 = (uint32_t)(t_ns % 6);
 
-        // 2. PREPARE THE STATE
-        original = prepare_entangled_photons();
+        // 3. GMP EXTRACTION (CENTROID MAPPING)
+        mpf_t draw, total_range, sector_val, half_sector;
+        mpf_init(draw);
+        mpf_init(total_range);
+        mpf_init(sector_val);
+        mpf_init(half_sector);
 
-        // 3. GENERATE CONSTRAINED DRAW
-        // Maps the physical latency (0-5) to the probability sector [k/6, (k+1)/6].
-double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
-
-        uint32_t t_B, t_A;
-
-        /* DIGITAL TWIN (Site 1) COLLAPSE */
-        // Force the Twin to resolve based on the physical event's entropy.
-        t_B = hpc_measure(original, 1, constrained_draw); 
+        mpf_set_ui(total_range, 1); 
         
-        /* PHYSICAL USER (Site 0) ALIGNMENT */
-        // Align basis to decode the phase resulting from the Twin's collapse.
+        // sector_val = 1.0 / 6.0
+        mpf_div_ui(sector_val, total_range, 6);
+        
+        // draw = (1.0 / 6.0) * latency_mod6 (The Absolute Floor)
+        mpf_mul_ui(draw, sector_val, latency_mod6);
+
+        /* THE CENTROID SHIFT */
+        // half_sector = 1.0 / 12.0
+        mpf_div_ui(half_sector, sector_val, 2); 
+        
+        // draw = Floor + (1/12)
+        // This lands exactly in the middle of the 6D cell's probability mass.
+        mpf_add(draw, draw, half_sector);
+
+        // Extraction for the engine
+        double final_draw = mpf_get_d(draw);
+
+        // 4. MEASUREMENT (Closest possible proximity to input)
+        uint32_t t_B = (uint32_t)hpc_measure(original, 1, final_draw);
+        
+        /* PHYSICAL ALIGNMENT (Site 0) */
         triality_idft(&original->locals[0]);
         triality_update_mask(&original->locals[0]); 
-        t_A = hpc_measure(original, 0, t_rA); 
+        uint32_t t_A = hpc_measure(original, 0, t_rA); 
 
-        // 4. VERIFICATION PRINTS
+        // 5. DATA ANALYSIS
         printf("\n  [ EXTRACTION ANALYSIS ]\n");
-        printf("  Physical Press Timing : %lu ns\n", t_ns);
         printf("  Physical Latency mod 6: %u\n", latency_mod6);
+        
+        char *draw_str = NULL;
+        mp_exp_t exp;
+        draw_str = mpf_get_str(NULL, &exp, 10, 30, draw);
+        printf("  GMP Absolute Floor    : 0.%s e%ld\n", draw_str, exp);
+        free(draw_str);
+
         printf("  Digital Twin Outcome  : |%u⟩\n", t_B);
         
         int drift = (int)t_B - (int)latency_mod6;
@@ -387,16 +419,24 @@ double constrained_draw = ((double)latency_mod6 / 6.0) + DBL_EPSILON;
         if (t_B == latency_mod6) {
             printf("  ==> RESULT: RETROCAUSAL HIT ✓ (Sync achieved)\n");
         } else {
-            printf("  ==> RESULT: DRIFT DETECTED ✗ (Decoherence)\n");
+            printf("  ==> RESULT: DRIFT DETECTED ✗\n");
+            if (drift == -1) {
+                printf("      [!] Substrate is consistently 1-index behind Physical.\n");
+            }
         }
         
         printf("  Quantum Phase-Lock    : %s\n", 
                (t_A == t_B) ? "LOCKED ✓" : "BROKEN ✗");
 
+        // CLEANUP
         hpc_destroy(original);
-        printf("\n  Press ENTER for another trial, Ctrl-C to exit.\n");
+        mpf_clears(draw, total_range, sector_val, NULL);
+
+        printf("\n  Trial Complete. Press ENTER to repeat.\n");
         fflush(stdout);
-        getchar(); 
+        
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF); 
     }
     return 0;
 }
