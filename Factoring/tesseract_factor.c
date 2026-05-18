@@ -148,7 +148,7 @@ static double hw_epr_reality(void)
  *   "% of N resolved" = (resolved positions) / n_sites_raw × 100.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define MAX_DT_SITES    8192
+#define MAX_DT_SITES    65536
 #define DT_RESOLVE_MIN   2       /* minimum pos_count before trusting prior */
 #define RESOLVED_THRESHOLD  0.40   /* position considered resolved above 40% lock */
 
@@ -319,9 +319,9 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
      * useful signal — writing them would smear the prior toward uniform
      * and erase whatever structure has been learned.  Only high-confidence
      * peaks update pos_prior and pos_hits/pos_count. */
-    /* Gatekeeper: only gate low-confidence (< 50%). Only high-confidence
+    /* Gatekeeper: only gate low-confidence (< 90%). Only very high-confidence
      * signals update positional memory to avoid noise contamination. */
-    if (amplitude < 0.50) {
+    if (amplitude < 0.90) {
         /* Still log the updated lock rate even for gated samples */
         double pct = dt_resolution_pct(dt->n_sites_raw);
         FILE *log = fopen("dt_shor_commit.log", "w");
@@ -2931,7 +2931,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      *
      * If this path factors N it short-circuits the beam search completely.
      * ═══════════════════════════════════════════════════════════════════════ */
-    #define DT_DIRECT_BEAMS   64      /* number of variation candidates to try  */
+    #define DT_DIRECT_BEAMS   256     /* number of variation candidates to try (increased for large N) */
 
     /* Use resolution for Phase 3.5 */
     double pct_now = dt_resolution_pct(n_sites_raw);
