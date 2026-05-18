@@ -319,9 +319,9 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
      * useful signal — writing them would smear the prior toward uniform
      * and erase whatever structure has been learned.  Only high-confidence
      * peaks update pos_prior and pos_hits/pos_count. */
-    /* Gatekeeper: only gate low-confidence (< 90%). Only very high-confidence
+    /* Gatekeeper: only gate low-confidence (< 95%). Only very high-confidence
      * signals update positional memory to avoid noise contamination. */
-    if (amplitude < 0.90) {
+    if (amplitude < 0.95) {
         /* Still log the updated lock rate even for gated samples */
         double pct = dt_resolution_pct(dt->n_sites_raw);
         FILE *log = fopen("dt_shor_commit.log", "w");
