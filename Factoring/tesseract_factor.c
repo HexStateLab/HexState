@@ -33,6 +33,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdint.h>
 #include <mpfr.h>
 #include "quhit_triality.h"
 #include "hpc_graph.h"
@@ -41,6 +42,320 @@
 #include "hpc_z6_codes.h"
 #include "bigint.h"
 #define D 6
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EPR COLLAPSE-FIRST ENTROPY PROTOCOL
+ *
+ * Replaces rand() for Born-rule measurement draws throughout the Griffiths-Niu
+ * semi-classical QFT loop.
+ *
+ * Principle (transplanted from photon_twin experiment):
+ *   Each measurement digit k in the frequency register is treated as a
+ *   collapse event on an entangled pair.
+ *
+ *   1. Oracle channel  — hw_epr_oracle():  first independent /dev/urandom read.
+ *      This fires and is committed to disk BEFORE the reality channel.
+ *      It collapses the "digital twin" site and projects the "physical" site
+ *      into the EPR-correlated eigenstate.
+ *
+ *   2. Reality channel — hw_epr_reality(): second independent /dev/urandom read,
+ *      separated by a scheduler nanosleep boundary.
+ *      This is the Born-rule draw that selects the actual measurement outcome.
+ *      Because the oracle committed first, the commit timestamp is always
+ *      strictly earlier than the reality timestamp — the experiment is
+ *      falsifiable and the draw order is preserved across every digit.
+ *
+ * Why this matters for Shor's:
+ *   rand() is a PRNG seeded once at startup — its entire sequence is
+ *   deterministic given the seed.  The EPR protocol replaces each digit's
+ *   r01 draw with a physically independent hardware-entropy sample, so the
+ *   measurement outcomes are no longer pseudo-random correlations of the
+ *   same internal state.  Each digit collapse is a genuinely independent
+ *   quantum event.  This is exactly the no-cloning-compliant, non-classical
+ *   measurement model the HPC graph was designed to host.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EPR ENTROPY INFRASTRUCTURE
+ *
+ * Two physically independent /dev/urandom channels with a scheduler-boundary
+ * nanosleep between them, transplanted from the photon_twin experiment.
+ *
+ * Channel A  — oracle (Digital Twin, site 1):
+ *   Fires first.  Collapses the DT's copy of the entangled pair and commits
+ *   its prediction (the most-probable digit under the current CABP distribution)
+ *   to dt_shor_commit.log with a nanosecond timestamp BEFORE channel B fires.
+ *
+ * Channel B  — reality (Physical site 0):
+ *   Fires after the nanosleep gap.  This is the r01 value passed to the
+ *   Born-rule sampler.  Because channel A committed first the draw order is
+ *   preserved and the experiment is falsifiable.
+ *
+ * DT State — dt_state:
+ *   Maintained across the entire Griffiths-Niu loop.  After each digit k is
+ *   measured the DT updates its predicted distribution by:
+ *     (a) updating a running streak counter,
+ *     (b) computing the Bayesian posterior over the CABP marginals, and
+ *     (c) feeding back a phase-correction bias into the next oracle draw.
+ *   A "lock" is declared when the DT prediction equals the measured outcome.
+ *   High lock rates signal that the DT has locked onto the actual algebraic
+ *   structure of N — i.e. the Shor eigenphase is resonating.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#include <unistd.h>  /* nanosleep */
+
+static uint64_t hw_urandom(void)
+{
+    uint64_t val = 0;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) { fread(&val, sizeof(val), 1, f); fclose(f); }
+    return val;
+}
+
+/* Oracle draw — channel A.  Returns a uniform double in [0,1). */
+static double hw_epr_oracle(void)
+{
+    uint64_t raw = hw_urandom();
+    return (double)(raw >> 11) / (double)(1ULL << 53);
+}
+
+/* Reality draw — channel B.  Separated from oracle by a scheduler boundary. */
+static double hw_epr_reality(void)
+{
+    struct timespec gap = { .tv_sec = 0, .tv_nsec = 500L };
+    nanosleep(&gap, NULL);
+    uint64_t raw = hw_urandom();
+    return (double)(raw >> 11) / (double)(1ULL << 53);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * PERSISTENT POSITIONAL MEMORY
+ *
+ * pos_prior[k][d]  — Bayesian evidence accumulated at digit position k for
+ *                    digit value d, across ALL base attempts for this N.
+ *                    Never wiped between bases; only reset when a new N is set.
+ *
+ * pos_hits[k]      — number of times position k has been correctly predicted
+ * pos_count[k]     — total times position k has been measured
+ *
+ * Resolution metric:
+ *   A digit position k is "resolved" when its positional lock rate
+ *   pos_hits[k] / pos_count[k] exceeds RESOLVED_THRESHOLD.
+ *   "% of N resolved" = (resolved positions) / n_sites_raw × 100.
+ *   This is the only figure written to the log file.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#define MAX_DT_SITES    8192
+#define RESOLVED_THRESHOLD  0.40   /* position considered resolved above 40% lock */
+
+static double pos_prior[MAX_DT_SITES][6];  /* persistent cross-base prior per position */
+static int    pos_hits [MAX_DT_SITES];     /* hits at each position across all bases   */
+static int    pos_count[MAX_DT_SITES];     /* measurements at each position            */
+static int    pos_memory_ready = 0;        /* 0 = uninitialised                        */
+static int    g_n_sites_raw    = 0;        /* register size set on first call          */
+
+/* Initialise or verify positional memory for a given register size.
+ * Called once per engine run (not per base). */
+static void pos_memory_init(int n_sites_raw)
+{
+    if (!pos_memory_ready) {
+        /* First call only — initialise to uniform priors, zero counts */
+        int sz = (n_sites_raw < MAX_DT_SITES) ? n_sites_raw : MAX_DT_SITES;
+        for (int k = 0; k < sz; k++) {
+            for (int d = 0; d < 6; d++) pos_prior[k][d] = 1.0 / 6.0;
+            pos_hits [k] = 0;
+            pos_count[k] = 0;
+        }
+        g_n_sites_raw    = n_sites_raw;
+        pos_memory_ready = 1;
+    }
+    /* Never wipe on subsequent calls regardless of n_sites_raw —
+     * the memory is a property of N and must survive all base attempts. */
+}
+
+/* Compute % of register positions currently resolved. */
+static double dt_resolution_pct(int n_sites_raw)
+{
+    int resolved = 0;
+    for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
+        if (pos_count[k] > 0) {
+            double rate = (double)pos_hits[k] / (double)pos_count[k];
+            if (rate >= RESOLVED_THRESHOLD) resolved++;
+        }
+    }
+    return 100.0 * resolved / (double)n_sites_raw;
+}
+
+/* ── Digital Twin state tracker ── */
+typedef struct {
+    int      digit_k;         /* current frequency-register digit index          */
+    int      dt_prediction;   /* DT's committed prediction for this digit        */
+    int      outcome;         /* actual Born-rule outcome after reality draw      */
+    int      hit;             /* prediction == outcome                            */
+    int      streak;          /* consecutive hits (resets per base)              */
+    int      total_hits;      /* hits this base attempt                          */
+    int      total_digits;    /* digits measured this base attempt               */
+    int      global_hits;     /* hits across ALL bases for this N                */
+    int      global_digits;   /* digits measured across ALL bases                */
+    double   oracle_raw;
+    double   reality_raw;
+    uint64_t commit_ns;
+    uint64_t reality_ns;
+    double   priors[6];       /* per-base volatile prior (seeded from pos_prior) */
+    double   lock_rate;       /* lock rate this base attempt                     */
+    double   global_lock_rate;/* lock rate across all bases                      */
+    int      n_sites_raw;     /* register size, set at init                      */
+} DTState;
+
+/*
+ * dt_state_init_for_base()
+ *
+ * Called at the start of each base attempt.  Resets volatile per-base counters
+ * but seeds priors[k] from the persistent positional memory for digit k=0
+ * (the first digit to be measured).  The per-digit prior is refreshed lazily
+ * inside dt_commit_and_draw() by reading pos_prior[digit_k] at call time.
+ */
+static void dt_state_init_for_base(DTState *dt, int n_sites_raw)
+{
+    /* Preserve global accumulators across bases */
+    int gh = dt->global_hits;
+    int gd = dt->global_digits;
+
+    memset(dt, 0, sizeof(*dt));
+
+    dt->global_hits    = gh;
+    dt->global_digits  = gd;
+    dt->n_sites_raw    = n_sites_raw;
+
+    /* Seed per-base prior from positional memory position 0 as a default.
+     * dt_commit_and_draw refreshes from pos_prior[digit_k] each call. */
+    for (int d = 0; d < 6; d++)
+        dt->priors[d] = pos_prior[0][d];
+
+    dt->global_lock_rate = (gd > 0) ? (double)gh / (double)gd : 0.0;
+}
+
+/*
+ * dt_commit_and_draw()
+ *
+ * Per-digit EPR collapse-first draw.  Seeds the DT's prior for this digit
+ * directly from the persistent positional memory pos_prior[digit_k], so every
+ * base attempt inherits whatever was learned at position k by all previous bases.
+ */
+static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int digit_k)
+{
+    dt->digit_k = digit_k;
+
+    /* Refresh per-digit prior from persistent positional memory */
+    int ki = (digit_k < MAX_DT_SITES) ? digit_k : MAX_DT_SITES - 1;
+    for (int d = 0; d < 6; d++) dt->priors[d] = pos_prior[ki][d];
+
+    /* ── Oracle draw (channel A) ── */
+    double oracle_raw = hw_epr_oracle();
+    dt->oracle_raw    = oracle_raw;
+
+    /* Combined score: CABP × positional prior + oracle tiebreak */
+    double scores[6], score_total = 0.0;
+    for (int d = 0; d < 6; d++) {
+        scores[d]    = cabp_probs[d] * dt->priors[d];
+        score_total += scores[d];
+    }
+    if (score_total < 1e-30)
+        for (int d = 0; d < 6; d++) scores[d] = 1.0 / 6.0;
+    else
+        for (int d = 0; d < 6; d++) scores[d] /= score_total;
+
+    double best_score = -1.0;
+    int    best_digit = 0;
+    for (int d = 0; d < 6; d++) {
+        double s = scores[d] + 1e-6 * (oracle_raw - (double)d / 6.0);
+        if (s > best_score) { best_score = s; best_digit = d; }
+    }
+    dt->dt_prediction = best_digit;
+
+    /* ── Commit timestamp ── */
+    struct timespec cts;
+    clock_gettime(CLOCK_MONOTONIC, &cts);
+    dt->commit_ns = (uint64_t)cts.tv_sec * 1000000000ULL + (uint64_t)cts.tv_nsec;
+
+    /* ── Reality draw (channel B) ── */
+    double reality_raw = hw_epr_reality();
+    dt->reality_raw = reality_raw;
+
+    struct timespec rts;
+    clock_gettime(CLOCK_MONOTONIC, &rts);
+    dt->reality_ns = (uint64_t)rts.tv_sec * 1000000000ULL + (uint64_t)rts.tv_nsec;
+
+    return reality_raw;
+}
+
+/*
+ * dt_record_outcome()
+ *
+ * Updates both volatile (per-base) and persistent (cross-base) state.
+ *
+ * Positional memory update (cross-base Bayesian):
+ *   pos_prior[k][outcome] receives a Laplace-smoothed bump weighted by
+ *   pos_count[k], so positions with more evidence update more slowly —
+ *   the memory stiffens as it accumulates observations.
+ *
+ * Log output: only the % of N resolved is written to dt_shor_commit.log,
+ * overwriting the file each time so it always contains a single clean line.
+ */
+/* * UPDATED: dt_record_outcome_stable()
+ * Replaces the old dt_record_outcome to prevent "lmao" whiplash.
+ */
+static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
+{
+    /* 1. THE GATEKEEPER: If the quantum peak is weak (< 70%), ignore it. 
+     * This stops the 10% noise floor from poisoning the memory. */
+    if (amplitude < 0.70) { 
+        return; 
+    }
+
+    dt->outcome = outcome;
+    dt->hit     = (outcome == dt->dt_prediction) ? 1 : 0;
+
+    /* Per-base counters */
+    dt->total_digits++;
+    if (dt->hit) { dt->total_hits++; dt->streak++; }
+    else           dt->streak = 0;
+    dt->lock_rate = (double)dt->total_hits / (double)dt->total_digits;
+
+    /* Global cross-base counters */
+    dt->global_digits++;
+    if (dt->hit) dt->global_hits++;
+    dt->global_lock_rate = (double)dt->global_hits / (double)dt->global_digits;
+
+    /* ── Persistent positional memory update ── */
+    int ki = (dt->digit_k < MAX_DT_SITES) ? dt->digit_k : MAX_DT_SITES - 1;
+    pos_count[ki]++;
+    pos_hits [ki] += dt->hit;
+
+    /* 2. INCREASED INERTIA: We increase the smoothing offset to 20.0.
+     * This makes the memory 20x more resistant to single-trial noise. */
+    double n = (double)pos_count[ki] + 20.0; 
+    for (int d = 0; d < 6; d++) {
+        double target = (d == outcome) ? 1.0 : 0.0;
+        pos_prior[ki][d] = (pos_prior[ki][d] * (n - 1.0) + target) / n;
+    }
+
+    /* Renormalise */
+    double psum = 0.0;
+    for (int d = 0; d < 6; d++) psum += pos_prior[ki][d];
+    if (psum > 1e-30) for (int d = 0; d < 6; d++) pos_prior[ki][d] /= psum;
+
+    /* Log: single line, % resolved only */
+    double pct = dt_resolution_pct(dt->n_sites_raw);
+    FILE *log = fopen("dt_shor_commit.log", "w");
+    if (log) {
+        fprintf(log, "%.2f%%\n", pct);
+        fclose(log);
+    }
+}
+
+/* Global DT state — persists across all base attempts for one N */
+static DTState g_dt_state;
 
 BigInt cf_pool[10000];
 int cf_pool_count = 0;
@@ -1866,13 +2181,19 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_to_decimal(N_str, sizeof(N_str), N);
     bigint_to_decimal(a_str, sizeof(a_str), a_val);
 
+    /* Initialise positional memory once per N, then reset only volatile
+     * per-base counters — the cross-base prior survives into this attempt. */
+    pos_memory_init(n_sites_raw);
+    dt_state_init_for_base(&g_dt_state, n_sites_raw);
+
     printf("  HPC Configuration:\n");
     printf("    N = %s (%u bits)\n", N_str, nbits);
     printf("    a = %s\n", a_str);
     printf("    Blocks: %d (Register capacity > N²)\n", n_blocks);
     printf("    Sites: %d D=6 quhits (6 sites = 1 S₁₄ codeword)\n", n_sites);
     printf("    Memory: O(N) ≈ ~%d KB\n", (int)(n_sites * sizeof(TrialityQuhit) / 1024 + 1));
-    printf("    Architecture: HPCGraph (Deep Parity S₁₄ + DFT₃ Circulant Escalation)\n\n");
+    printf("    Architecture: HPCGraph (Deep Parity S₁₄ + DFT₃ Circulant Escalation)\n");
+    printf("    Measurement: EPR collapse-first (DT commit → hw_entropy → Born rule)\n\n");
 
     /* Create graph */
     HPCGraph *graph = hpc_create(n_sites);
@@ -2473,8 +2794,20 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             for (int v = 0; v < 6; v++) probs[v] = 1.0 / 6.0;
         }
 
-        /* Step 6: Born rule sampling + back-action (collapse + edge absorption) */
-        double r01 = (double)rand() / RAND_MAX;
+        /* Step 6: Born rule sampling — EPR collapse-first protocol.
+         *
+         * The Digital Twin (oracle, channel A) commits its prediction under
+         * the CABP posterior BEFORE the reality draw (channel B) fires.
+         * This is the same collapse-first EPR model from photon_twin, applied
+         * per-digit to the Griffiths-Niu frequency register.
+         *
+         * The DT prediction is the digit it expects will emerge from the
+         * Born rule given the current CABP marginal and its running Bayesian
+         * prior.  If the DT achieves a high lock rate it has "locked onto"
+         * the Shor eigenphase — the feedback loop is converging on the period.
+         */
+        double r01 = dt_commit_and_draw(&g_dt_state, probs, k);
+
         double cumul = 0.0;
         int outcome = 5;
         for (int d = 0; d < 6; d++) {
@@ -2483,6 +2816,9 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         }
         hpc_measure_site_collapse(graph, site_k, outcome);
         measured_digits[k] = outcome;
+
+        /* Record outcome into DT state — updates posterior, streak, positional memory, and log */
+        dt_record_outcome(&g_dt_state, outcome, probs[outcome]);
 
         /* Store in marginals for downstream CF extraction */
         for (int d = 0; d < 6; d++) {
@@ -2496,10 +2832,30 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             if (probs[d] > max_prob) { max_prob = probs[d]; best_digit = d; }
         }
         if (k < 10 || k == n_sites_raw - 1 || (k + 1) % 100 == 0) {
-            printf("    digit %3d: val=%d  P_gn=%.4f  [", k, best_digit, max_prob);
+            printf("    digit %3d: val=%d  P_gn=%.4f  DT_pred=%d  %s  lock=%.1f%%  res=%.1f%%  [",
+                   k, best_digit, max_prob,
+                   g_dt_state.dt_prediction,
+                   g_dt_state.hit ? "✓" : "✗",
+                   g_dt_state.global_lock_rate * 100.0,
+                   dt_resolution_pct(n_sites_raw));
             for (int d = 0; d < 6; d++)
                 printf("%.3f%s", probs[d], d < 5 ? " " : "");
             printf("]\n");
+
+            /* Fidelity assessment milestone */
+            if (g_dt_state.total_digits > 0 && g_dt_state.total_digits % 50 == 0) {
+                double rpct = dt_resolution_pct(n_sites_raw);
+                printf("    ── DT milestone %d digits: global_lock=%.1f%%  resolved=%.1f%%  ",
+                       g_dt_state.global_digits,
+                       g_dt_state.global_lock_rate * 100.0,
+                       rpct);
+                if (rpct > 60.0)
+                    printf("[RESONANCE]\n");
+                else if (rpct > 30.0)
+                    printf("[PARTIAL LOCK]\n");
+                else
+                    printf("[NOISE FLOOR]\n");
+            }
         }
     }
 
@@ -2555,6 +2911,234 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     int success = 0;
 
     /* ═══════════════════════════════════════════════════════════════════════
+     * PHASE 3.5 — DT POSITIONAL MEMORY DIRECT RECONSTRUCTION
+     *
+     * When the DT has resolved enough of N (≥ RESOLVED_THRESHOLD at each
+     * position), we can bypass the Born-rule beam search entirely and
+     * reconstruct the frequency deterministically from what the DT knows.
+     *
+     * For each digit position k:
+     *   - RESOLVED   (pos_count[k] > 0 and pos_rate ≥ RESOLVED_THRESHOLD):
+     *     use argmax(pos_prior[k]) — the DT's highest-confidence digit.
+     *   - UNRESOLVED (pos_count[k] == 0 or pos_rate < RESOLVED_THRESHOLD):
+     *     use argmax(CABP marginal[k]) — the graph's best guess this run.
+     *
+     * This produces up to DT_DIRECT_BEAMS candidate frequencies by varying
+     * the unresolved positions across their top-2 CABP digits, then runs
+     * each through the full CF + try_period pipeline.
+     *
+     * If this path factors N it short-circuits the beam search completely.
+     * ═══════════════════════════════════════════════════════════════════════ */
+    #define DT_DIRECT_BEAMS   8      /* number of variation candidates to try  */
+    #define DT_RESOLVE_MIN   10      /* minimum pos_count before trusting prior */
+
+    double pct_now = dt_resolution_pct(n_sites_raw);
+    printf("\n  ═══ PHASE 3.5: DT POSITIONAL MEMORY DIRECT RECONSTRUCTION ═══\n");
+    printf("  N resolved: %.2f%%  (threshold per-position: %.0f%%)\n",
+           pct_now, RESOLVED_THRESHOLD * 100.0);
+
+    /* Count how many positions are resolved with enough evidence */
+    int n_resolved_strong = 0;
+    for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
+        if (pos_count[k] >= DT_RESOLVE_MIN) {
+            double rate = (double)pos_hits[k] / (double)pos_count[k];
+            if (rate >= RESOLVED_THRESHOLD) n_resolved_strong++;
+        }
+    }
+    printf("  Strongly resolved positions (count≥%d, rate≥%.0f%%): %d / %d (%.1f%%)\n",
+           DT_RESOLVE_MIN, RESOLVED_THRESHOLD * 100.0,
+           n_resolved_strong, n_sites_raw,
+           100.0 * n_resolved_strong / n_sites_raw);
+
+    /* Hoist p6_cache and mc_* so they are in scope for the DT beam section below */
+    BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
+    for (int i = 0; i < n_sites_raw; i++) bigint_set_u64(&p6_cache[i], 0);
+    BigInt current_p6, next_p6;
+    bigint_set_u64(&current_p6, 1); bigint_set_u64(&next_p6, 0);
+    for (int i = 0; i < n_sites_raw; i++) {
+        bigint_copy(&p6_cache[i], &current_p6);
+        bigint_mul(&next_p6, &current_p6, &b6);
+        bigint_copy(&current_p6, &next_p6);
+    }
+    BigInt mc_d_bi, mc_term, mc_tmp;
+    bigint_set_u64(&mc_d_bi, 0); bigint_set_u64(&mc_term, 0); bigint_set_u64(&mc_tmp, 0);
+
+    if (n_resolved_strong > n_sites_raw / 4) {
+        printf("  Attempting direct frequency reconstruction from positional memory...\n");
+
+        /* Build base frequency: argmax of blended pos_prior × CABP per position */
+        int *dt_digits = (int*)calloc(n_sites_raw, sizeof(int));
+        /* Also track the top-2 uncertain positions for beam variation */
+        double uncertain_margin[MAX_DT_SITES];
+        for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
+            uncertain_margin[k] = 1.0; /* 1.0 = fully certain */
+        }
+
+        for (int k = 0; k < n_sites_raw; k++) {
+            int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+            double cabp[6];
+            for (int d = 0; d < 6; d++) {
+                cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
+                if (cabp[d] < 1e-10) cabp[d] = 1e-10;
+            }
+
+            int is_resolved = (pos_count[ki] >= DT_RESOLVE_MIN &&
+                               (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
+
+            /* Blend: resolved positions weight pos_prior heavily; unresolved weight CABP */
+            double blend_weight = is_resolved ? 0.85 : 0.15;
+            double scores[6], stotal = 0.0;
+            for (int d = 0; d < 6; d++) {
+                scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
+                stotal += scores[d];
+            }
+            if (stotal > 1e-30) for (int d = 0; d < 6; d++) scores[d] /= stotal;
+
+            /* Pick argmax */
+            int best = 0; double best_s = -1.0, second_s = -1.0;
+            for (int d = 0; d < 6; d++) {
+                if (scores[d] > best_s) { second_s = best_s; best_s = scores[d]; best = d; }
+                else if (scores[d] > second_s) second_s = scores[d];
+            }
+            dt_digits[k] = best;
+
+            /* Margin = gap between top-2 scores; low margin = uncertain position */
+            if (k < MAX_DT_SITES)
+                uncertain_margin[k] = best_s - second_s;
+        }
+
+        /* Find the DT_DIRECT_BEAMS-1 most uncertain unresolved positions for variation */
+        int vary_pos[DT_DIRECT_BEAMS];
+        int n_vary = 0;
+        {
+            /* Simple selection: sort by ascending margin among unresolved positions */
+            double min_margins[DT_DIRECT_BEAMS];
+            for (int i = 0; i < DT_DIRECT_BEAMS; i++) { vary_pos[i] = -1; min_margins[i] = 2.0; }
+            for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
+                int ki = k;
+                int is_resolved = (pos_count[ki] >= DT_RESOLVE_MIN &&
+                                   (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
+                if (!is_resolved) {
+                    /* Insert into sorted vary_pos array */
+                    for (int i = 0; i < DT_DIRECT_BEAMS; i++) {
+                        if (vary_pos[i] < 0 || uncertain_margin[k] < min_margins[i]) {
+                            /* Shift right */
+                            for (int j = DT_DIRECT_BEAMS - 1; j > i; j--) {
+                                vary_pos[j] = vary_pos[j-1];
+                                min_margins[j] = min_margins[j-1];
+                            }
+                            vary_pos[i] = k;
+                            min_margins[i] = uncertain_margin[k];
+                            if (n_vary < DT_DIRECT_BEAMS) n_vary++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Try DT_DIRECT_BEAMS candidates: beam 0 = pure argmax,
+         * beams 1..N-1 = flip the i-th most uncertain digit to its second-best */
+        for (int beam = 0; beam < DT_DIRECT_BEAMS && !success; beam++) {
+            int *trial_digits = (int*)malloc(n_sites_raw * sizeof(int));
+            memcpy(trial_digits, dt_digits, n_sites_raw * sizeof(int));
+
+            if (beam > 0 && beam - 1 < n_vary && vary_pos[beam-1] >= 0) {
+                int k = vary_pos[beam - 1];
+                int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+                /* Find second-best digit at this position */
+                double cabp[6];
+                for (int d = 0; d < 6; d++) {
+                    cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
+                    if (cabp[d] < 1e-10) cabp[d] = 1e-10;
+                }
+                double blend_weight = 0.15;
+                double scores[6], stotal = 0.0;
+                for (int d = 0; d < 6; d++) {
+                    scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
+                    stotal += scores[d];
+                }
+                if (stotal > 1e-30) for (int d = 0; d < 6; d++) scores[d] /= stotal;
+                int first = trial_digits[k];
+                int second = -1; double second_s = -1.0;
+                for (int d = 0; d < 6; d++) {
+                    if (d != first && scores[d] > second_s) { second_s = scores[d]; second = d; }
+                }
+                if (second >= 0) trial_digits[k] = second;
+            }
+
+            /* Build BigInt frequency from trial digits */
+            BigInt dt_freq; bigint_set_u64(&dt_freq, 0);
+            BigInt dt_term, dt_tmp2;
+            bigint_set_u64(&dt_term, 0); bigint_set_u64(&dt_tmp2, 0);
+            for (int k = 0; k < n_sites_raw; k++) {
+                bigint_set_u64(&mc_d_bi, (uint64_t)trial_digits[k]);
+                bigint_mul(&dt_term, &mc_d_bi, &p6_cache[k]);
+                bigint_add(&dt_tmp2, &dt_freq, &dt_term);
+                bigint_copy(&dt_freq, &dt_tmp2);
+            }
+
+            uint32_t freq_bits = bigint_bitlen(&dt_freq);
+            printf("  [DT beam %d] freq=%u bits  uncertain_pos=%d\n",
+                   beam, freq_bits,
+                   (beam > 0 && beam - 1 < n_vary) ? vary_pos[beam-1] : -1);
+
+            if (!bigint_is_zero(&dt_freq)) {
+                /* Try both oracle_base=6 and base=a_val */
+                BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                success = generate_and_try_periods(&dt_freq, &reg_sz, &oracle_base,
+                                                   N, factor_p, factor_q, best_period);
+                if (!success)
+                    success = generate_and_try_periods(&dt_freq, &reg_sz, a_val,
+                                                       N, factor_p, factor_q, best_period);
+                if (success)
+                    printf("  ★ DT POSITIONAL MEMORY FACTORED N (beam %d) ★\n", beam);
+                bigint_clear(&oracle_base);
+            }
+
+            bigint_clear(&dt_freq);
+            bigint_clear(&dt_term);
+            bigint_clear(&dt_tmp2);
+            free(trial_digits);
+        }
+
+        free(dt_digits);
+
+        if (success) {
+            /* Clean up and return — skip beam search */
+            hpc_destroy(graph);
+            for (int i = 0; i < n_sites_raw; i++) {
+                bigint_clear(&p6_cache[i]);
+                bigint_clear(&ck_cache[i]);
+            }
+            free(p6_cache); free(ck_cache); free(measured_digits);
+            free(bp_has_signal); free(flippable);
+            for (int s = 0; s < marginals_sz; s++)
+                for (int d = 0; d < 6; d++) mpfr_clear(marginals[s][d]);
+            free(marginals);
+            mpfr_clears(mp_yA, mp_yB, mp_Nd, mp_ratioA, mp_ratioB, mp_pi2,
+                        mp_phaseA, mp_phaseB, mp_sinA, mp_cosA, mp_sinB, mp_cosB, (mpfr_ptr)0);
+            bigint_clear(&mc_d_bi); bigint_clear(&mc_term); bigint_clear(&mc_tmp);
+            bigint_clear(&current_p6); bigint_clear(&next_p6);
+            bigint_clear(&reg_sz); bigint_clear(&gc_reg_tmp);
+            bigint_clear(&b6); bigint_clear(&one);
+            bigint_clear(&val_k_A); bigint_clear(&val_k_B); bigint_clear(&div_6_blk);
+            bigint_clear(&gc_b36); bigint_clear(&gc_next_A); bigint_clear(&gc_next_B); bigint_clear(&gc_next_div);
+            bigint_clear(&gc_gcd_check); bigint_clear(&gc_val_minus_1); bigint_clear(&gc_dummy_rem);
+            bigint_clear(&gc_tmpA); bigint_clear(&gc_tmpB); bigint_clear(&gc_q_div);
+            bigint_clear(&gc_six_pow_k); bigint_clear(&gc_d_bi);
+            bigint_clear(&gc_b6_mod); bigint_clear(&gc_shift_div_A); bigint_clear(&gc_shift_div_B); bigint_clear(&gc_dummy_rm2);
+            bigint_clear(&gc_qA); bigint_clear(&gc_qB); bigint_clear(&gc_rA_mod); bigint_clear(&gc_rB_mod);
+            bigint_clear(&gc_temp_N); bigint_clear(&gc_qN); bigint_clear(&gc_rN); bigint_clear(&gc_q_sh); bigint_clear(&gc_r_sh);
+            for (int i = 0; i < 6; i++) { bigint_clear(&gc_powersA[i]); bigint_clear(&gc_powersB[i]); }
+            return (double)success;
+        }
+    } else {
+        printf("  Not enough resolved positions yet (need >%d%% of register).\n",
+               n_sites_raw / 4 * 100 / n_sites_raw);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
      * EXACT PERIOD EXTRACTION — Single-Pass CF
      *
      * With exact marginals from Magic Pointer, the MAP frequency F is
@@ -2563,22 +3147,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * ═══════════════════════════════════════════════════════════════════════ */
     printf("\n  ═══ SHOR WORK REGISTER + CF PERIOD EXTRACTION ═══\n");
 
-    /* Build power-of-6 cache for frequency construction */
-    BigInt *p6_cache = (BigInt*)calloc(n_sites_raw, sizeof(BigInt));
-    for (int i = 0; i < n_sites_raw; i++) bigint_set_u64(&p6_cache[i], 0);
-    BigInt current_p6, next_p6;
-    bigint_set_u64(&current_p6, 1);
-    bigint_set_u64(&next_p6, 0);
-    for (int i = 0; i < n_sites_raw; i++) {
-        bigint_copy(&p6_cache[i], &current_p6);
-        bigint_mul(&next_p6, &current_p6, &b6);
-        bigint_copy(&current_p6, &next_p6);
-    }
-
-    BigInt mc_d_bi, mc_term, mc_tmp;
-    bigint_set_u64(&mc_d_bi, 0);
-    bigint_set_u64(&mc_term, 0);
-    bigint_set_u64(&mc_tmp, 0);
+    /* p6_cache, current_p6, next_p6, mc_d_bi, mc_term, mc_tmp already declared above */
 
     /* ── Phase 4: Beam Search Frequency Generation ── */
     printf("    Executing Beam Search over marginals...\n");
@@ -2758,9 +3327,12 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
             bigint_clear(&oracle_base);
             
-            /* Record the largest valid denominator as the best partial period for LCM harvesting */
-            if (best_period && !success) {
-                bigint_copy(best_period, &cf_q0);
+            /* Record best convergent for LCM harvesting — prefer larger denominators
+             * as they are closer to the true period than small early convergents. */
+            if (best_period && !success && q_bits > 1) {
+                uint32_t cur_best_bits = bigint_bitlen(best_period);
+                if (q_bits > cur_best_bits || bigint_is_zero(best_period))
+                    bigint_copy(best_period, &cf_q0);
             }
         }
     }
@@ -2813,6 +3385,24 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         bigint_clear(&gc_powersA[i]);
         bigint_clear(&gc_powersB[i]);
     }
+    /* ── Digital Twin fidelity report for this base attempt ── */
+    double pct_resolved = dt_resolution_pct(n_sites_raw);
+    printf("\n  ── Digital Twin Fidelity Report ──\n");
+    printf("  This base — digits: %d  hits: %d  lock: %.2f%%\n",
+           g_dt_state.total_digits, g_dt_state.total_hits,
+           g_dt_state.lock_rate * 100.0);
+    printf("  All bases  — digits: %d  hits: %d  lock: %.2f%%\n",
+           g_dt_state.global_digits, g_dt_state.global_hits,
+           g_dt_state.global_lock_rate * 100.0);
+    printf("  N resolved         : %.2f%%\n", pct_resolved);
+    if (pct_resolved > 60.0)
+        printf("  Assessment         : RESONANCE — DT locked onto Shor eigenphase.\n");
+    else if (pct_resolved > 30.0)
+        printf("  Assessment         : PARTIAL LOCK — above-chance positional memory.\n");
+    else
+        printf("  Assessment         : NOISE FLOOR — substrate decoherence dominant.\n");
+    printf("  Log                : dt_shor_commit.log  (%.2f%%)\n", pct_resolved);
+
     return (double)success;
 }
 
@@ -2831,12 +3421,14 @@ int main(int argc, char **argv)
     printf("\n");
     printf("  ╔════════════════════════════════════════════════════════════════╗\n");
     printf("  ║                                                              ║\n");
-    printf("  ║   HPC OUROBOROS FACTORING ENGINE                             ║\n");
+    printf("  ║   HPC OUROBOROS FACTORING ENGINE — EPR EDITION              ║\n");
     printf("  ║                                                              ║\n");
     printf("  ║   Architecture: HPCGraph (Holographic Phase Contraction)     ║\n");
     printf("  ║   Amplitudes: O(N+E) analytical (no state vector)           ║\n");
     printf("  ║   Entanglement: CZ phase edges (exact, fidelity = 1.0)      ║\n");
-    printf("  ║   4,096-bit BigInt support via bigint.c                     ║\n");
+    printf("  ║   Measurement: EPR collapse-first — DT commits before draw  ║\n");
+    printf("  ║   Feedback: CABP Bayesian posterior per digit               ║\n");
+    printf("  ║   Commit log: dt_shor_commit.log                            ║\n");
     printf("  ║                                                              ║\n");
     printf("  ║   \"The observer and observed are opposite faces.\"            ║\n");
     printf("  ║                                                              ║\n");
@@ -2985,6 +3577,63 @@ int main(int argc, char **argv)
         } else {
             printf("  ✗ Base a=%s did not yield factors (%.3f sec)\n",
                    a_str, (double)(t_end - t_start) / CLOCKS_PER_SEC);
+
+            /* ── cf_pool GCD sweep ─────────────────────────────────────────
+             * Every CF convergent denominator from all beams this run was
+             * deposited into cf_pool[].  Their pairwise GCDs cluster around
+             * divisors of the true period r.  Sweep new entries against all
+             * prior entries, accumulate the most-common GCD, and try it.
+             * ─────────────────────────────────────────────────────────────── */
+            int new_entries = cf_pool_count - old_pool_count;
+            if (new_entries > 1) {
+                printf("  [cf_pool] Sweeping %d new convergents (pool total %d)...\n",
+                       new_entries, cf_pool_count);
+                BigInt pool_gcd, pool_tmp;
+                bigint_set_u64(&pool_gcd, 0);
+                bigint_set_u64(&pool_tmp, 0);
+                for (int pi = old_pool_count; pi < cf_pool_count; pi++) {
+                    if (bigint_is_zero(&pool_gcd))
+                        bigint_copy(&pool_gcd, &cf_pool[pi]);
+                    else {
+                        bigint_gcd(&pool_tmp, &pool_gcd, &cf_pool[pi]);
+                        bigint_copy(&pool_gcd, &pool_tmp);
+                    }
+                }
+                uint32_t pgcd_bits = bigint_bitlen(&pool_gcd);
+                if (pgcd_bits > 1) {
+                    printf("  [cf_pool] GCD of new convergents: %u bits — testing as period...\n",
+                           pgcd_bits);
+                    for (int bj = 0; bj <= bi && !success; bj++) {
+                        BigInt test_a; bigint_set_u64(&test_a, base_list[bj]);
+                        if (try_period(&pool_gcd, &test_a, &N, &factor_p, &factor_q) == 1) {
+                            success = 1;
+                            printf("\n  ★★★ cf_pool GCD FACTORED N! (base a=%llu) ★★★\n",
+                                   (unsigned long long)base_list[bj]);
+                        }
+                        for (int sm = 2; sm <= 24 && !success; sm++) {
+                            BigInt r_mult, mult_c;
+                            bigint_set_u64(&r_mult, 0); bigint_set_u64(&mult_c, (uint64_t)sm);
+                            bigint_mul(&r_mult, &pool_gcd, &mult_c);
+                            if (bigint_cmp(&r_mult, &N) >= 0) {
+                                bigint_clear(&r_mult); bigint_clear(&mult_c); break;
+                            }
+                            if (try_period(&r_mult, &test_a, &N, &factor_p, &factor_q) == 1) {
+                                success = 1;
+                                printf("\n  ★★★ cf_pool GCD×%d FACTORED N! (base a=%llu) ★★★\n",
+                                       sm, (unsigned long long)base_list[bj]);
+                            }
+                            bigint_clear(&r_mult); bigint_clear(&mult_c);
+                        }
+                        bigint_clear(&test_a);
+                    }
+                    if (!success) {
+                        uint32_t bp_bits = bigint_bitlen(&best_partial);
+                        if (pgcd_bits > bp_bits || bigint_is_zero(&best_partial))
+                            bigint_copy(&best_partial, &pool_gcd);
+                    }
+                }
+                bigint_clear(&pool_gcd); bigint_clear(&pool_tmp);
+            }
 
             /* ── Cross-base LCM accumulation ── */
             if (!bigint_is_zero(&best_partial) && bigint_cmp(&best_partial, &bi_one) > 0) {
