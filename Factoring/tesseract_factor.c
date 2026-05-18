@@ -265,11 +265,12 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     else
         for (int d = 0; d < 6; d++) scores[d] /= score_total;
 
-    double best_score = -1.0;
-    int    best_digit = 0;
+    /* Stochastic draw from scores distribution using oracle (channel A) */
+    double cumul = 0.0;
+    int    best_digit = 5;
     for (int d = 0; d < 6; d++) {
-        double s = scores[d] + 1e-6 * (oracle_raw - (double)d / 6.0);
-        if (s > best_score) { best_score = s; best_digit = d; }
+        cumul += scores[d];
+        if (oracle_raw <= cumul) { best_digit = d; break; }
     }
     dt->dt_prediction = best_digit;
 
@@ -307,34 +308,45 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
  */
 static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
 {
-    /* 1. THE GATEKEEPER: If the quantum peak is weak (< 70%), ignore it. 
-     * This stops the 10% noise floor from poisoning the memory. */
-    if (amplitude < 0.70) { 
-        return; 
-    }
-
     dt->outcome = outcome;
     dt->hit     = (outcome == dt->dt_prediction) ? 1 : 0;
 
-    /* Per-base counters */
+    /* ── Lock-rate accounting: ALWAYS update, regardless of amplitude.
+     * Previously the entire function returned early when amplitude < 0.70,
+     * which meant lock rate was computed only over the rare high-confidence
+     * samples — pure selection bias producing artificial 100% lock.
+     * Lock rate must reflect ALL predictions to be meaningful. */
     dt->total_digits++;
     if (dt->hit) { dt->total_hits++; dt->streak++; }
     else           dt->streak = 0;
     dt->lock_rate = (double)dt->total_hits / (double)dt->total_digits;
 
-    /* Global cross-base counters */
     dt->global_digits++;
     if (dt->hit) dt->global_hits++;
     dt->global_lock_rate = (double)dt->global_hits / (double)dt->global_digits;
 
-    /* ── Persistent positional memory update ── */
+    /* ── Persistent positional memory update: gated on amplitude.
+     * Low-confidence peaks (< 0.70) carry too much shot noise to be
+     * useful signal — writing them would smear the prior toward uniform
+     * and erase whatever structure has been learned.  Only high-confidence
+     * peaks update pos_prior and pos_hits/pos_count. */
+    /* Gatekeeper: only gate pure noise (< 25%). Allow moderate-confidence signals
+     * to contribute to Bayesian learning for faster adaptation. */
+    if (amplitude < 0.25) {
+        /* Still log the updated lock rate even for gated samples */
+        double pct = dt_resolution_pct(dt->n_sites_raw);
+        FILE *log = fopen("dt_shor_commit.log", "w");
+        if (log) { fprintf(log, "%.2f%%\n", pct); fclose(log); }
+        return;
+    }
+
     int ki = (dt->digit_k < MAX_DT_SITES) ? dt->digit_k : MAX_DT_SITES - 1;
     pos_count[ki]++;
     pos_hits [ki] += dt->hit;
 
-    /* 2. INCREASED INERTIA: We increase the smoothing offset to 20.0.
-     * This makes the memory 20x more resistant to single-trial noise. */
-    double n = (double)pos_count[ki] + 20.0; 
+    /* Moderate inertia: offset of 5.0 allows faster early adaptation
+     * while still damping single-trial noise. */
+    double n = (double)pos_count[ki] + 5.0;
     for (int d = 0; d < 6; d++) {
         double target = (d == outcome) ? 1.0 : 0.0;
         pos_prior[ki][d] = (pos_prior[ki][d] * (n - 1.0) + target) / n;
@@ -2540,17 +2552,19 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
         int site_k = blk_k * 6 + off_k;
         if (site_k >= n_sites) continue;
 
-        /* c_k = a^{6^{k+offset}} mod N */
+        /* c_k = a^{6^{k+offset}} mod N
+         * Each loop step: x → x^6 mod N  (one application of the 6th-power map).
+         * Done correctly as: x^6 = (x^2)^3 = ((x^2)^2)*x^2  using 3 mod-muls. */
         BigInt bi_t, bi_t2, dummy_q;
         bigint_set_u64(&bi_t, 0); bigint_set_u64(&bi_t2, 0); bigint_set_u64(&dummy_q, 0);
         bigint_copy(&ck_cache[k], a_val);
-        for (int s = 0; s < k + scale_offset; s++) {
-            bigint_mul(&bi_t, &ck_cache[k], &ck_cache[k]);
-            bigint_div_mod(&bi_t, N, &dummy_q, &bi_t2);
-            bigint_mul(&bi_t, &bi_t2, &ck_cache[k]);
-            bigint_div_mod(&bi_t, N, &dummy_q, &bi_t2);
-            bigint_mul(&bi_t, &bi_t2, &bi_t2);
-            bigint_div_mod(&bi_t, N, &dummy_q, &ck_cache[k]);
+        {
+            static BigInt b6_exp; bigint_set_u64(&b6_exp, 6);
+            for (int s = 0; s < k + scale_offset; s++) {
+                /* ck_cache[k] = ck_cache[k]^6 mod N */
+                bigint_pow_mod(&bi_t, &ck_cache[k], &b6_exp, N);
+                bigint_copy(&ck_cache[k], &bi_t);
+            }
         }
 
         /* Compute multiplier[d] = c_k^d mod N for d=0..5 */
@@ -2929,8 +2943,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      *
      * If this path factors N it short-circuits the beam search completely.
      * ═══════════════════════════════════════════════════════════════════════ */
-    #define DT_DIRECT_BEAMS   8      /* number of variation candidates to try  */
-    #define DT_RESOLVE_MIN   10      /* minimum pos_count before trusting prior */
+    #define DT_DIRECT_BEAMS   64      /* number of variation candidates to try  */
+    #define DT_RESOLVE_MIN   2       /* minimum pos_count before trusting prior */
 
     double pct_now = dt_resolution_pct(n_sites_raw);
     printf("\n  ═══ PHASE 3.5: DT POSITIONAL MEMORY DIRECT RECONSTRUCTION ═══\n");
@@ -3084,16 +3098,18 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                    (beam > 0 && beam - 1 < n_vary) ? vary_pos[beam-1] : -1);
 
             if (!bigint_is_zero(&dt_freq)) {
-                /* Try both oracle_base=6 and base=a_val */
-                BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
-                success = generate_and_try_periods(&dt_freq, &reg_sz, &oracle_base,
+                /* Try base a_val first — frequency encodes ord_N(a_val) */
+                success = generate_and_try_periods(&dt_freq, &reg_sz, a_val,
                                                    N, factor_p, factor_q, best_period);
-                if (!success)
-                    success = generate_and_try_periods(&dt_freq, &reg_sz, a_val,
+                if (!success) {
+                    /* Also try oracle base 6 as fallback */
+                    BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                    success = generate_and_try_periods(&dt_freq, &reg_sz, &oracle_base,
                                                        N, factor_p, factor_q, best_period);
+                    bigint_clear(&oracle_base);
+                }
                 if (success)
                     printf("  ★ DT POSITIONAL MEMORY FACTORED N (beam %d) ★\n", beam);
-                bigint_clear(&oracle_base);
             }
 
             bigint_clear(&dt_freq);
