@@ -319,9 +319,9 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
      * useful signal — writing them would smear the prior toward uniform
      * and erase whatever structure has been learned.  Only high-confidence
      * peaks update pos_prior and pos_hits/pos_count. */
-    /* Gatekeeper: only gate pure noise (< 25%). Allow moderate-confidence signals
-     * to contribute to Bayesian learning for faster adaptation. */
-    if (amplitude < 0.25) {
+    /* Gatekeeper: only gate low-confidence (< 50%). Only high-confidence
+     * signals update positional memory to avoid noise contamination. */
+    if (amplitude < 0.50) {
         /* Still log the updated lock rate even for gated samples */
         double pct = dt_resolution_pct(dt->n_sites_raw);
         FILE *log = fopen("dt_shor_commit.log", "w");
@@ -2983,7 +2983,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
                 if (cabp[d] < 1e-10) cabp[d] = 1e-10;
             }
-            double blend_weight = 0.15;
+            double blend_weight = 0.25;
             double scores[6], stotal = 0.0;
             for (int d = 0; d < 6; d++) {
                 scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
@@ -3006,20 +3006,24 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 uncertain_margin[k] = best_s - second_s;
         }
 
-        /* Find the DT_DIRECT_BEAMS-1 most uncertain unresolved positions for variation */
+        /* Find the DT_DIRECT_BEAMS-1 most uncertain positions for variation
+         * Consider all positions when DT lock rate is low, even if "resolved" */
         int vary_pos[DT_DIRECT_BEAMS];
         int n_vary = 0;
         {
-            /* Simple selection: sort by ascending margin among unresolved positions */
             double min_margins[DT_DIRECT_BEAMS];
             for (int i = 0; i < DT_DIRECT_BEAMS; i++) { vary_pos[i] = -1; min_margins[i] = 2.0; }
             for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
-                int ki = k;
-                /* Check if position is resolved */
-                int is_resolved = (pos_count[ki] >= DT_RESOLVE_MIN &&
-                                  pos_count[ki] > 0 &&
-                                  (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
-                if (!is_resolved) {
+                /* If DT lock rate is low (< 50%), consider all positions for variation
+                 * regardless of resolution status to avoid converging on wrong pattern */
+                int consider = (g_dt_state.lock_rate < 0.50);
+                if (!consider) {
+                    int ki = k;
+                    consider = !(pos_count[ki] >= DT_RESOLVE_MIN &&
+                                 pos_count[ki] > 0 &&
+                                 (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
+                }
+                if (consider) {
                     /* Insert into sorted vary_pos array */
                     for (int i = 0; i < DT_DIRECT_BEAMS; i++) {
                         if (vary_pos[i] < 0 || uncertain_margin[k] < min_margins[i]) {
@@ -3053,7 +3057,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                     cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
                     if (cabp[d] < 1e-10) cabp[d] = 1e-10;
                 }
-                double blend_weight = 0.15;
+                double blend_weight = 0.25;
                 double scores[6], stotal = 0.0;
                 for (int d = 0; d < 6; d++) {
                     scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
