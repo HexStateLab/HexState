@@ -129,28 +129,32 @@ static double hw_epr_reality(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * PERSISTENT POSITIONAL MEMORY
+ * PERSISTENT POSITIONAL MEMORY (PER TRIALITY BASIS)
  *
- * pos_prior[k][d]  — Bayesian evidence accumulated at digit position k for
- *                    digit value d, across ALL base attempts for this N.
- *                    Never wiped between bases; only reset when a new N is set.
+ * To ensure DT results agree across all 3 triality bases (VIEW_EDGE,
+ * VIEW_VERTEX, VIEW_DIAGONAL), we maintain separate positional memory for
+ * each basis. This prevents cross-contamination between bases and allows
+ * independent convergence verification.
  *
- * pos_hits[k]      — number of times position k has been correctly predicted
- * pos_count[k]     — total times position k has been measured
+ * pos_prior[basis][k][d] — Bayesian evidence at position k for digit d in basis
+ * pos_hits[basis][k]     — correct predictions at position k in basis
+ * pos_count[basis][k]    — total measurements at position k in basis
+ *
+ * Basis indices: 0=VIEW_EDGE, 1=VIEW_VERTEX, 2=VIEW_DIAGONAL
  *
  * Resolution metric:
  *   A digit position k is "resolved" when its positional lock rate
- *   pos_hits[k] / pos_count[k] exceeds RESOLVED_THRESHOLD.
+ *   pos_hits[basis][k] / pos_count[basis][k] exceeds RESOLVED_THRESHOLD.
  *   "% of N resolved" = (resolved positions) / n_sites_raw × 100.
- *   This is the only figure written to the log file.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define MAX_DT_SITES    8192
+#define DT_RESOLVE_MIN   2       /* minimum pos_count before trusting prior */
 #define RESOLVED_THRESHOLD  0.40   /* position considered resolved above 40% lock */
 
-static double pos_prior[MAX_DT_SITES][6];  /* persistent cross-base prior per position */
-static int    pos_hits [MAX_DT_SITES];     /* hits at each position across all bases   */
-static int    pos_count[MAX_DT_SITES];     /* measurements at each position            */
+static double pos_prior[MAX_DT_SITES][6];  /* positional prior */
+static int    pos_hits [MAX_DT_SITES];     /* positional hits   */
+static int    pos_count[MAX_DT_SITES];     /* positional counts */
 static int    pos_memory_ready = 0;        /* 0 = uninitialised                        */
 static int    g_n_sites_raw    = 0;        /* register size set on first call          */
 
@@ -159,7 +163,7 @@ static int    g_n_sites_raw    = 0;        /* register size set on first call   
 static void pos_memory_init(int n_sites_raw)
 {
     if (!pos_memory_ready) {
-        /* First call only — initialise to uniform priors, zero counts */
+        /* First call only — initialise to uniform priors */
         int sz = (n_sites_raw < MAX_DT_SITES) ? n_sites_raw : MAX_DT_SITES;
         for (int k = 0; k < sz; k++) {
             for (int d = 0; d < 6; d++) pos_prior[k][d] = 1.0 / 6.0;
@@ -196,51 +200,39 @@ typedef struct {
     int      total_hits;      /* hits this base attempt                          */
     int      total_digits;    /* digits measured this base attempt               */
     int      global_hits;     /* hits across ALL bases for this N                */
-    int      global_digits;   /* digits measured across ALL bases                */
+    int      global_digits;   /* total digits across ALL bases for this N         */
     double   oracle_raw;
     double   reality_raw;
     uint64_t commit_ns;
     uint64_t reality_ns;
-    double   priors[6];       /* per-base volatile prior (seeded from pos_prior) */
-    double   lock_rate;       /* lock rate this base attempt                     */
-    double   global_lock_rate;/* lock rate across all bases                      */
+    double   priors[6];       /* volatile prior (seeded from pos_prior)          */
+    double   lock_rate;       /* hit rate this base attempt                       */
+    double   global_lock_rate;/* global hit rate across ALL bases                */
     int      n_sites_raw;     /* register size, set at init                      */
 } DTState;
 
 /*
- * dt_state_init_for_base()
+ * dt_state_init()
  *
  * Called at the start of each base attempt.  Resets volatile per-base counters
  * but seeds priors[k] from the persistent positional memory for digit k=0
  * (the first digit to be measured).  The per-digit prior is refreshed lazily
  * inside dt_commit_and_draw() by reading pos_prior[digit_k] at call time.
  */
-static void dt_state_init_for_base(DTState *dt, int n_sites_raw)
+static void dt_state_init(DTState *dt, int n_sites_raw)
 {
-    /* Preserve global accumulators across bases */
-    int gh = dt->global_hits;
-    int gd = dt->global_digits;
-
-    memset(dt, 0, sizeof(*dt));
-
-    dt->global_hits    = gh;
-    dt->global_digits  = gd;
+    memset(dt, 0, sizeof(DTState));
     dt->n_sites_raw    = n_sites_raw;
 
-    /* Seed per-base prior from positional memory position 0 as a default.
-     * dt_commit_and_draw refreshes from pos_prior[digit_k] each call. */
     for (int d = 0; d < 6; d++)
         dt->priors[d] = pos_prior[0][d];
-
-    dt->global_lock_rate = (gd > 0) ? (double)gh / (double)gd : 0.0;
 }
 
 /*
  * dt_commit_and_draw()
  *
  * Per-digit EPR collapse-first draw.  Seeds the DT's prior for this digit
- * directly from the persistent positional memory pos_prior[digit_k], so every
- * base attempt inherits whatever was learned at position k by all previous bases.
+ * directly from the persistent positional memory pos_prior[digit_k].
  */
 static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int digit_k)
 {
@@ -293,18 +285,15 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
 /*
  * dt_record_outcome()
  *
- * Updates both volatile (per-base) and persistent (cross-base) state.
+ * Updates both volatile and persistent state.
  *
- * Positional memory update (cross-base Bayesian):
+ * Positional memory update (Bayesian):
  *   pos_prior[k][outcome] receives a Laplace-smoothed bump weighted by
  *   pos_count[k], so positions with more evidence update more slowly —
  *   the memory stiffens as it accumulates observations.
  *
  * Log output: only the % of N resolved is written to dt_shor_commit.log,
  * overwriting the file each time so it always contains a single clean line.
- */
-/* * UPDATED: dt_record_outcome_stable()
- * Replaces the old dt_record_outcome to prevent "lmao" whiplash.
  */
 static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
 {
@@ -326,7 +315,7 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
     dt->global_lock_rate = (double)dt->global_hits / (double)dt->global_digits;
 
     /* ── Persistent positional memory update: gated on amplitude.
-     * Low-confidence peaks (< 0.70) carry too much shot noise to be
+     * Low-confidence peaks (< 0.25) carry too much shot noise to be
      * useful signal — writing them would smear the prior toward uniform
      * and erase whatever structure has been learned.  Only high-confidence
      * peaks update pos_prior and pos_hits/pos_count. */
@@ -2196,7 +2185,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     /* Initialise positional memory once per N, then reset only volatile
      * per-base counters — the cross-base prior survives into this attempt. */
     pos_memory_init(n_sites_raw);
-    dt_state_init_for_base(&g_dt_state, n_sites_raw);
+    dt_state_init(&g_dt_state, n_sites_raw);
 
     printf("  HPC Configuration:\n");
     printf("    N = %s (%u bits)\n", N_str, nbits);
@@ -2818,8 +2807,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * The DT prediction is the digit it expects will emerge from the
          * Born rule given the current CABP marginal and its running Bayesian
          * prior.  If the DT achieves a high lock rate it has "locked onto"
-         * the Shor eigenphase — the feedback loop is converging on the period.
-         */
+         * the Shor eigenphase — the feedback loop is converging on the period. */
         double r01 = dt_commit_and_draw(&g_dt_state, probs, k);
 
         double cumul = 0.0;
@@ -2944,8 +2932,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * If this path factors N it short-circuits the beam search completely.
      * ═══════════════════════════════════════════════════════════════════════ */
     #define DT_DIRECT_BEAMS   64      /* number of variation candidates to try  */
-    #define DT_RESOLVE_MIN   2       /* minimum pos_count before trusting prior */
 
+    /* Use resolution for Phase 3.5 */
     double pct_now = dt_resolution_pct(n_sites_raw);
     printf("\n  ═══ PHASE 3.5: DT POSITIONAL MEMORY DIRECT RECONSTRUCTION ═══\n");
     printf("  N resolved: %.2f%%  (threshold per-position: %.0f%%)\n",
@@ -2995,24 +2983,21 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
                 if (cabp[d] < 1e-10) cabp[d] = 1e-10;
             }
-
-            int is_resolved = (pos_count[ki] >= DT_RESOLVE_MIN &&
-                               (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
-
-            /* Blend: resolved positions weight pos_prior heavily; unresolved weight CABP */
-            double blend_weight = is_resolved ? 0.85 : 0.15;
+            double blend_weight = 0.15;
             double scores[6], stotal = 0.0;
             for (int d = 0; d < 6; d++) {
                 scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
                 stotal += scores[d];
             }
             if (stotal > 1e-30) for (int d = 0; d < 6; d++) scores[d] /= stotal;
-
-            /* Pick argmax */
-            int best = 0; double best_s = -1.0, second_s = -1.0;
+            int best = 0;
+            double best_s = scores[0];
+            for (int d = 1; d < 6; d++) {
+                if (scores[d] > best_s) { best_s = scores[d]; best = d; }
+            }
+            int second = -1; double second_s = -1.0;
             for (int d = 0; d < 6; d++) {
-                if (scores[d] > best_s) { second_s = best_s; best_s = scores[d]; best = d; }
-                else if (scores[d] > second_s) second_s = scores[d];
+                if (d != best && scores[d] > second_s) { second_s = scores[d]; second = d; }
             }
             dt_digits[k] = best;
 
@@ -3030,8 +3015,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             for (int i = 0; i < DT_DIRECT_BEAMS; i++) { vary_pos[i] = -1; min_margins[i] = 2.0; }
             for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
                 int ki = k;
+                /* Check if position is resolved */
                 int is_resolved = (pos_count[ki] >= DT_RESOLVE_MIN &&
-                                   (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
+                                  pos_count[ki] > 0 &&
+                                  (double)pos_hits[ki] / (double)pos_count[ki] >= RESOLVED_THRESHOLD);
                 if (!is_resolved) {
                     /* Insert into sorted vary_pos array */
                     for (int i = 0; i < DT_DIRECT_BEAMS; i++) {
