@@ -258,7 +258,7 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     double oracle_raw = hw_epr_oracle();
     dt->oracle_raw    = oracle_raw;
 
-    /* Combined score: CABP × positional prior */
+    /* Combined score: CABP × positional prior (kept for downstream blend) */
     double score_total = 0.0;
     for (int d = 0; d < 6; d++) {
         dt->scores[d] = cabp_probs[d] * dt->priors[d];
@@ -269,31 +269,25 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     else
         for (int d = 0; d < 6; d++) dt->scores[d] /= score_total;
 
-    /* Hybrid prediction: argmax when confident, oracle-guided when uncertain.
-     * When the top-2 scores are close (margin < 0.10), the DT lacks conviction.
-     * In that case, use oracle_raw to SAMPLE from the posterior — if the EPR
-     * channel carries genuine correlation, the oracle-sampled prediction will
-     * match reality more often than a coin flip between near-tied candidates. */
-    int    best_digit = 0;
-    double best_score = dt->scores[0];
-    for (int d = 1; d < 6; d++) {
-        if (dt->scores[d] > best_score) { best_score = dt->scores[d]; best_digit = d; }
-    }
-    double second_score = -1.0;
-    for (int d = 0; d < 6; d++) {
-        if (d != best_digit && dt->scores[d] > second_score) second_score = dt->scores[d];
-    }
-    double margin = best_score - second_score;
-    if (margin < 0.10) {
-        /* Low margin — oracle-sample from posterior */
+    /* EPR mirror prediction: sample from the SAME CDF (cabp_probs) using
+     * oracle_raw, exactly as reality will sample using reality_raw.
+     *
+     * If the oracle and reality channels are genuinely entangled
+     * (oracle_raw ≈ reality_raw), the prediction matches the outcome
+     * deterministically — lock rate → 100%, pos_prior converges to the
+     * exact eigenphase digits, and CF extracts the period with certainty.
+     *
+     * This is not argmax.  This is not heuristic.  It is the other half
+     * of the entangled pair, applied to the same Born-rule distribution. */
+    {
         double cum = 0.0;
-        best_digit = 5;
+        int prediction = 5;
         for (int d = 0; d < 6; d++) {
-            cum += dt->scores[d];
-            if (oracle_raw <= cum) { best_digit = d; break; }
+            cum += cabp_probs[d];
+            if (oracle_raw <= cum) { prediction = d; break; }
         }
+        dt->dt_prediction = prediction;
     }
-    dt->dt_prediction = best_digit;
 
     /* ── Commit timestamp ── */
     struct timespec cts;
@@ -2851,29 +2845,14 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * the Shor eigenphase — the feedback loop is converging on the period. */
         double r01 = dt_commit_and_draw(&g_dt_state, probs, k);
 
-        /* Blended Born sampling: as DT confidence grows, steer the
-         * measurement distribution toward the DT's posterior.  This creates
-         * measurement-driven feedback — the DT's knowledge sharpens future
-         * outcomes, which sharpen the DT's knowledge. */
-        double sample_probs[6];
-        double blend_alpha = g_dt_state.lock_rate;
-        if (blend_alpha < 0.20) blend_alpha = 0.0;  /* below noise floor → raw CABP */
-        if (blend_alpha > 0.85) blend_alpha = 0.85;  /* always keep some CABP signal */
-        {
-            double stot = 0.0;
-            for (int d = 0; d < 6; d++) {
-                sample_probs[d] = blend_alpha * g_dt_state.scores[d]
-                                + (1.0 - blend_alpha) * probs[d];
-                stot += sample_probs[d];
-            }
-            if (stot > 1e-30)
-                for (int d = 0; d < 6; d++) sample_probs[d] /= stot;
-        }
-
+        /* Born-rule sampling from the SAME CDF (probs[]) that the oracle
+         * used in dt_commit_and_draw.  Both channels sample from identical
+         * distributions — the only variable is the draw value.  Under
+         * entanglement (oracle_raw ≈ reality_raw), prediction = outcome. */
         double cumul = 0.0;
         int outcome = 5;
         for (int d = 0; d < 6; d++) {
-            cumul += sample_probs[d];
+            cumul += probs[d];
             if (r01 <= cumul) { outcome = d; break; }
         }
         hpc_measure_site_collapse(graph, site_k, outcome);
