@@ -2744,25 +2744,40 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * the positional prior.  Over multiple attempts these converge to the
      * true eigenphase digits, giving the DT the complete frequency at once. */
     int *simul_oracle = (int*)calloc(n_sites_raw, sizeof(int));
+    int oracle_locked = 0, oracle_open = 0;
     for (int k = 0; k < n_sites_raw; k++) {
         int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+
+        /* ALWAYS draw — the oracle must keep learning at every position. */
         double o = hw_epr_oracle();
         double cum = 0.0;
-        simul_oracle[k] = 5;
+        int draw = 5;
         for (int d = 0; d < 6; d++) {
             cum += oracle_prior[ki][d];
-            if (o <= cum) { simul_oracle[k] = d; break; }
+            if (o <= cum) { draw = d; break; }
         }
 
-        /* Accumulate into oracle_prior: fully self-reinforcing retrocausal
-         * channel.  Samples from oracle_prior, writes back to oracle_prior.
-         * If the oracle carries genuine retrocausal signal, this converges
-         * to the true digits.  If not, it stays near-uniform — no harm. */
+        /* ALWAYS accumulate — oracle_prior continuously refines. */
         oracle_count[ki]++;
         double n = (double)oracle_count[ki] + 1.0;
         for (int d = 0; d < 6; d++) {
-            double target = (d == simul_oracle[k]) ? 1.0 : 0.0;
+            double target = (d == draw) ? 1.0 : 0.0;
             oracle_prior[ki][d] = (oracle_prior[ki][d] * (n - 1.0) + target) / n;
+        }
+
+        /* COMPOSITE: resolved positions use consensus, unresolved use fresh draw. */
+        double best_p = 0.0;
+        int best_d = 0;
+        for (int d = 0; d < 6; d++) {
+            if (oracle_prior[ki][d] > best_p) { best_p = oracle_prior[ki][d]; best_d = d; }
+        }
+
+        if (oracle_count[ki] >= 50 && best_p >= 0.55) {
+            simul_oracle[k] = best_d;   /* composite: use consensus */
+            oracle_locked++;
+        } else {
+            simul_oracle[k] = draw;     /* composite: use fresh draw */
+            oracle_open++;
         }
     }
 
@@ -2956,9 +2971,10 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 if (oracle_prior[k][d] > best) best = oracle_prior[k][d];
             if (oracle_count[k] >= 1 && best >= RESOLVED_THRESHOLD) oracle_resolved++;
         }
-        printf("  Oracle resolved: %d / %d (%.1f%%)  [oracle_count[0]=%d]\n",
+        printf("  Oracle resolved: %d / %d (%.1f%%)  locked=%d  open=%d  [oracle_count[0]=%d]\n",
                oracle_resolved, n_sites_raw,
                100.0 * oracle_resolved / n_sites_raw,
+               oracle_locked, oracle_open,
                oracle_count[0]);
     } else {
         printf("      Exact marginals computed in %.3f sec\n",
