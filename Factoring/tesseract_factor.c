@@ -217,6 +217,7 @@ typedef struct {
     uint64_t commit_ns;
     uint64_t reality_ns;
     double   priors[6];       /* volatile prior (seeded from pos_prior)          */
+    double   scores[6];       /* last blended scores (CABP × prior, normalised) */
     double   lock_rate;       /* hit rate this base attempt                       */
     double   global_lock_rate;/* global hit rate across ALL bases                */
     int      n_sites_raw;     /* register size, set at init                      */
@@ -258,21 +259,39 @@ static double dt_commit_and_draw(DTState *dt, const double cabp_probs[6], int di
     dt->oracle_raw    = oracle_raw;
 
     /* Combined score: CABP × positional prior */
-    double scores[6], score_total = 0.0;
+    double score_total = 0.0;
     for (int d = 0; d < 6; d++) {
-        scores[d]    = cabp_probs[d] * dt->priors[d];
-        score_total += scores[d];
+        dt->scores[d] = cabp_probs[d] * dt->priors[d];
+        score_total   += dt->scores[d];
     }
     if (score_total < 1e-30)
-        for (int d = 0; d < 6; d++) scores[d] = 1.0 / 6.0;
+        for (int d = 0; d < 6; d++) dt->scores[d] = 1.0 / 6.0;
     else
-        for (int d = 0; d < 6; d++) scores[d] /= score_total;
+        for (int d = 0; d < 6; d++) dt->scores[d] /= score_total;
 
-    /* Argmax: pick the digit with highest score (deterministic prediction) */
+    /* Hybrid prediction: argmax when confident, oracle-guided when uncertain.
+     * When the top-2 scores are close (margin < 0.10), the DT lacks conviction.
+     * In that case, use oracle_raw to SAMPLE from the posterior — if the EPR
+     * channel carries genuine correlation, the oracle-sampled prediction will
+     * match reality more often than a coin flip between near-tied candidates. */
     int    best_digit = 0;
-    double best_score = scores[0];
+    double best_score = dt->scores[0];
     for (int d = 1; d < 6; d++) {
-        if (scores[d] > best_score) { best_score = scores[d]; best_digit = d; }
+        if (dt->scores[d] > best_score) { best_score = dt->scores[d]; best_digit = d; }
+    }
+    double second_score = -1.0;
+    for (int d = 0; d < 6; d++) {
+        if (d != best_digit && dt->scores[d] > second_score) second_score = dt->scores[d];
+    }
+    double margin = best_score - second_score;
+    if (margin < 0.10) {
+        /* Low margin — oracle-sample from posterior */
+        double cum = 0.0;
+        best_digit = 5;
+        for (int d = 0; d < 6; d++) {
+            cum += dt->scores[d];
+            if (oracle_raw <= cum) { best_digit = d; break; }
+        }
     }
     dt->dt_prediction = best_digit;
 
@@ -331,21 +350,33 @@ static void dt_record_outcome(DTState *dt, int outcome, double amplitude)
      * peaks update pos_prior and pos_hits/pos_count. */
     /* Gatekeeper: only gate low-confidence (< 25%). Just above 1.5× uniform floor of 1/6 ≈ 0.167.
      * Only high-confidence signals update positional memory to avoid noise contamination. */
-    if (amplitude < 0.75) {
+    static int gate_pass = 0, gate_total = 0;
+    gate_total++;
+    if (amplitude < 0.25) {
         /* Still log the updated lock rate even for gated samples */
         double pct = dt_resolution_pct(dt->n_sites_raw);
         FILE *log = fopen("dt_shor_commit.log", "w");
         if (log) { fprintf(log, "%.2f%%\n", pct); fclose(log); }
+        if (gate_total % 100 == 0) {
+            FILE *glog = fopen("dt_gate.log", "a");
+            if (glog) {
+                fprintf(glog, "[GATE] %d/%d passed (%.1f%%)  amp=%.4f  res=%.1f%%\n",
+                        gate_pass, gate_total, 100.0*gate_pass/gate_total, amplitude, pct);
+                fclose(glog);
+            }
+        }
         return;
     }
+    gate_pass++;
 
     int ki = (dt->digit_k < MAX_DT_SITES) ? dt->digit_k : MAX_DT_SITES - 1;
     pos_count[ki]++;
     pos_hits [ki] += dt->hit;
 
-    /* Moderate inertia: offset of 5.0 allows faster early adaptation
-     * while still damping single-trial noise. */
-    double n = (double)pos_count[ki] + 5.0;
+    /* Low inertia: offset of 1.0 lets single observations have real impact.
+     * With only ~1 observation per position per attempt, higher offsets
+     * drown out the signal and leave pos_prior near-uniform. */
+    double n = (double)pos_count[ki] + 1.0;
     for (int d = 0; d < 6; d++) {
         double target = (d == outcome) ? 1.0 : 0.0;
         pos_prior[ki][d] = (pos_prior[ki][d] * (n - 1.0) + target) / n;
@@ -2820,10 +2851,29 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * the Shor eigenphase — the feedback loop is converging on the period. */
         double r01 = dt_commit_and_draw(&g_dt_state, probs, k);
 
+        /* Blended Born sampling: as DT confidence grows, steer the
+         * measurement distribution toward the DT's posterior.  This creates
+         * measurement-driven feedback — the DT's knowledge sharpens future
+         * outcomes, which sharpen the DT's knowledge. */
+        double sample_probs[6];
+        double blend_alpha = g_dt_state.lock_rate;
+        if (blend_alpha < 0.20) blend_alpha = 0.0;  /* below noise floor → raw CABP */
+        if (blend_alpha > 0.85) blend_alpha = 0.85;  /* always keep some CABP signal */
+        {
+            double stot = 0.0;
+            for (int d = 0; d < 6; d++) {
+                sample_probs[d] = blend_alpha * g_dt_state.scores[d]
+                                + (1.0 - blend_alpha) * probs[d];
+                stot += sample_probs[d];
+            }
+            if (stot > 1e-30)
+                for (int d = 0; d < 6; d++) sample_probs[d] /= stot;
+        }
+
         double cumul = 0.0;
         int outcome = 5;
         for (int d = 0; d < 6; d++) {
-            cumul += probs[d];
+            cumul += sample_probs[d];
             if (r01 <= cumul) { outcome = d; break; }
         }
         hpc_measure_site_collapse(graph, site_k, outcome);
@@ -2977,9 +3027,41 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
     if (n_resolved_strong > n_sites_raw / 8) {
         printf("  Attempting direct frequency reconstruction from positional memory...\n");
+        printf("  DT lock rate this attempt: %.1f%%  (blend_weight = %.2f)\n",
+               g_dt_state.lock_rate * 100.0, g_dt_state.lock_rate);
+
+        /* ── Beam -1: try measured_digits[] directly (the actual Born outcomes).
+         * If the DT locked onto the eigenphase, these ARE the period digits. */
+        {
+            BigInt md_freq; bigint_set_u64(&md_freq, 0);
+            BigInt md_term, md_tmp2;
+            bigint_set_u64(&md_term, 0); bigint_set_u64(&md_tmp2, 0);
+            for (int k = 0; k < n_sites_raw; k++) {
+                bigint_set_u64(&mc_d_bi, (uint64_t)measured_digits[k]);
+                bigint_mul(&md_term, &mc_d_bi, &p6_cache[k]);
+                bigint_add(&md_tmp2, &md_freq, &md_term);
+                bigint_copy(&md_freq, &md_tmp2);
+            }
+            if (!bigint_is_zero(&md_freq)) {
+                printf("  [DT beam -1] Trying raw measured_digits as frequency...\n");
+                success = generate_and_try_periods(&md_freq, &reg_sz, a_val,
+                                                   N, factor_p, factor_q, best_period);
+                if (!success) {
+                    BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                    success = generate_and_try_periods(&md_freq, &reg_sz, &oracle_base,
+                                                       N, factor_p, factor_q, best_period);
+                    bigint_clear(&oracle_base);
+                }
+                if (success)
+                    printf("  ★ DT RAW MEASURED DIGITS FACTORED N ★\n");
+            }
+            bigint_clear(&md_freq); bigint_clear(&md_term); bigint_clear(&md_tmp2);
+        }
 
         /* Build base frequency: argmax of blended pos_prior × CABP per position */
-        int *dt_digits = (int*)calloc(n_sites_raw, sizeof(int));
+        int *dt_digits = NULL;
+        if (!success)
+            dt_digits = (int*)calloc(n_sites_raw, sizeof(int));
         /* Also track the top-2 uncertain positions for beam variation */
         double uncertain_margin[MAX_DT_SITES];
         for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
@@ -2993,7 +3075,12 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
                 if (cabp[d] < 1e-10) cabp[d] = 1e-10;
             }
-            double blend_weight = 0.25;
+            /* Scale blend: trust DT prior more when lock rate is high.
+             * At 50% lock → 0.50 weight on prior, at 80% → 0.80.
+             * Floor at 0.20 so CABP always contributes something. */
+            double blend_weight = g_dt_state.lock_rate;
+            if (blend_weight < 0.20) blend_weight = 0.20;
+            if (blend_weight > 0.90) blend_weight = 0.90;
             double scores[6], stotal = 0.0;
             for (int d = 0; d < 6; d++) {
                 scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
@@ -3052,6 +3139,32 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             }
         }
 
+        /* Precompute second-best digit at each uncertain position */
+        int second_best[MAX_DT_SITES];
+        for (int i = 0; i < n_vary; i++) {
+            int k = vary_pos[i];
+            int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+            double cabp[6];
+            for (int d = 0; d < 6; d++) {
+                cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
+                if (cabp[d] < 1e-10) cabp[d] = 1e-10;
+            }
+            double bw = g_dt_state.lock_rate;
+            if (bw < 0.20) bw = 0.20;
+            if (bw > 0.90) bw = 0.90;
+            double scores[6], st = 0.0;
+            for (int d = 0; d < 6; d++) {
+                scores[d] = bw * pos_prior[ki][d] + (1.0 - bw) * cabp[d];
+                st += scores[d];
+            }
+            if (st > 1e-30) for (int d = 0; d < 6; d++) scores[d] /= st;
+            int first = dt_digits[k];
+            second_best[i] = -1; double sb = -1.0;
+            for (int d = 0; d < 6; d++) {
+                if (d != first && scores[d] > sb) { sb = scores[d]; second_best[i] = d; }
+            }
+        }
+
         /* Try DT_DIRECT_BEAMS candidates: beam 0 = pure argmax,
          * beams 1..N-1 = flip the i-th most uncertain digit to its second-best */
         for (int beam = 0; beam < DT_DIRECT_BEAMS && !success; beam++) {
@@ -3060,26 +3173,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
 
             if (beam > 0 && beam - 1 < n_vary && vary_pos[beam-1] >= 0) {
                 int k = vary_pos[beam - 1];
-                int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
-                /* Find second-best digit at this position */
-                double cabp[6];
-                for (int d = 0; d < 6; d++) {
-                    cabp[d] = mpfr_get_d(marginals[k][d], MPFR_RNDN);
-                    if (cabp[d] < 1e-10) cabp[d] = 1e-10;
-                }
-                double blend_weight = 0.25;
-                double scores[6], stotal = 0.0;
-                for (int d = 0; d < 6; d++) {
-                    scores[d] = blend_weight * pos_prior[ki][d] + (1.0 - blend_weight) * cabp[d];
-                    stotal += scores[d];
-                }
-                if (stotal > 1e-30) for (int d = 0; d < 6; d++) scores[d] /= stotal;
-                int first = trial_digits[k];
-                int second = -1; double second_s = -1.0;
-                for (int d = 0; d < 6; d++) {
-                    if (d != first && scores[d] > second_s) { second_s = scores[d]; second = d; }
-                }
-                if (second >= 0) trial_digits[k] = second;
+                if (second_best[beam-1] >= 0) trial_digits[k] = second_best[beam-1];
             }
 
             /* Build BigInt frequency from trial digits */
@@ -3119,7 +3213,199 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
             free(trial_digits);
         }
 
-        free(dt_digits);
+        /* ── Multi-position flips: try pairs of uncertain positions ── */
+        if (!success && n_vary >= 2) {
+            int max_pairs = (n_vary > 20) ? 20 : n_vary;  /* limit combinatorial explosion */
+            printf("  [DT] Trying %d×%d pair flips...\n", max_pairs, max_pairs);
+            for (int i = 0; i < max_pairs && !success; i++) {
+                for (int j = i + 1; j < max_pairs && !success; j++) {
+                    int *trial_digits = (int*)malloc(n_sites_raw * sizeof(int));
+                    memcpy(trial_digits, dt_digits, n_sites_raw * sizeof(int));
+
+                    int ki = vary_pos[i], kj = vary_pos[j];
+                    if (second_best[i] >= 0) trial_digits[ki] = second_best[i];
+                    if (second_best[j] >= 0) trial_digits[kj] = second_best[j];
+
+                    BigInt dt_freq; bigint_set_u64(&dt_freq, 0);
+                    BigInt dt_term, dt_tmp2;
+                    bigint_set_u64(&dt_term, 0); bigint_set_u64(&dt_tmp2, 0);
+                    for (int k = 0; k < n_sites_raw; k++) {
+                        bigint_set_u64(&mc_d_bi, (uint64_t)trial_digits[k]);
+                        bigint_mul(&dt_term, &mc_d_bi, &p6_cache[k]);
+                        bigint_add(&dt_tmp2, &dt_freq, &dt_term);
+                        bigint_copy(&dt_freq, &dt_tmp2);
+                    }
+                    if (!bigint_is_zero(&dt_freq)) {
+                        success = generate_and_try_periods(&dt_freq, &reg_sz, a_val,
+                                                           N, factor_p, factor_q, best_period);
+                        if (!success) {
+                            BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                            success = generate_and_try_periods(&dt_freq, &reg_sz, &oracle_base,
+                                                               N, factor_p, factor_q, best_period);
+                            bigint_clear(&oracle_base);
+                        }
+                        if (success)
+                            printf("  ★ DT PAIR FLIP FACTORED N (pos %d+%d) ★\n", ki, kj);
+                    }
+                    bigint_clear(&dt_freq); bigint_clear(&dt_term); bigint_clear(&dt_tmp2);
+                    free(trial_digits);
+                }
+            }
+        }
+
+        /* ── Reverse CF: reconstruct expected frequency from CF convergent
+         * periods and score against pos_prior.  Even when the argmax frequency
+         * has several wrong digits, the CF convergent denominators may still
+         * contain the true period.  For each candidate period r, we compute
+         * F_expected = round(s × R / r), convert to base-6 digits, and score
+         * each digit against the learned pos_prior.  The highest-scoring r is
+         * the most consistent with accumulated evidence. ── */
+        if (!success && dt_digits) {
+            /* Build argmax frequency F₀ */
+            BigInt rcf_f0; bigint_set_u64(&rcf_f0, 0);
+            {
+                BigInt rcf_t, rcf_t2;
+                bigint_set_u64(&rcf_t, 0); bigint_set_u64(&rcf_t2, 0);
+                for (int k = 0; k < n_sites_raw; k++) {
+                    bigint_set_u64(&mc_d_bi, (uint64_t)dt_digits[k]);
+                    bigint_mul(&rcf_t, &mc_d_bi, &p6_cache[k]);
+                    bigint_add(&rcf_t2, &rcf_f0, &rcf_t);
+                    bigint_copy(&rcf_f0, &rcf_t2);
+                }
+                bigint_clear(&rcf_t); bigint_clear(&rcf_t2);
+            }
+
+            if (!bigint_is_zero(&rcf_f0)) {
+                printf("  [RevCF] Scoring CF convergent periods against pos_prior...\n");
+
+                /* CF expansion of F₀ / R */
+                BigInt rcf_num, rcf_den, rcf_a0, rcf_rem;
+                BigInt rcf_pm1, rcf_p0, rcf_qm1, rcf_q0;
+                BigInt rcf_a_next, rcf_pnew, rcf_qnew, rcf_tmp;
+                bigint_set_u64(&rcf_num, 0); bigint_set_u64(&rcf_den, 0);
+                bigint_set_u64(&rcf_a0, 0); bigint_set_u64(&rcf_rem, 0);
+                bigint_set_u64(&rcf_pm1, 1); bigint_set_u64(&rcf_qm1, 0);
+                bigint_set_u64(&rcf_p0, 0); bigint_set_u64(&rcf_q0, 1);
+                bigint_set_u64(&rcf_a_next, 0); bigint_set_u64(&rcf_pnew, 0);
+                bigint_set_u64(&rcf_qnew, 0); bigint_set_u64(&rcf_tmp, 0);
+
+                bigint_copy(&rcf_num, &rcf_f0);
+                bigint_copy(&rcf_den, &reg_sz);
+                bigint_div_mod(&rcf_num, &rcf_den, &rcf_a0, &rcf_rem);
+                bigint_copy(&rcf_p0, &rcf_a0);
+
+                BigInt rcf_one; bigint_set_u64(&rcf_one, 1);
+                BigInt rcf_six; bigint_set_u64(&rcf_six, 6);
+
+                double best_rcf_score = -1e30;
+                BigInt best_rcf_period; bigint_set_u64(&best_rcf_period, 0);
+
+                for (int step = 0; step < 60 && !success; step++) {
+                    if (bigint_cmp(&rcf_q0, N) >= 0) break;
+                    if (bigint_is_zero(&rcf_q0) || bigint_cmp(&rcf_q0, &rcf_one) <= 0)
+                        goto rcf_next_step;
+
+                    /* For harmonics s = 1..6, reconstruct F_expected = s*R/q */
+                    for (int s = 1; s <= 6 && !success; s++) {
+                        BigInt s_bi; bigint_set_u64(&s_bi, (uint64_t)s);
+                        BigInt sr, f_exp, f_rem;
+                        bigint_set_u64(&sr, 0); bigint_set_u64(&f_exp, 0);
+                        bigint_set_u64(&f_rem, 0);
+                        bigint_mul(&sr, &s_bi, &reg_sz);
+                        bigint_div_mod(&sr, &rcf_q0, &f_exp, &f_rem);
+
+                        if (bigint_is_zero(&f_exp)) {
+                            bigint_clear(&s_bi); bigint_clear(&sr);
+                            bigint_clear(&f_exp); bigint_clear(&f_rem);
+                            continue;
+                        }
+
+                        /* Convert F_expected to base-6 digits and score vs pos_prior */
+                        BigInt f_work; bigint_set_u64(&f_work, 0);
+                        bigint_copy(&f_work, &f_exp);
+                        double log_score = 0.0;
+                        int valid = 1;
+                        for (int k = 0; k < n_sites_raw; k++) {
+                            BigInt dq, dr;
+                            bigint_set_u64(&dq, 0); bigint_set_u64(&dr, 0);
+                            bigint_div_mod(&f_work, &rcf_six, &dq, &dr);
+                            int digit = (int)bigint_to_u64(&dr);
+                            if (digit < 0 || digit > 5) { valid = 0; bigint_clear(&dq); bigint_clear(&dr); break; }
+                            log_score += log(pos_prior[k][digit] + 1e-10);
+                            bigint_copy(&f_work, &dq);
+                            bigint_clear(&dq); bigint_clear(&dr);
+                        }
+                        bigint_clear(&f_work);
+
+                        if (valid && log_score > best_rcf_score) {
+                            best_rcf_score = log_score;
+                            bigint_copy(&best_rcf_period, &rcf_q0);
+
+                            /* Try this period immediately */
+                            success = try_period(&rcf_q0, a_val, N, factor_p, factor_q);
+                            if (!success) {
+                                /* Try multiples */
+                                for (int m = 2; m <= 6 && !success; m++) {
+                                    BigInt m_bi, rm;
+                                    bigint_set_u64(&m_bi, (uint64_t)m);
+                                    bigint_set_u64(&rm, 0);
+                                    bigint_mul(&rm, &rcf_q0, &m_bi);
+                                    if (bigint_cmp(&rm, N) < 0)
+                                        success = try_period(&rm, a_val, N, factor_p, factor_q);
+                                    bigint_clear(&m_bi); bigint_clear(&rm);
+                                }
+                            }
+                            if (success) {
+                                char q_str[1300];
+                                bigint_to_decimal(q_str, sizeof(q_str), &rcf_q0);
+                                printf("  ★ REVERSE CF FACTORED N (period=%s, s=%d, score=%.2f) ★\n",
+                                       q_str, s, log_score);
+                            }
+                        }
+
+                        bigint_clear(&s_bi); bigint_clear(&sr);
+                        bigint_clear(&f_exp); bigint_clear(&f_rem);
+                    }
+
+                    rcf_next_step:
+                    if (bigint_is_zero(&rcf_rem)) break;
+                    bigint_copy(&rcf_num, &rcf_den);
+                    bigint_copy(&rcf_den, &rcf_rem);
+                    bigint_div_mod(&rcf_num, &rcf_den, &rcf_a_next, &rcf_rem);
+
+                    /* p_new = a_next * p0 + pm1 */
+                    bigint_mul(&rcf_tmp, &rcf_a_next, &rcf_p0);
+                    bigint_add(&rcf_pnew, &rcf_tmp, &rcf_pm1);
+                    /* q_new = a_next * q0 + qm1 */
+                    bigint_mul(&rcf_tmp, &rcf_a_next, &rcf_q0);
+                    bigint_add(&rcf_qnew, &rcf_tmp, &rcf_qm1);
+
+                    bigint_copy(&rcf_pm1, &rcf_p0);
+                    bigint_copy(&rcf_p0, &rcf_pnew);
+                    bigint_copy(&rcf_qm1, &rcf_q0);
+                    bigint_copy(&rcf_q0, &rcf_qnew);
+                }
+
+                if (!success && !bigint_is_zero(&best_rcf_period)) {
+                    char bp_str[1300];
+                    bigint_to_decimal(bp_str, sizeof(bp_str), &best_rcf_period);
+                    printf("  [RevCF] Best scoring period: %s (log_score=%.2f) — not a factor\n",
+                           bp_str, best_rcf_score);
+                }
+
+                bigint_clear(&rcf_num); bigint_clear(&rcf_den);
+                bigint_clear(&rcf_a0); bigint_clear(&rcf_rem);
+                bigint_clear(&rcf_pm1); bigint_clear(&rcf_p0);
+                bigint_clear(&rcf_qm1); bigint_clear(&rcf_q0);
+                bigint_clear(&rcf_a_next); bigint_clear(&rcf_pnew);
+                bigint_clear(&rcf_qnew); bigint_clear(&rcf_tmp);
+                bigint_clear(&rcf_one); bigint_clear(&rcf_six);
+                bigint_clear(&best_rcf_period);
+            }
+            bigint_clear(&rcf_f0);
+        }
+
+        if (dt_digits) free(dt_digits);
 
         if (success) {
             /* Clean up and return — skip beam search */
@@ -3460,13 +3746,29 @@ int main(int argc, char **argv)
     }
 
     int auto_a = 0;
-    if (strcmp(TARGET_A, "0") == 0) {
-        auto_a = 1;
-        bigint_set_u64(&a_val, 2);
-    } else {
-        if (bigint_from_decimal(&a_val, TARGET_A) != 0) {
-            printf("  ERROR: Invalid a = \"%s\"\n", TARGET_A);
-            return 1;
+    int manual_base = 0;
+
+    /* Parse --base option */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) {
+            if (bigint_from_decimal(&a_val, argv[i + 1]) != 0) {
+                printf("  ERROR: Invalid --base = \"%s\"\n", argv[i + 1]);
+                return 1;
+            }
+            manual_base = 1;
+            break;
+        }
+    }
+
+    if (!manual_base) {
+        if (strcmp(TARGET_A, "0") == 0) {
+            auto_a = 1;
+            bigint_set_u64(&a_val, 2);
+        } else {
+            if (bigint_from_decimal(&a_val, TARGET_A) != 0) {
+                printf("  ERROR: Invalid a = \"%s\"\n", TARGET_A);
+                return 1;
+            }
         }
     }
 
@@ -3514,7 +3816,7 @@ int main(int argc, char **argv)
     success = 0;
 
     int active_base_idx = 181;
-    if (auto_a) {
+    if (auto_a && !manual_base) {
         printf("\n  ╔════════════════════════════════════════════════════════════════╗\n");
         printf("  ║  AUTOMATED TOPOLOGICAL RESONANCE PROBE (BASE SELECTOR)         ║\n");
         printf("  ╚════════════════════════════════════════════════════════════════╝\n");
@@ -3557,12 +3859,22 @@ int main(int argc, char **argv)
     BigInt cf_history[200];
     for (int i = 0; i < 200; i++) bigint_set_u64(&cf_history[i], 0);
     int cf_hist_count = 0;
-    int first_base = 1;  /* Track first base to avoid resetting initial state */
+    int first_base = 1;
+
+    if (manual_base) {
+        char a_str[1300];
+        bigint_to_decimal(a_str, sizeof(a_str), &a_val);
+        printf("  ╔════════════════════════════════════════════════════════════════╗\n");
+        printf("  ║  MANUAL BASE MODE: spamming a = %-28s ║\n", a_str);
+        printf("  ╚════════════════════════════════════════════════════════════════╝\n\n");
+    }
+
     for (int bi = active_base_idx; !success; bi = (auto_a ? (bi + 1) % 200 : bi)) {
         if (auto_a) bigint_set_u64(&a_val, base_list[bi]);
 
-        /* Reset positional memory when base changes to prevent cross-contamination */
-        if (!first_base && pos_memory_ready) {
+        /* Reset positional memory when base changes to prevent cross-contamination.
+         * Skip reset when spamming the same manual base — let DT accumulate. */
+        if (!first_base && pos_memory_ready && !manual_base) {
             pos_memory_reset();
         }
         first_base = 0;
