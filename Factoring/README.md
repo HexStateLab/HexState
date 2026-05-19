@@ -130,8 +130,8 @@ Time: 0.023 seconds
 
 ```bash
 # Compile with heavy optimizations
-gcc -O2 -std=gnu99 -I.. -o tesseract_factor tesseract_factor.c ../quhit_triality.c ../quhit_hexagram.c ../s6_exotic.c ../bigint.cpp -lm -lmpfr -lgmp
+gcc -g -O0 -std=gnu99 -I.. -o tesseract_factor_dbg tesseract_factor.c ../quhit_triality.c ../quhit_hexagram.c ../s6_exotic.c ../bigint.cpp -lm -lmpfr -lgmp
 
 # Execute with the default target
-./factor
+./tesseract_factor_dbg 111111 --base 2 --oracle 
 ```
