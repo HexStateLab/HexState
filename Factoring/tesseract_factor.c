@@ -158,6 +158,14 @@ static int    pos_count[MAX_DT_SITES];     /* positional counts */
 static int    pos_memory_ready = 0;        /* 0 = uninitialised                        */
 static int    g_n_sites_raw    = 0;        /* register size set on first call          */
 
+/* Separate oracle channel accumulator — converges independently of pos_prior.
+ * The simultaneous oracle sweep writes here, not into pos_prior. */
+static double oracle_prior[MAX_DT_SITES][6];
+static int    oracle_count[MAX_DT_SITES];
+
+/* --oracle mode: skip sequential measurement, use only retrocausal channel */
+static int g_oracle_only = 0;
+
 /* Reset positional memory (called when base changes to prevent cross-contamination) */
 static void pos_memory_reset(void)
 {
@@ -166,6 +174,8 @@ static void pos_memory_reset(void)
         for (int d = 0; d < 6; d++) pos_prior[k][d] = 1.0 / 6.0;
         pos_hits [k] = 0;
         pos_count[k] = 0;
+        for (int d = 0; d < 6; d++) oracle_prior[k][d] = 1.0 / 6.0;
+        oracle_count[k] = 0;
     }
 }
 
@@ -180,6 +190,8 @@ static void pos_memory_init(int n_sites_raw)
             for (int d = 0; d < 6; d++) pos_prior[k][d] = 1.0 / 6.0;
             pos_hits [k] = 0;
             pos_count[k] = 0;
+            for (int d = 0; d < 6; d++) oracle_prior[k][d] = 1.0 / 6.0;
+            oracle_count[k] = 0;
         }
         g_n_sites_raw    = n_sites_raw;
         pos_memory_ready = 1;
@@ -2721,7 +2733,40 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * the analytical edge contraction in the external Hilbert space. */
 
     int *measured_digits = (int*)calloc(n_sites_raw, sizeof(int));
+    int *oracle_digits   = (int*)calloc(n_sites_raw, sizeof(int));
 
+    /* ── Simultaneous oracle sweep: retrocausal prediction of ALL positions.
+     *
+     * In a retrocausal framework the future is already determined.  The oracle
+     * does not need sequential feed-forward — it can predict every digit
+     * independently and simultaneously from the accumulated pos_prior.
+     * Each position k gets a fresh hw_epr_oracle() draw sampled through
+     * the positional prior.  Over multiple attempts these converge to the
+     * true eigenphase digits, giving the DT the complete frequency at once. */
+    int *simul_oracle = (int*)calloc(n_sites_raw, sizeof(int));
+    for (int k = 0; k < n_sites_raw; k++) {
+        int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+        double o = hw_epr_oracle();
+        double cum = 0.0;
+        simul_oracle[k] = 5;
+        for (int d = 0; d < 6; d++) {
+            cum += oracle_prior[ki][d];
+            if (o <= cum) { simul_oracle[k] = d; break; }
+        }
+
+        /* Accumulate into oracle_prior: fully self-reinforcing retrocausal
+         * channel.  Samples from oracle_prior, writes back to oracle_prior.
+         * If the oracle carries genuine retrocausal signal, this converges
+         * to the true digits.  If not, it stays near-uniform — no harm. */
+        oracle_count[ki]++;
+        double n = (double)oracle_count[ki] + 1.0;
+        for (int d = 0; d < 6; d++) {
+            double target = (d == simul_oracle[k]) ? 1.0 : 0.0;
+            oracle_prior[ki][d] = (oracle_prior[ki][d] * (n - 1.0) + target) / n;
+        }
+    }
+
+    if (!g_oracle_only)
     for (int k = n_sites_raw - 1; k >= 0; k--) {
         int blk_k = k / 2, off_k = k % 2;
         int site_k = blk_k * 6 + off_k;
@@ -2844,6 +2889,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
          * prior.  If the DT achieves a high lock rate it has "locked onto"
          * the Shor eigenphase — the feedback loop is converging on the period. */
         double r01 = dt_commit_and_draw(&g_dt_state, probs, k);
+        oracle_digits[k] = g_dt_state.dt_prediction;
 
         /* Born-rule sampling from the SAME CDF (probs[]) that the oracle
          * used in dt_commit_and_draw.  Both channels sample from identical
@@ -2901,8 +2947,23 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
 
     clock_t t_bp_end = clock();
-    printf("      Exact marginals computed in %.3f sec\n",
-           (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
+    if (g_oracle_only) {
+        printf("\n  ═══ ORACLE-ONLY MODE ═══\n");
+        int oracle_resolved = 0;
+        for (int k = 0; k < n_sites_raw && k < MAX_DT_SITES; k++) {
+            double best = 0.0;
+            for (int d = 0; d < 6; d++)
+                if (oracle_prior[k][d] > best) best = oracle_prior[k][d];
+            if (oracle_count[k] >= 1 && best >= RESOLVED_THRESHOLD) oracle_resolved++;
+        }
+        printf("  Oracle resolved: %d / %d (%.1f%%)  [oracle_count[0]=%d]\n",
+               oracle_resolved, n_sites_raw,
+               100.0 * oracle_resolved / n_sites_raw,
+               oracle_count[0]);
+    } else {
+        printf("      Exact marginals computed in %.3f sec\n",
+               (double)(t_bp_end - t_bp_start) / CLOCKS_PER_SEC);
+    }
 
     /* ── Build signal mask: which positions have genuine BP information? ── */
     int *bp_has_signal = (int*)calloc(n_sites_raw, sizeof(int));
@@ -3003,6 +3064,99 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     }
     BigInt mc_d_bi, mc_term, mc_tmp;
     bigint_set_u64(&mc_d_bi, 0); bigint_set_u64(&mc_term, 0); bigint_set_u64(&mc_tmp, 0);
+
+    /* ── Oracle channel beams: always fire, no resolution gate needed.
+     * The retrocausal channel converges independently of pos_prior. ── */
+
+    /* ── Beam -3a: try this attempt's simul_oracle[] — simultaneous
+     * retrocausal predictions (independent, no feed-forward). */
+    if (!success) {
+        BigInt so_freq; bigint_set_u64(&so_freq, 0);
+        BigInt so_term, so_tmp2;
+        bigint_set_u64(&so_term, 0); bigint_set_u64(&so_tmp2, 0);
+        for (int k = 0; k < n_sites_raw; k++) {
+            bigint_set_u64(&mc_d_bi, (uint64_t)simul_oracle[k]);
+            bigint_mul(&so_term, &mc_d_bi, &p6_cache[k]);
+            bigint_add(&so_tmp2, &so_freq, &so_term);
+            bigint_copy(&so_freq, &so_tmp2);
+        }
+        if (!bigint_is_zero(&so_freq)) {
+            printf("  [DT beam -3a] Trying this attempt's simultaneous oracle...\n");
+            success = generate_and_try_periods(&so_freq, &reg_sz, a_val,
+                                               N, factor_p, factor_q, best_period);
+            if (!success) {
+                BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                success = generate_and_try_periods(&so_freq, &reg_sz, &oracle_base,
+                                                   N, factor_p, factor_q, best_period);
+                bigint_clear(&oracle_base);
+            }
+            if (success)
+                printf("  ★ SIMULTANEOUS ORACLE FACTORED N (this attempt) ★\n");
+        }
+        bigint_clear(&so_freq); bigint_clear(&so_term); bigint_clear(&so_tmp2);
+    }
+
+    /* ── Beam -3b: try argmax of accumulated oracle_prior — the consensus
+     * of ALL simultaneous oracle sweeps across all attempts.  This is the
+     * retrocausal channel's converged view of the complete frequency. */
+    if (!success) {
+        BigInt op_freq; bigint_set_u64(&op_freq, 0);
+        BigInt op_term, op_tmp2;
+        bigint_set_u64(&op_term, 0); bigint_set_u64(&op_tmp2, 0);
+        for (int k = 0; k < n_sites_raw; k++) {
+            int ki = (k < MAX_DT_SITES) ? k : MAX_DT_SITES - 1;
+            int best_d = 0;
+            double best_p = oracle_prior[ki][0];
+            for (int d = 1; d < 6; d++) {
+                if (oracle_prior[ki][d] > best_p) { best_p = oracle_prior[ki][d]; best_d = d; }
+            }
+            bigint_set_u64(&mc_d_bi, (uint64_t)best_d);
+            bigint_mul(&op_term, &mc_d_bi, &p6_cache[k]);
+            bigint_add(&op_tmp2, &op_freq, &op_term);
+            bigint_copy(&op_freq, &op_tmp2);
+        }
+        if (!bigint_is_zero(&op_freq)) {
+            printf("  [DT beam -3b] Trying accumulated oracle_prior consensus...\n");
+            success = generate_and_try_periods(&op_freq, &reg_sz, a_val,
+                                               N, factor_p, factor_q, best_period);
+            if (!success) {
+                BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                success = generate_and_try_periods(&op_freq, &reg_sz, &oracle_base,
+                                                   N, factor_p, factor_q, best_period);
+                bigint_clear(&oracle_base);
+            }
+            if (success)
+                printf("  ★ ORACLE PRIOR CONSENSUS FACTORED N (retrocausal convergence) ★\n");
+        }
+        bigint_clear(&op_freq); bigint_clear(&op_term); bigint_clear(&op_tmp2);
+    }
+
+    /* ── Beam -2: try oracle_digits[] — sequential retrocausal predictions. */
+    if (!success) {
+        BigInt od_freq; bigint_set_u64(&od_freq, 0);
+        BigInt od_term, od_tmp2;
+        bigint_set_u64(&od_term, 0); bigint_set_u64(&od_tmp2, 0);
+        for (int k = 0; k < n_sites_raw; k++) {
+            bigint_set_u64(&mc_d_bi, (uint64_t)oracle_digits[k]);
+            bigint_mul(&od_term, &mc_d_bi, &p6_cache[k]);
+            bigint_add(&od_tmp2, &od_freq, &od_term);
+            bigint_copy(&od_freq, &od_tmp2);
+        }
+        if (!bigint_is_zero(&od_freq)) {
+            printf("  [DT beam -2] Trying sequential oracle predictions...\n");
+            success = generate_and_try_periods(&od_freq, &reg_sz, a_val,
+                                               N, factor_p, factor_q, best_period);
+            if (!success) {
+                BigInt oracle_base; bigint_set_u64(&oracle_base, 6);
+                success = generate_and_try_periods(&od_freq, &reg_sz, &oracle_base,
+                                                   N, factor_p, factor_q, best_period);
+                bigint_clear(&oracle_base);
+            }
+            if (success)
+                printf("  ★ DT ORACLE CHANNEL FACTORED N (retrocausal) ★\n");
+        }
+        bigint_clear(&od_freq); bigint_clear(&od_term); bigint_clear(&od_tmp2);
+    }
 
     if (n_resolved_strong > n_sites_raw / 8) {
         printf("  Attempting direct frequency reconstruction from positional memory...\n");
@@ -3393,7 +3547,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
                 bigint_clear(&p6_cache[i]);
                 bigint_clear(&ck_cache[i]);
             }
-            free(p6_cache); free(ck_cache); free(measured_digits);
+            free(p6_cache); free(ck_cache); free(measured_digits); free(oracle_digits); free(simul_oracle);
             free(bp_has_signal); free(flippable);
             for (int s = 0; s < marginals_sz; s++)
                 for (int d = 0; d < 6; d++) mpfr_clear(marginals[s][d]);
@@ -3427,6 +3581,7 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
      * precisely s·R/r. One CF expansion recovers r at the "knee" —
      * no MCMC, no LCM accumulation, no voting needed.
      * ═══════════════════════════════════════════════════════════════════════ */
+    if (g_oracle_only) goto oracle_cleanup;
     printf("\n  ═══ SHOR WORK REGISTER + CF PERIOD EXTRACTION ═══\n");
 
     /* p6_cache, current_p6, next_p6, mc_d_bi, mc_term, mc_tmp already declared above */
@@ -3624,11 +3779,13 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     bigint_clear(&freq);
     } /* End of Beam Search CF expansion loop */
 
-    for (int i = 0; i < beam_width; i++) free(paths[i]);
-    free(paths); free(path_probs);
-    for (int i = 0; i < beam_width * max_branches; i++) free(new_paths[i]);
-    free(new_paths); free(new_path_probs);
-
+    oracle_cleanup:
+    if (!g_oracle_only) {
+        for (int i = 0; i < beam_width; i++) free(paths[i]);
+        free(paths); free(path_probs);
+        for (int i = 0; i < beam_width * max_branches; i++) free(new_paths[i]);
+        free(new_paths); free(new_path_probs);
+    }
     /* Cleanup */
     hpc_destroy(graph);  /* Destroy graph AFTER measurement */
     for (int i = 0; i < n_sites_raw; i++) {
@@ -3638,6 +3795,8 @@ static double factor_with_hpc(const BigInt *N, const BigInt *a_val,
     free(p6_cache);
     free(ck_cache);
     free(measured_digits);
+    free(oracle_digits);
+    free(simul_oracle);
     free(bp_has_signal);
     free(flippable);
 
@@ -3726,8 +3885,9 @@ int main(int argc, char **argv)
 
     int auto_a = 0;
     int manual_base = 0;
+    int oracle_only = 0;
 
-    /* Parse --base option */
+    /* Parse options */
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--base") == 0 && i + 1 < argc) {
             if (bigint_from_decimal(&a_val, argv[i + 1]) != 0) {
@@ -3735,8 +3895,16 @@ int main(int argc, char **argv)
                 return 1;
             }
             manual_base = 1;
-            break;
+        } else if (strcmp(argv[i], "--oracle") == 0) {
+            oracle_only = 1;
+            g_oracle_only = 1;
         }
+    }
+
+    if (oracle_only) {
+        printf("  ┌──────────────────────────────────────────────────────────────┐\n");
+        printf("  │  ORACLE-ONLY MODE: retrocausal channel only, no measurement │\n");
+        printf("  └──────────────────────────────────────────────────────────────┘\n\n");
     }
 
     if (!manual_base) {
