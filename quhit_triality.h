@@ -356,6 +356,7 @@ void ltri_shift(LazyTrialityQuhit *q, int delta);
 void ltri_dft(LazyTrialityQuhit *q);
 void ltri_idft(LazyTrialityQuhit *q);
 void ltri_phase(LazyTrialityQuhit *q, const double *phi_re, const double *phi_im);
+void ltri_phase_single(LazyTrialityQuhit *q, int k, double phi_re, double phi_im);
 
 /* Materialize — apply accumulated transform, return edge-view amplitudes */
 void ltri_materialize(LazyTrialityQuhit *q, double *out_re, double *out_im);
