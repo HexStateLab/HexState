@@ -349,6 +349,7 @@ static inline void hpc_set_local(HPCGraph *g, uint64_t site,
 static inline void hpc_dft(HPCGraph *g, uint64_t site)
 {
     triality_dft(&g->locals[site]);
+    triality_update_mask(&g->locals[site]);
     HPCGateEntry entry = { .type = HPC_GATE_LOCAL_DFT, .site_a = site,
                            .fidelity = 1.0 };
     hpc_log_gate(g, entry);
@@ -358,6 +359,7 @@ static inline void hpc_phase(HPCGraph *g, uint64_t site,
                               const double phi_re[6], const double phi_im[6])
 {
     triality_phase(&g->locals[site], phi_re, phi_im);
+    triality_update_mask(&g->locals[site]);
     HPCGateEntry entry = { .type = HPC_GATE_LOCAL_PHASE, .site_a = site,
                            .fidelity = 1.0 };
     for (int i = 0; i < 6; i++) entry.params[i] = phi_re[i];
@@ -367,6 +369,7 @@ static inline void hpc_phase(HPCGraph *g, uint64_t site,
 static inline void hpc_shift(HPCGraph *g, uint64_t site, int delta)
 {
     triality_shift(&g->locals[site], delta);
+    triality_update_mask(&g->locals[site]);
     HPCGateEntry entry = { .type = HPC_GATE_LOCAL_SHIFT, .site_a = site,
                            .fidelity = 1.0 };
     entry.params[0] = (double)delta;
@@ -520,7 +523,8 @@ static inline void hpc_amplitude(const HPCGraph *g,
     /* Step 1: Product of local amplitudes — O(N) */
     for (uint64_t k = 0; k < g->n_sites; k++) {
         uint32_t idx = indices[k];
-        const TrialityQuhit *q = &g->locals[k];
+        TrialityQuhit *q = (TrialityQuhit*)&g->locals[k];
+        triality_ensure_view(q, VIEW_EDGE);
         double a_re = q->edge_re[idx];
         double a_im = q->edge_im[idx];
         double new_re = re * a_re - im * a_im;
@@ -591,7 +595,8 @@ static inline double hpc_marginal(const HPCGraph *g,
 
     /* Product state: no edges touching this site */
     if (adj->count == 0) {
-        const TrialityQuhit *q = &g->locals[site];
+        TrialityQuhit *q = (TrialityQuhit*)&g->locals[site];
+        triality_ensure_view(q, VIEW_EDGE);
         return q->edge_re[value] * q->edge_re[value] +
                q->edge_im[value] * q->edge_im[value];
     }
@@ -617,6 +622,49 @@ static inline double hpc_marginal(const HPCGraph *g,
             if (connected[c] == partner) { found = 1; break; }
         if (!found && n_connected < 128)
             connected[n_connected++] = partner;
+    }
+
+    /* ═══ Fast Path for High-Degree Nodes (O(degree) vs O(6^degree)) ═══
+     * For n_connected > 6, the exponential enumeration stalls. We switch to
+     * a neighbor-factored approximation which is exact for trees and CZ gates. */
+    if (n_connected > 6) {
+        TrialityQuhit *q_site = (TrialityQuhit*)&g->locals[site];
+        triality_ensure_view(q_site, VIEW_EDGE);
+        double prob = q_site->edge_re[value] * q_site->edge_re[value] +
+                      q_site->edge_im[value] * q_site->edge_im[value];
+
+        for (uint64_t i = 0; i < adj->count; i++) {
+            uint64_t eid = adj->edge_ids[i];
+            const HPCEdge *edge = &g->edges[eid];
+            uint64_t partner = (edge->site_a == site) ?
+                                edge->site_b : edge->site_a;
+
+            TrialityQuhit *q_p = (TrialityQuhit*)&g->locals[partner];
+            triality_ensure_view(q_p, VIEW_EDGE);
+
+            double edge_factor = 0.0;
+            for (int k = 0; k < HPC_D; k++) {
+                double w_re, w_im;
+                if (edge->type == HPC_EDGE_CZ) {
+                    uint32_t pidx = (value * k) % HPC_D;
+                    w_re = HPC_W6_RE[pidx];
+                    w_im = HPC_W6_IM[pidx];
+                } else if (edge->site_a == site) {
+                    w_re = edge->w_re[value][k];
+                    w_im = edge->w_im[value][k];
+                } else {
+                    w_re = edge->w_re[k][value];
+                    w_im = edge->w_im[k][value];
+                }
+
+                double pk = q_p->edge_re[k] * q_p->edge_re[k] +
+                            q_p->edge_im[k] * q_p->edge_im[k];
+                double w_mag2 = w_re * w_re + w_im * w_im;
+                edge_factor += pk * w_mag2;
+            }
+            prob *= edge_factor;
+        }
+        return prob;
     }
 
     /* Also find edges between connected partners (not touching site)
@@ -661,7 +709,8 @@ static inline double hpc_marginal(const HPCGraph *g,
     uint64_t n_configs = 1;
 
     for (uint64_t c = 0; c < n_connected; c++) {
-        const TrialityQuhit *q_c = &g->locals[connected[c]];
+        TrialityQuhit *q_c = (TrialityQuhit*)&g->locals[connected[c]];
+        triality_ensure_view(q_c, VIEW_EDGE);
         uint8_t mask = q_c->active_mask ? q_c->active_mask : 0x3F;
         int cnt = 0;
         for (int k = 0; k < HPC_D; k++)
@@ -681,12 +730,14 @@ static inline double hpc_marginal(const HPCGraph *g,
         }
 
         /* Compute amplitude for this configuration */
-        const TrialityQuhit *q_site = &g->locals[site];
+        TrialityQuhit *q_site = (TrialityQuhit*)&g->locals[site];
+        triality_ensure_view(q_site, VIEW_EDGE);
         double amp_re = q_site->edge_re[value];
         double amp_im = q_site->edge_im[value];
 
         for (uint64_t c = 0; c < n_connected; c++) {
-            const TrialityQuhit *q_p = &g->locals[connected[c]];
+            TrialityQuhit *q_p = (TrialityQuhit*)&g->locals[connected[c]];
+            triality_ensure_view(q_p, VIEW_EDGE);
             uint32_t pv = partner_vals[c];
             double p_re = q_p->edge_re[pv], p_im = q_p->edge_im[pv];
             double new_re = amp_re * p_re - amp_im * p_im;
@@ -984,8 +1035,10 @@ static inline double hpc_norm_sq(const HPCGraph *g)
 static inline double hpc_exotic_invariant(HPCGraph *g)
 {
     double total = 0.0;
-    for (uint64_t i = 0; i < g->n_sites; i++)
+    for (uint64_t i = 0; i < g->n_sites; i++) {
+        triality_ensure_view(&g->locals[i], VIEW_EDGE);
         total += triality_exotic_invariant_cached(&g->locals[i]);
+    }
     return total / g->n_sites;
 }
 
