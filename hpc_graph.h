@@ -395,7 +395,8 @@ static inline void hpc_cz(HPCGraph *g, uint64_t site_a, uint64_t site_b)
     e->site_a = site_a;
     e->site_b = site_b;
     e->fidelity = 1.0;
-    /* Phase matrix not stored — implicitly ω^(a·b) */
+    e->syntheme_id = 1;  /* Use syntheme_id to store CZ multiplicity m */
+    /* Phase matrix not stored — implicitly ω^(m·a·b) */
 
     g->n_edges++;
     g->cz_edges++;
@@ -542,8 +543,9 @@ static inline void hpc_amplitude(const HPCGraph *g,
         double w_re, w_im;
 
         if (edge->type == HPC_EDGE_CZ) {
-            /* CZ: ω^(ia·ib) — precomputed, O(1) */
-            uint32_t phase_idx = (ia * ib) % HPC_D;
+            /* CZ: ω^(m·ia·ib) — precomputed, O(1) */
+            uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+            uint32_t phase_idx = (m * ia * ib) % HPC_D;
             w_re = HPC_W6_RE[phase_idx];
             w_im = HPC_W6_IM[phase_idx];
         } else {
@@ -646,7 +648,8 @@ static inline double hpc_marginal(const HPCGraph *g,
             for (int k = 0; k < HPC_D; k++) {
                 double w_re, w_im;
                 if (edge->type == HPC_EDGE_CZ) {
-                    uint32_t pidx = (value * k) % HPC_D;
+                    uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+                    uint32_t pidx = (m * value * k) % HPC_D;
                     w_re = HPC_W6_RE[pidx];
                     w_im = HPC_W6_IM[pidx];
                 } else if (edge->site_a == site) {
@@ -772,7 +775,8 @@ static inline double hpc_marginal(const HPCGraph *g,
 
             double w_re, w_im;
             if (edge->type == HPC_EDGE_CZ) {
-                uint32_t phase_idx = (va * vb) % HPC_D;
+                uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+                uint32_t phase_idx = (m * va * vb) % HPC_D;
                 w_re = HPC_W6_RE[phase_idx];
                 w_im = HPC_W6_IM[phase_idx];
             } else {
@@ -820,13 +824,13 @@ static inline void hpc_compact_edges(HPCGraph *g)
         uint64_t sa = edge->site_a, sb = edge->site_b;
 
         /* Count and remove duplicate CZ edges for this pair */
-        int cz_count = 1;  /* This edge counts as 1 */
+        int cz_count = edge->syntheme_id ? edge->syntheme_id : 1;  /* This edge's multiplicity */
         for (uint64_t e2 = e + 1; e2 < g->n_edges; ) {
             HPCEdge *other = &g->edges[e2];
             if (other->type == HPC_EDGE_CZ &&
                 ((other->site_a == sa && other->site_b == sb) ||
                  (other->site_a == sb && other->site_b == sa))) {
-                cz_count++;
+                cz_count += (other->syntheme_id ? other->syntheme_id : 1);
 
                 /* Remove adjacency entries for the duplicate */
                 hpc_adj_remove(g, other->site_a, e2);
@@ -863,23 +867,9 @@ static inline void hpc_compact_edges(HPCGraph *g)
             }
             g->n_edges--;
             g->cz_edges--;
-        } else if (reduced == 1) {
-            /* Standard CZ — already correct, just advance */
-            e++;
         } else {
-            /* Convert to general phase edge with accumulated phase:
-             * w(a,b) = ω^(reduced · a · b) */
-            edge->type = HPC_EDGE_PHASE;
-            edge->fidelity = 1.0;  /* Still exact */
-            for (int a = 0; a < HPC_D; a++) {
-                for (int b = 0; b < HPC_D; b++) {
-                    uint32_t phase_idx = (uint32_t)(reduced * a * b) % HPC_D;
-                    edge->w_re[a][b] = HPC_W6_RE[phase_idx];
-                    edge->w_im[a][b] = HPC_W6_IM[phase_idx];
-                }
-            }
-            g->cz_edges--;
-            g->phase_edges++;
+            /* Keep as exact CZ edge, just update multiplicity */
+            edge->syntheme_id = reduced;
             e++;
         }
     }
@@ -949,7 +939,8 @@ static inline uint32_t hpc_measure(HPCGraph *g, uint64_t site,
         for (int k = 0; k < HPC_D; k++) {
             double w_re, w_im;
             if (edge->type == HPC_EDGE_CZ) {
-                uint32_t phase_idx = (outcome * k) % HPC_D;
+                uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+                uint32_t phase_idx = (m * outcome * k) % HPC_D;
                 w_re = HPC_W6_RE[phase_idx];
                 w_im = HPC_W6_IM[phase_idx];
             } else if (edge->site_a == site) {
