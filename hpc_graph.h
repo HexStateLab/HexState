@@ -643,19 +643,48 @@ static inline void hpc_amplitude(const HPCGraph *g,
     }
     memcpy(transformed, indices, n_sites * sizeof(uint32_t));
 
+    /* Single reverse pass: interleave phase evaluation and permutation inversion.
+     *
+     * For operator U = D_m · P_m · ... · D_1 · P_1 · |ψ₀⟩:
+     *   ⟨i|U⟩ = D_m(i) · D_{m-1}(P_m⁻¹(i)) · ... · ψ₀(P₁⁻¹(...P_m⁻¹(i)...))
+     *
+     * Starting from requested indices i, iterate edges newest→oldest.
+     * Phase edges D_e are evaluated at CURRENT indices (before their
+     * following permutation's inverse is applied). Permutation edges P_e
+     * are applied as inverse transforms to the running indices. */
+    double re = 1.0, im = 0.0;
     for (int64_t e = (int64_t)g->n_edges - 1; e >= 0; e--) {
         const HPCEdge *edge = &g->edges[e];
-        if (edge->type != HPC_EDGE_PERMUTE) continue;
 
-        uint64_t a = edge->site_a;
-        uint64_t b = edge->site_b;
-        uint32_t packed = edge->perm_source[transformed[a]][transformed[b]];
-        transformed[a] = (packed >> 3) & 7;
-        transformed[b] = packed & 7;
+        if (edge->type == HPC_EDGE_PERMUTE) {
+            uint64_t a = edge->site_a;
+            uint64_t b = edge->site_b;
+            uint32_t packed = edge->perm_source[transformed[a]][transformed[b]];
+            transformed[a] = (packed >> 3) & 7;
+            transformed[b] = packed & 7;
+        } else {
+            uint32_t ia = transformed[edge->site_a];
+            uint32_t ib = transformed[edge->site_b];
+            double wr, wi;
+
+            if (edge->type == HPC_EDGE_CZ) {
+                uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+                uint32_t phase_idx = (m * ia * ib) % HPC_D;
+                wr = HPC_W6_RE[phase_idx];
+                wi = HPC_W6_IM[phase_idx];
+            } else {
+                wr = edge->w_re[ia][ib];
+                wi = edge->w_im[ia][ib];
+            }
+
+            double new_re = re * wr - im * wi;
+            double new_im = re * wi + im * wr;
+            re = new_re;
+            im = new_im;
+        }
     }
 
-    /* Phase 2: Product of local amplitudes at transformed indices — O(N) */
-    double re = 1.0, im = 0.0;
+    /* Local amplitudes at final (most-backward-transformed) indices */
     for (uint64_t k = 0; k < n_sites; k++) {
         uint32_t idx = transformed[k];
         TrialityQuhit *q = (TrialityQuhit*)&g->locals[k];
@@ -664,33 +693,6 @@ static inline void hpc_amplitude(const HPCGraph *g,
         double a_im = q->edge_im[idx];
         double new_re = re * a_re - im * a_im;
         double new_im = re * a_im + im * a_re;
-        re = new_re;
-        im = new_im;
-    }
-
-    /* Phase 3: Phase edge accumulation at transformed indices — O(E)
-     * Skip PERMUTE edges (already handled). */
-    for (uint64_t e = 0; e < g->n_edges; e++) {
-        const HPCEdge *edge = &g->edges[e];
-        if (edge->type == HPC_EDGE_PERMUTE) continue;
-
-        uint32_t ia = transformed[edge->site_a];
-        uint32_t ib = transformed[edge->site_b];
-
-        double wr, wi;
-
-        if (edge->type == HPC_EDGE_CZ) {
-            uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
-            uint32_t phase_idx = (m * ia * ib) % HPC_D;
-            wr = HPC_W6_RE[phase_idx];
-            wi = HPC_W6_IM[phase_idx];
-        } else {
-            wr = edge->w_re[ia][ib];
-            wi = edge->w_im[ia][ib];
-        }
-
-        double new_re = re * wr - im * wi;
-        double new_im = re * wi + im * wr;
         re = new_re;
         im = new_im;
     }
@@ -910,76 +912,61 @@ static inline double hpc_marginal(const HPCGraph *g,
             for (uint64_t c = 0; c < n_connected; c++)
                 cur_vals[1 + c] = partner_vals[c];
 
-            /* Step 2: apply inverse permutations in reverse edge order */
+            /* Step 2: single reverse pass — interleave phase evaluation and permutation inversion */
+            double amp_re = 1.0, amp_im = 0.0;
             for (int64_t ei = (int64_t)n_conn_edges - 1; ei >= 0; ei--) {
                 const HPCEdge *edge = &g->edges[conn_edge_ids[ei]];
-                if (edge->type != HPC_EDGE_PERMUTE) continue;
 
-                uint64_t a = edge->site_a;
-                uint64_t b = edge->site_b;
-
-                /* Find current values of a and b */
+                uint64_t sa = edge->site_a, sb = edge->site_b;
                 uint32_t ca = 0, cb = 0;
                 for (int i = 0; i < n_all; i++) {
-                    if (all_sites[i] == a) ca = cur_vals[i];
-                    if (all_sites[i] == b) cb = cur_vals[i];
+                    if (all_sites[i] == sa) ca = cur_vals[i];
+                    if (all_sites[i] == sb) cb = cur_vals[i];
                 }
 
-                uint32_t packed = edge->perm_source[ca][cb];
-                uint32_t sa_val = (packed >> 3) & 7;
-                uint32_t sb_val = packed & 7;
-
-                /* Update values */
-                for (int i = 0; i < n_all; i++) {
-                    if (all_sites[i] == a) cur_vals[i] = sa_val;
-                    if (all_sites[i] == b) cur_vals[i] = sb_val;
+                if (edge->type == HPC_EDGE_PERMUTE) {
+                    uint32_t packed = edge->perm_source[ca][cb];
+                    uint32_t sa_val = (packed >> 3) & 7;
+                    uint32_t sb_val = packed & 7;
+                    for (int i = 0; i < n_all; i++) {
+                        if (all_sites[i] == sa) cur_vals[i] = sa_val;
+                        if (all_sites[i] == sb) cur_vals[i] = sb_val;
+                    }
+                } else {
+                    double wr, wi;
+                    if (edge->type == HPC_EDGE_CZ) {
+                        uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
+                        uint32_t phase_idx = (m * ca * cb) % HPC_D;
+                        wr = HPC_W6_RE[phase_idx];
+                        wi = HPC_W6_IM[phase_idx];
+                    } else {
+                        wr = edge->w_re[ca][cb];
+                        wi = edge->w_im[ca][cb];
+                    }
+                    double new_re = amp_re * wr - amp_im * wi;
+                    double new_im = amp_re * wi + amp_im * wr;
+                    amp_re = new_re;
+                    amp_im = new_im;
                 }
             }
 
             /* Step 3: local amplitudes at source indices */
             TrialityQuhit *q_site = (TrialityQuhit*)&g->locals[site];
             triality_ensure_view(q_site, VIEW_EDGE);
-            double amp_re = q_site->edge_re[cur_vals[0]];
-            double amp_im = q_site->edge_im[cur_vals[0]];
+            double a_re = q_site->edge_re[cur_vals[0]];
+            double a_im = q_site->edge_im[cur_vals[0]];
+            double new_re = amp_re * a_re - amp_im * a_im;
+            double new_im = amp_re * a_im + amp_im * a_re;
+            amp_re = new_re;
+            amp_im = new_im;
 
             for (uint64_t c = 0; c < n_connected; c++) {
                 TrialityQuhit *q_p = (TrialityQuhit*)&g->locals[connected[c]];
                 triality_ensure_view(q_p, VIEW_EDGE);
                 double p_re = q_p->edge_re[cur_vals[1 + c]];
                 double p_im = q_p->edge_im[cur_vals[1 + c]];
-                double new_re = amp_re * p_re - amp_im * p_im;
-                double new_im = amp_re * p_im + amp_im * p_re;
-                amp_re = new_re;
-                amp_im = new_im;
-            }
-
-            /* Step 4: phase edges only (skip PERMUTE) */
-            for (uint64_t ei = 0; ei < n_conn_edges; ei++) {
-                const HPCEdge *edge = &g->edges[conn_edge_ids[ei]];
-                if (edge->type == HPC_EDGE_PERMUTE) continue;
-
-                uint64_t sa = edge->site_a, sb = edge->site_b;
-                uint32_t va = 0, vb = 0;
-
-                /* Resolve source values for both endpoints */
-                for (int i = 0; i < n_all; i++) {
-                    if (all_sites[i] == sa) va = cur_vals[i];
-                    if (all_sites[i] == sb) vb = cur_vals[i];
-                }
-
-                double wr, wi;
-                if (edge->type == HPC_EDGE_CZ) {
-                    uint32_t m = edge->syntheme_id ? edge->syntheme_id : 1;
-                    uint32_t phase_idx = (m * va * vb) % HPC_D;
-                    wr = HPC_W6_RE[phase_idx];
-                    wi = HPC_W6_IM[phase_idx];
-                } else {
-                    wr = edge->w_re[va][vb];
-                    wi = edge->w_im[va][vb];
-                }
-
-                double new_re = amp_re * wr - amp_im * wi;
-                double new_im = amp_re * wi + amp_im * wr;
+                new_re = amp_re * p_re - amp_im * p_im;
+                new_im = amp_re * p_im + amp_im * p_re;
                 amp_re = new_re;
                 amp_im = new_im;
             }
