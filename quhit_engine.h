@@ -56,7 +56,7 @@
 
 #define MAX_QUHITS          262144      /* Max quhits in engine (256K)      */
 #define MAX_PAIRS           262144      /* Max entangled pairs (256K)       */
-#define MAX_REGISTERS       16384       /* Max quhit registers              */
+#define MAX_REGISTERS       65536       /* Max quhit registers (expanded for large N) */
 #define MAX_CZ_DEFERRED     4096        /* Max deferred CZ per pair         */
 
 #define MAGIC_TAG           0xBEEF      /* Magic pointer tag                */
