@@ -872,6 +872,19 @@ static inline double hpc_marginal(const HPCGraph *g,
         if (g->edges[conn_edge_ids[ei]].type == HPC_EDGE_PERMUTE)
             has_perm_in_subgraph = 1;
 
+    /* When permutation edges are present, the local active mask only reflects
+     * pre-permutation support. Post-permutation, partner site values can map
+     * to any of the HPC_D host indices. Enumerate all 6 values per partner. */
+    if (has_perm_in_subgraph) {
+        n_configs = 1;
+        for (uint64_t c = 0; c < n_connected; c++) {
+            partner_active_count[c] = HPC_D;
+            for (int k = 0; k < HPC_D; k++)
+                partner_active[c][k] = k;
+            n_configs *= HPC_D;
+        }
+    }
+
     double total_prob = 0.0;
 
     if (has_perm_in_subgraph) {
