@@ -20,8 +20,20 @@
 #include <stdint.h>
 #include <time.h>
 
-#define MAX_QUBITS 64
+#define MAX_QUBITS 128
 #define MAX_SYNDROME (1ULL << 21)  /* up to N_Q_HX ≤ 21 → 2^21 = 2M entries (8MB per decoder) */
+
+/* Extended bit-width type for lifted-product codes (S_2 gives ~116 qubits) */
+typedef __uint128_t row_t;
+#define ROW_MAX 128
+static inline int popcnt_row(row_t x) {
+    return __builtin_popcountll((uint64_t)x) + __builtin_popcountll((uint64_t)(x >> 64));
+}
+static inline int ctz_row(row_t x) {
+    if ((uint64_t)x) return __builtin_ctzll((uint64_t)x);
+    return 64 + __builtin_ctzll((uint64_t)(x >> 64));
+}
+static inline row_t row_bit(int q) { return (row_t)1 << q; }
 
 /* ═══════════════════════════════════════════════════════════════════════
  * PRNG
@@ -59,8 +71,8 @@ static void rng_seed(uint64_t seed) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    uint64_t x[MAX_QUBITS];  /* X bits for each generator */
-    uint64_t z[MAX_QUBITS];  /* Z bits for each generator */
+    row_t x[MAX_QUBITS];  /* X bits for each generator */
+    row_t z[MAX_QUBITS];  /* Z bits for each generator */
     uint64_t r[MAX_QUBITS];  /* phases (0 or 1) */
     int n;
 } PauliFrame;
@@ -242,91 +254,113 @@ static int pf_measure_x(PauliFrame *pf, int q, double rand) {
  *   Total generators: 2rn (but there's redundancy: k² relations)
  * ═══════════════════════════════════════════════════════════════════════ */
 
-/* Build hypergraph product code from classical parity check matrix H */
-static int build_hgp(int *hx_rows, int *hx_cols, uint64_t *hx,
-                     int *hz_rows, int *hz_cols, uint64_t *hz,
-                     const uint64_t *H, int r, int n) {
-    int n_q = n * n + r * r;  /* total physical qubits */
-    int rn = r * n;           /* number of X or Z stabilizer rows (each) */
+/* ═══════════════════════════════════════════════════════════════════════
+ * LIFTED PRODUCT CODE (from [7,4,3] classical code over S_m)
+ *
+ * Replaces each 0/1 entry of the classical parity check matrix H (r×n)
+ * with an m×m permutation matrix over the symmetric group S_m.
+ * The result is a larger CSS code with m×(n²+r²) physical qubits.
+ *
+ * Mapping: qubit (sector, position, copy) → linear bit index
+ *   A(i,j,k): i,j∈[0,n-1], k∈[0,m-1]  →  q = ((i*n + j)*m + k)
+ *   B(a,b,k): a,b∈[0,r-1], k∈[0,m-1]  →  q = m*n² + ((a*r + b)*m + k)
+ *
+ * HX = [H̃ ⊗ I_n, I_r ⊗ H̃^T]  (size: m·rn × m·(n²+r²))
+ * HZ = [I_n ⊗ H̃, H̃^T ⊗ I_r]
+ *
+ * where H̃ is the lifted classical matrix: each entry H[p][q] becomes
+ * an m×m permutation matrix P(g) for some g ∈ S_m.
+ * ═══════════════════════════════════════════════════════════════════════ */
 
-    /* Layout:
-     *   Qubits 0 .. n²-1:      A-type (position)
-     *   Qubits n² .. n²+r²-1:  B-type (check)
-     *
-     * HX = [H ⊗ I_n, I_r ⊗ H^T] (size: rn × n_q)
-     * HZ = [I_n ⊗ H, H^T ⊗ I_r] (size: rn × n_q)
-     *
-     * Index mapping for A-type qubits: (i,j) → i*n + j  where i∈[0,n-1], j∈[0,n-1]
-     * Index mapping for B-type qubits: (a,b) → n² + a*r + b  where a∈[0,r-1], b∈[0,r-1]
-     */
+/* Generate permutation mapping for S_m: perm_g[k] = τ_g(k) for g ∈ S_m.
+ * Standard generators for S_2: identity=[0,1], swap=[1,0] */
+static int perm_S2[2][2] = {{0,1}, {1,0}};
 
-    /* Build HX: rows indexed by (row_idx, col_idx) where row_idx ∈ [0,r-1], col_idx ∈ [0,n-1]
-     *   HX[(row_idx, col_idx)][A(i,j)] = H[row_idx][i] * δ(col_idx, j)
-     *   HX[(row_idx, col_idx)][B(a,b)] = δ(row_idx, a) * H[b][col_idx]
-     */
+/* Build lifted-product code from classical H (r×n) over S_m.
+ * lift_perm[i][j] ∈ {0,…,m!-1} specifies which group element at row i, col j.
+ * If lift_perm == NULL, uses identity lifting (all 1→identity).
+ * Returns total physical qubits, or 0 on error. */
+static int build_lp(int *hx_rows, int *hz_rows,
+                    row_t *hx, row_t *hz,
+                    const uint64_t *H, int r, int n,
+                    int m, const int *lift_perm) {
+    /* Validate m — currently only S_1 (m=1 ≡ HGP) and S_2 (m=2) supported */
+    int supported_m = (m == 1 || m == 2);
+    if (!supported_m) return 0;
+
+    int n_q = m * (n * n + r * r);
+    int rn = r * n;
+    int hx_n = m * rn;  /* number of HX rows after lifting */
+    int hz_n = m * rn;  /* same for HZ */
+
+    /* Each row of H has m·n A-qubits + m·r B-qubits in the product structure.
+     * We construct HX and HZ row by row using the lift map. */
+
+    /* Precompute permutation image: for group element g at block (row,col),
+     * the m bits in the block are set at positions determined by the permutation. */
+    int (*perm)[2] = perm_S2;  /* only S_2 for now */
+
+    /* --- Build HX: rows indexed by (ri, cj, copy) ---
+     * HX[(ri,cj,ck)][A(i,j,k)] = H[ri][i] * δ(cj,j) * δ(ck, π(ri,i)(k))
+     * HX[(ri,cj,ck)][B(a,b,k)] = δ(ri,a) * H[b][cj] * δ(ck, π(b,cj)(k))
+     * where π(row,col) is the permutation for entry H[row][col]. */
     int hx_row = 0;
     for (int ri = 0; ri < r; ri++) {
         for (int cj = 0; cj < n; cj++) {
-            uint64_t row_x = 0;
-            /* A part: H[ri][i] * δ(cj, j) → qubit i*n + cj is active when H[ri][i]=1 */
-            for (int i = 0; i < n; i++) {
-                if ((H[ri] >> i) & 1) {
-                    int q = i * n + cj;
-                    row_x |= (1ULL << q);
+            for (int ck = 0; ck < m; ck++) {
+                row_t row_x = 0;
+                /* A-part: qubits at (i, cj, π(ri,i)(k)) for each i with H[ri][i]=1 */
+                for (int i = 0; i < n; i++) {
+                    if (!((H[ri] >> i) & 1)) continue;
+                    int g = lift_perm ? lift_perm[ri * n + i] : 0;
+                    int pk = perm[g][ck];  /* permutation image */
+                    int q = ((i * n + cj) * m + pk);
+                    row_x |= row_bit(q);
                 }
-            }
-            /* B part: δ(ri, a) * H[b][cj] → qubit n² + ri*r + b is active when H[b][cj]=1 */
-            for (int b = 0; b < r; b++) {
-                if ((H[b] >> cj) & 1) {
-                    int q = n * n + ri * r + b;
-                    row_x |= (1ULL << q);
+                /* B-part: qubits at (ri, b, π(b,cj)(k)) for each b with H[b][cj]=1 */
+                for (int b = 0; b < r; b++) {
+                    if (!((H[b] >> cj) & 1)) continue;
+                    int g = lift_perm ? lift_perm[b * n + cj] : 0;
+                    int pk = perm[g][ck];
+                    int q = m * n * n + ((ri * r + b) * m + pk);
+                    row_x |= row_bit(q);
                 }
+                hx[hx_row++] = row_x;
             }
-            hx[hx_row] = row_x;
-            hx_row++;
         }
     }
 
-    /* Build HZ: rows indexed by (row_idx, col_idx) where row_idx ∈ [0,n-1], col_idx ∈ [0,r-1]
-     *   HZ[(row_idx, col_idx)][A(i,j)] = δ(row_idx, i) * H[col_idx][j]
-     *   HZ[(row_idx, col_idx)][B(a,b)] = H[col_idx][a] * δ(row_idx, b)... wait
-     * Actually:
-     *   HZ = [I_n ⊗ H, H^T ⊗ I_r]
-     *   HZ[(i, c)][A(j, k)] = δ(i,j) * H[c][k]  (where c ∈ [0,r-1], i,j,k ∈ [0,n-1])
-     *   HZ[(i, c)][B(a, b)] = H[c][a] * δ(i,b)   (where a,b ∈ [0,r-1], c ∈ [0,r-1], i ∈ [0,n-1])
-     *
-     * Let me re-index more carefully:
-     * HZ rows are (i, c) where i ∈ [0,n-1], c ∈ [0,r-1]
-     *   HZ[(i,c)][A(j,k)] = δ(i,j) * H[c][k]
-     *   HZ[(i,c)][B(a,b)] = H[c][a] * δ(i,b)
-     */
+    /* --- Build HZ: rows indexed by (i, c, copy) ---
+     * HZ[(i,c,ck)][A(j,k,kk)] = δ(i,j) * H[c][k] * δ(ck, π(c,k)(kk))
+     * HZ[(i,c,ck)][B(a,b,kk)] = H[c][a] * δ(i,b) * δ(ck, π(c,a)(kk)) */
     int hz_row = 0;
     for (int i = 0; i < n; i++) {
         for (int c = 0; c < r; c++) {
-            uint64_t row_z = 0;
-            /* A part (I⊗H): qubit j*n + k active when j=i and H[c][k]=1 */
-            for (int k = 0; k < n; k++) {
-                if ((H[c] >> k) & 1) {
-                    int q = i * n + k;
-                    row_z |= (1ULL << q);
+            for (int ck = 0; ck < m; ck++) {
+                row_t row_z = 0;
+                /* A-part: qubits at (i, k, π(c,k)(ck)) for each k with H[c][k]=1 */
+                for (int k = 0; k < n; k++) {
+                    if (!((H[c] >> k) & 1)) continue;
+                    int g = lift_perm ? lift_perm[c * n + k] : 0;
+                    int pk = perm[g][ck];
+                    int q = ((i * n + k) * m + pk);
+                    row_z |= row_bit(q);
                 }
-            }
-            /* B part (H^T⊗I_r): qubit n² + a*r + b active when H[a][i]=1 and b=c */
-            for (int a = 0; a < r; a++) {
-                if ((H[a] >> i) & 1) {
-                    int q = n * n + a * r + c;
-                    row_z |= (1ULL << q);
+                /* B-part: qubits at (a, c, π(c,a)(ck)) for each a with H[a][i]=1 */
+                for (int a = 0; a < r; a++) {
+                    if (!((H[a] >> i) & 1)) continue;
+                    int g = lift_perm ? lift_perm[a * n + i] : 0;
+                    int pk = perm[g][ck];
+                    int q = m * n * n + ((a * r + c) * m + pk);
+                    row_z |= row_bit(q);
                 }
+                hz[hz_row++] = row_z;
             }
-            hz[hz_row] = row_z;
-            hz_row++;
         }
     }
 
-    if (hx_rows) *hx_rows = rn;
-    if (hx_cols) *hx_cols = n_q;
-    if (hz_rows) *hz_rows = rn;
-    if (hz_cols) *hz_cols = n_q;
+    if (hx_rows) *hx_rows = hx_n;
+    if (hz_rows) *hz_rows = hz_n;
     return n_q;
 }
 
@@ -356,32 +390,35 @@ static const uint64_t H_CLASSIC_7_4_3[3] = {0b1010101, 0b1100110, 0b1111000};
 static const int N7 = 7, R7 = 3;
 
 /* Store the built code's matrices */
-static uint64_t HX_Q[MAX_QUBITS];   /* X-stabilizer rows (bitmask of qubits) */
-static uint64_t HZ_Q[MAX_QUBITS];   /* Z-stabilizer rows */
+static row_t HX_Q[MAX_QUBITS];   /* X-stabilizer rows (bitmask of qubits) */
+static row_t HZ_Q[MAX_QUBITS];   /* Z-stabilizer rows */
 static int N_Q_HX = 0;              /* number of X-stabilizer rows */
 static int N_Q_HZ = 0;              /* number of Z-stabilizer rows */
 static int N_Q = 0;                 /* total physical qubits */
 static int K_Q = 0;                 /* logical qubits */
+static int LIFT_M = 1;              /* lifting degree (1 = standard HGP) */
 
-/* Initialize hypergraph product code from classical code H (r rows × n cols) */
-/* classical_d: distance of classical code (used for display) */
-/* quiet: if non-zero, suppress output */
-static void init_code_quiet(const uint64_t *H, int r, int n, int classical_d, int quiet) {
-    N_Q = build_hgp(NULL, NULL, HX_Q, NULL, NULL, HZ_Q, H, r, n);
-    N_Q_HX = r * n;
-    N_Q_HZ = r * n;
+/* Initialize lifted-product code from classical code H (r rows × n cols)
+ * over S_m. m=1 gives standard HGP. lift_pat is an r×n array of group
+ * element indices (NULL = all identity). */
+static void init_code_quiet(const uint64_t *H, int r, int n, int classical_d,
+                            int quiet, int m, const int *lift_pat) {
+    LIFT_M = m;
+    N_Q = build_lp(NULL, NULL, HX_Q, HZ_Q, H, r, n, m, lift_pat);
+    N_Q_HX = m * r * n;
+    N_Q_HZ = m * r * n;
     
     if (!quiet) {
-        printf("  [[%d,?,?]] Hypergraph Product Code\n", N_Q);
+        printf("  [[%d,?,?]] Lifted Product Code (S_%d)\n", N_Q, m);
         printf("  From classical [%d,%d,%d] code\n", n, n - r, classical_d);
         printf("  HX rows: %d, HZ rows: %d\n", N_Q_HX, N_Q_HZ);
     }
     
     /* Compute rank of HX and HZ */
-    uint64_t hx_copy[MAX_QUBITS];
-    uint64_t hz_copy[MAX_QUBITS];
-    memcpy(hx_copy, HX_Q, sizeof(uint64_t) * N_Q_HX);
-    memcpy(hz_copy, HZ_Q, sizeof(uint64_t) * N_Q_HZ);
+    row_t hx_copy[MAX_QUBITS];
+    row_t hz_copy[MAX_QUBITS];
+    memcpy(hx_copy, HX_Q, sizeof(row_t) * N_Q_HX);
+    memcpy(hz_copy, HZ_Q, sizeof(row_t) * N_Q_HZ);
     
     int rank_hx = 0, rank_hz = 0;
     for (int col = 0; col < N_Q && rank_hx < N_Q_HX; col++) {
@@ -389,7 +426,7 @@ static void init_code_quiet(const uint64_t *H, int r, int n, int classical_d, in
         for (int rk = rank_hx; rk < N_Q_HX; rk++)
             if ((hx_copy[rk] >> col) & 1) { pivot = rk; break; }
         if (pivot < 0) continue;
-        uint64_t t = hx_copy[rank_hx]; hx_copy[rank_hx] = hx_copy[pivot]; hx_copy[pivot] = t;
+        row_t t = hx_copy[rank_hx]; hx_copy[rank_hx] = hx_copy[pivot]; hx_copy[pivot] = t;
         for (int rk = 0; rk < N_Q_HX; rk++)
             if (rk != rank_hx && ((hx_copy[rk] >> col) & 1))
                 hx_copy[rk] ^= hx_copy[rank_hx];
@@ -400,7 +437,7 @@ static void init_code_quiet(const uint64_t *H, int r, int n, int classical_d, in
         for (int rk = rank_hz; rk < N_Q_HZ; rk++)
             if ((hz_copy[rk] >> col) & 1) { pivot = rk; break; }
         if (pivot < 0) continue;
-        uint64_t t = hz_copy[rank_hz]; hz_copy[rank_hz] = hz_copy[pivot]; hz_copy[pivot] = t;
+        row_t t = hz_copy[rank_hz]; hz_copy[rank_hz] = hz_copy[pivot]; hz_copy[pivot] = t;
         for (int rk = 0; rk < N_Q_HZ; rk++)
             if (rk != rank_hz && ((hz_copy[rk] >> col) & 1))
                 hz_copy[rk] ^= hz_copy[rank_hz];
@@ -413,23 +450,23 @@ static void init_code_quiet(const uint64_t *H, int r, int n, int classical_d, in
 }
 
 static void init_code(const uint64_t *H, int r, int n, int classical_d) {
-    init_code_quiet(H, r, n, classical_d, 0);
+    init_code_quiet(H, r, n, classical_d, 0, 1, NULL);
 }
 
 static void init_code_20_4(void) {
-    init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 0);
+    init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 0, 1, NULL);
 }
 
 static void init_code_34_4(void) {
-    init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 0);
+    init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 0, 1, NULL);
 }
 
 static void init_code_45_9(void) {
-    init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 0);
+    init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 0, 1, NULL);
 }
 
 static void init_code_58_16(void) {
-    init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 0);
+    init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 0, 1, NULL);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -491,51 +528,51 @@ static void build_decoder(void) {
  * ═══════════════════════════════════════════════════════════════════════ */
 
 /* Compute X-syndrome (HX) from Z-error mask: syn_x[s] = parity(HX_Q[s] & e_z) */
-static uint64_t css_syn_x(uint64_t e_z) {
+static uint64_t css_syn_x(row_t e_z) {
     uint64_t syn = 0;
     for (int s = 0; s < N_Q_HX; s++)
-        if (__builtin_popcountll(HX_Q[s] & e_z) & 1)
+        if (popcnt_row(HX_Q[s] & e_z) & 1)
             syn |= (1ULL << s);
     return syn;
 }
 
 /* Compute Z-syndrome (HZ) from X-error mask: syn_z[s] = parity(HZ_Q[s] & e_x) */
-static uint64_t css_syn_z(uint64_t e_x) {
+static uint64_t css_syn_z(row_t e_x) {
     uint64_t syn = 0;
     for (int s = 0; s < N_Q_HZ; s++)
-        if (__builtin_popcountll(HZ_Q[s] & e_x) & 1)
+        if (popcnt_row(HZ_Q[s] & e_x) & 1)
             syn |= (1ULL << s);
     return syn;
 }
 
 /* Correct errors using lookup table */
-static void css_correct(uint64_t *e_x, uint64_t *e_z) {
+static void css_correct(row_t *e_x, row_t *e_z) {
     if (!decoder_init) build_decoder();
     uint64_t syn_x = css_syn_x(*e_z);
     uint64_t syn_z = css_syn_z(*e_x);
 
     if (syn_x < (uint64_t)(1 << N_Q_HX)) {
         int q = decoder_x[(int)syn_x];
-        if (q >= 0) *e_z ^= (1ULL << q);
+        if (q >= 0) *e_z ^= row_bit(q);
     }
     if (syn_z < (uint64_t)(1 << N_Q_HZ)) {
         int q = decoder_z[(int)syn_z];
-        if (q >= 0) *e_x ^= (1ULL << q);
+        if (q >= 0) *e_x ^= row_bit(q);
     }
 }
 
 /* Inject depolarizing noise on each qubit with probability p/3 each for X, Z, Y */
-static void css_depolarize(uint64_t *e_x, uint64_t *e_z, int n_q, double p) {
+static void css_depolarize(row_t *e_x, row_t *e_z, int n_q, double p) {
     for (int i = 0; i < n_q; i++) {
         double r = rng_uniform();
-        if      (r < p)         { *e_x ^= (1ULL << i); }
-        else if (r < 2.0 * p)   { *e_z ^= (1ULL << i); }
-        else if (r < 3.0 * p)   { *e_x ^= (1ULL << i); *e_z ^= (1ULL << i); }
+        if      (r < p)         { *e_x ^= row_bit(i); }
+        else if (r < 2.0 * p)   { *e_z ^= row_bit(i); }
+        else if (r < 3.0 * p)   { *e_x ^= row_bit(i); *e_z ^= row_bit(i); }
     }
 }
 
 /* Test if error is identity (zero mask) */
-static int css_is_id(uint64_t e_x, uint64_t e_z) {
+static int css_is_id(row_t e_x, row_t e_z) {
     return (e_x == 0 && e_z == 0);
 }
 
@@ -567,14 +604,14 @@ static void demo(void) {
     printf("\n  ── Classical CSS Error Tracking ──\n\n");
 
     /* Test single error injection and detection */
-    uint64_t e_x = 0, e_z = 0;
-    e_z |= (1ULL << 0);  /* Z error on qubit 0 */
+    row_t e_x = 0, e_z = 0;
+    e_z ^= row_bit(0);  /* Z error on qubit 0 */
     uint64_t syn_x = css_syn_x(e_z);
     uint64_t syn_z = css_syn_z(e_x);
     printf("  Z error on q0: syn_x(HX)=0x%02lx (expect non-zero), syn_z(HZ)=0x%02lx (expect 0)\n", syn_x, syn_z);
     e_x = e_z = 0;
 
-    e_x |= (1ULL << 0);  /* X error on qubit 0 */
+    e_x ^= row_bit(0);  /* X error on qubit 0 */
     syn_x = css_syn_x(e_z);
     syn_z = css_syn_z(e_x);
     printf("  X error on q0: syn_x(HX)=0x%02lx (expect 0), syn_z(HZ)=0x%02lx (expect non-zero)\n", syn_x, syn_z);
@@ -606,12 +643,12 @@ static void demo(void) {
         /* Enumerate all weight-w X errors */
         if (w == 1) {
             for (int q = 0; q < N_Q && min_d > 1; q++) {
-                e_x = 1ULL << q; e_z = 0;
+                e_x = row_bit(q); e_z = 0;
                 if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0) {
                     min_d = 1;
                     printf("    Weight-1 X logical on q%d\n", q);
                 }
-                e_x = 0; e_z = 1ULL << q;
+                e_x = 0; e_z = row_bit(q);
                 if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0 && min_d > 1) {
                     min_d = 1;
                     printf("    Weight-1 Z logical on q%d\n", q);
@@ -620,12 +657,12 @@ static void demo(void) {
         } else if (w == 2) {
             for (int q1 = 0; q1 < N_Q && min_d > 2; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && min_d > 2; q2++) {
-                    e_x = (1ULL << q1) | (1ULL << q2); e_z = 0;
+                    e_x = row_bit(q1) ^ row_bit(q2); e_z = 0;
                     if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0) {
                         min_d = 2;
                         printf("    Weight-2 X logical on q%d,q%d\n", q1, q2);
                     }
-                    e_x = 0; e_z = (1ULL << q1) | (1ULL << q2);
+                    e_x = 0; e_z = row_bit(q1) ^ row_bit(q2);
                     if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0 && min_d > 2) {
                         min_d = 2;
                         printf("    Weight-2 Z logical on q%d,q%d\n", q1, q2);
@@ -635,13 +672,13 @@ static void demo(void) {
             for (int q1 = 0; q1 < N_Q && min_d > 3; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && min_d > 3; q2++)
                     for (int q3 = q2 + 1; q3 < N_Q && min_d > 3; q3++) {
-                        e_x = (1ULL << q1) | (1ULL << q2) | (1ULL << q3); e_z = 0;
+                        e_x = row_bit(q1) ^ row_bit(q2) ^ row_bit(q3); e_z = 0;
                         if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0) {
                             min_d = 3;
                             printf("    Weight-3 X logical on q%d,q%d,q%d\n", q1, q2, q3);
                         }
                         e_x = 0;
-                        e_z = (1ULL << q1) | (1ULL << q2) | (1ULL << q3);
+                        e_z = row_bit(q1) ^ row_bit(q2) ^ row_bit(q3);
                         if (css_syn_z(e_x) == 0 && css_syn_x(e_z) == 0 && min_d > 3) {
                             min_d = 3;
                             printf("    Weight-3 Z logical on q%d,q%d,q%d\n", q1, q2, q3);
@@ -667,14 +704,15 @@ static void demo(void) {
 #define MAX_LOGICALS 64
 
 /* Gaussian elimination rank computation over GF(2) */
-static int gf2_rank(uint64_t *rows, int n) {
-    int rank = 0, nr = n < 64 ? n : 64;
-    for (int c = 0; c < 64 && rank < nr; c++) {
+static int gf2_rank(row_t *rows, int n) {
+    int rank = 0;
+    int nr = n < ROW_MAX ? n : ROW_MAX;
+    for (int c = 0; c < ROW_MAX && rank < nr; c++) {
         int pivot = -1;
         for (int r = rank; r < nr; r++)
             if ((rows[r] >> c) & 1) { pivot = r; break; }
         if (pivot < 0) continue;
-        uint64_t t = rows[rank]; rows[rank] = rows[pivot]; rows[pivot] = t;
+        row_t t = rows[rank]; rows[rank] = rows[pivot]; rows[pivot] = t;
         for (int r = 0; r < nr; r++)
             if (r != rank && ((rows[r] >> c) & 1))
                 rows[r] ^= rows[rank];
@@ -685,9 +723,9 @@ static int gf2_rank(uint64_t *rows, int n) {
 
 /* Check if vector v is in the row space of matrix M (n_rows × unknown cols).
  * Correct by construction: compares rank(M) vs rank(M ∪ {v}). */
-static int in_row_space(uint64_t v, uint64_t *M, int n_rows) {
-    uint64_t buf1[65], buf2[65];
-    int nr = n_rows < 64 ? n_rows : 64;
+static int in_row_space(row_t v, row_t *M, int n_rows) {
+    row_t buf1[129], buf2[129];
+    int nr = n_rows < 128 ? n_rows : 128;
     for (int i = 0; i < nr; i++) buf1[i] = M[i];
     for (int i = 0; i < nr; i++) buf2[i] = M[i];
     buf2[nr] = v;
@@ -697,16 +735,12 @@ static int in_row_space(uint64_t v, uint64_t *M, int n_rows) {
 }
 
 /* Check if (e_x, 0) is an X-type stabilizer: in row space of HX? */
-static int is_x_stabilizer(uint64_t e_x) {
-    /* Need to check if e_x is in span of HZ (Z-stabilizers, which are Z-type).
-     * Wait: for X-type stabilizers (HX rows), they're products of X operators.
-     * For X-type logicals, we check: commutes with HZ (css_syn_z(e_x)=0)
-     * and NOT in span of HX rows. */
+static int is_x_stabilizer(row_t e_x) {
     return in_row_space(e_x, HX_Q, N_Q_HX);
 }
 
 /* Check if (0, e_z) is a Z-type stabilizer: in row space of HZ? */
-static int is_z_stabilizer(uint64_t e_z) {
+static int is_z_stabilizer(row_t e_z) {
     return in_row_space(e_z, HZ_Q, N_Q_HZ);
 }
 
@@ -714,33 +748,31 @@ static int is_z_stabilizer(uint64_t e_z) {
 static void find_logical_basis(void) {
     printf("\n═══ Logical Operator Discovery [[%d,%d,?]] ═══\n\n", N_Q, K_Q);
 
-    /* Find all weight-2 X-type logicals (since d=2) */
-    uint64_t x_logicals[MAX_LOGICALS];
-    uint64_t z_logicals[MAX_LOGICALS];
+    row_t x_logicals[MAX_LOGICALS];
+    row_t z_logicals[MAX_LOGICALS];
     int n_xl = 0, n_zl = 0;
 
     printf("  X-type logical operators (weight ≤ 3):\n");
     for (int w = 1; w <= 3 && n_xl < MAX_LOGICALS; w++) {
-        /* Enumerate weight-w X-type errors */
         if (w == 1) {
             for (int q = 0; q < N_Q && n_xl < MAX_LOGICALS; q++) {
-                uint64_t e_x = 1ULL << q;
+                row_t e_x = row_bit(q);
                 if (css_syn_z(e_x) == 0 && !is_x_stabilizer(e_x) && e_x != 0) {
                     x_logicals[n_xl++] = e_x;
-                    printf("    w=1 X: q%d (0x%04lx)\n", q, e_x);
+                    printf("    w=1 X: q%d\n", q);
                 }
             }
         } else if (w == 2) {
             for (int q1 = 0; q1 < N_Q && n_xl < MAX_LOGICALS; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && n_xl < MAX_LOGICALS; q2++) {
-                    uint64_t e_x = (1ULL << q1) | (1ULL << q2);
+                    row_t e_x = row_bit(q1) ^ row_bit(q2);
                     if (css_syn_z(e_x) == 0 && !is_x_stabilizer(e_x)) {
                         int dup = 0;
                         for (int i = 0; i < n_xl; i++)
                             if (x_logicals[i] == e_x) { dup = 1; break; }
                         if (!dup) {
                             x_logicals[n_xl++] = e_x;
-                            printf("    w=2 X: q%d,q%d (0x%04lx)\n", q1, q2, e_x);
+                            printf("    w=2 X: q%d,q%d\n", q1, q2);
                         }
                     }
                 }
@@ -748,14 +780,14 @@ static void find_logical_basis(void) {
             for (int q1 = 0; q1 < N_Q && n_xl < MAX_LOGICALS; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && n_xl < MAX_LOGICALS; q2++)
                     for (int q3 = q2 + 1; q3 < N_Q && n_xl < MAX_LOGICALS; q3++) {
-                        uint64_t e_x = (1ULL << q1) | (1ULL << q2) | (1ULL << q3);
+                        row_t e_x = row_bit(q1) ^ row_bit(q2) ^ row_bit(q3);
                         if (css_syn_z(e_x) == 0 && !is_x_stabilizer(e_x)) {
                             int dup = 0;
                             for (int i = 0; i < n_xl; i++)
                                 if (x_logicals[i] == e_x) { dup = 1; break; }
                             if (!dup) {
                                 x_logicals[n_xl++] = e_x;
-                                printf("    w=3 X: q%d,q%d,q%d (0x%04lx)\n", q1, q2, q3, e_x);
+                                printf("    w=3 X: q%d,q%d,q%d\n", q1, q2, q3);
                             }
                         }
                     }
@@ -766,23 +798,23 @@ static void find_logical_basis(void) {
     for (int w = 1; w <= 3 && n_zl < MAX_LOGICALS; w++) {
         if (w == 1) {
             for (int q = 0; q < N_Q && n_zl < MAX_LOGICALS; q++) {
-                uint64_t e_z = 1ULL << q;
+                row_t e_z = row_bit(q);
                 if (css_syn_x(e_z) == 0 && !is_z_stabilizer(e_z) && e_z != 0) {
                     z_logicals[n_zl++] = e_z;
-                    printf("    w=1 Z: q%d (0x%04lx)\n", q, e_z);
+                    printf("    w=1 Z: q%d\n", q);
                 }
             }
         } else if (w == 2) {
             for (int q1 = 0; q1 < N_Q && n_zl < MAX_LOGICALS; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && n_zl < MAX_LOGICALS; q2++) {
-                    uint64_t e_z = (1ULL << q1) | (1ULL << q2);
+                    row_t e_z = row_bit(q1) ^ row_bit(q2);
                     if (css_syn_x(e_z) == 0 && !is_z_stabilizer(e_z)) {
                         int dup = 0;
                         for (int i = 0; i < n_zl; i++)
                             if (z_logicals[i] == e_z) { dup = 1; break; }
                         if (!dup) {
                             z_logicals[n_zl++] = e_z;
-                            printf("    w=2 Z: q%d,q%d (0x%04lx)\n", q1, q2, e_z);
+                            printf("    w=2 Z: q%d,q%d\n", q1, q2);
                         }
                     }
                 }
@@ -790,14 +822,14 @@ static void find_logical_basis(void) {
             for (int q1 = 0; q1 < N_Q && n_zl < MAX_LOGICALS; q1++)
                 for (int q2 = q1 + 1; q2 < N_Q && n_zl < MAX_LOGICALS; q2++)
                     for (int q3 = q2 + 1; q3 < N_Q && n_zl < MAX_LOGICALS; q3++) {
-                        uint64_t e_z = (1ULL << q1) | (1ULL << q2) | (1ULL << q3);
+                        row_t e_z = row_bit(q1) ^ row_bit(q2) ^ row_bit(q3);
                         if (css_syn_x(e_z) == 0 && !is_z_stabilizer(e_z)) {
                             int dup = 0;
                             for (int i = 0; i < n_zl; i++)
                                 if (z_logicals[i] == e_z) { dup = 1; break; }
                             if (!dup) {
                                 z_logicals[n_zl++] = e_z;
-                                printf("    w=3 Z: q%d,q%d,q%d (0x%04lx)\n", q1, q2, q3, e_z);
+                                printf("    w=3 Z: q%d,q%d,q%d\n", q1, q2, q3);
                             }
                         }
                     }
@@ -806,34 +838,32 @@ static void find_logical_basis(void) {
 
     printf("\n  Found %d X-logicals, %d Z-logicals (need %d each)\n", n_xl, n_zl, K_Q);
 
-    /* Find X-basis via GF(2) elimination */
-    uint64_t x_basis[4] = {0};
+    row_t x_basis[4] = {0};
     int n_xb = 0;
     for (int i = 0; i < n_xl && n_xb < K_Q; i++) {
-        uint64_t v = x_logicals[i];
+        row_t v = x_logicals[i];
         if (!in_row_space(v, x_basis, n_xb))
             x_basis[n_xb++] = v;
     }
 
     /* Find Z-basis via GF(2) elimination */
-    uint64_t z_basis_raw[4] = {0};
+    row_t z_basis_raw[4] = {0};
     int n_zb = 0;
     for (int i = 0; i < n_zl && n_zb < K_Q; i++) {
-        uint64_t v = z_logicals[i];
+        row_t v = z_logicals[i];
         if (!in_row_space(v, z_basis_raw, n_zb))
             z_basis_raw[n_zb++] = v;
     }
 
     printf("\n  X-basis (%d vectors):\n", n_xb);
-    for (int i = 0; i < n_xb; i++) printf("    X̄_%d: 0x%04lx\n", i, x_basis[i]);
+    for (int i = 0; i < n_xb; i++) printf("    X_%d: 0x%08x%08x\n", i, (unsigned)((uint64_t)(x_basis[i] >> 32)), (unsigned)((uint64_t)x_basis[i]));
     printf("  Z-basis raw (%d vectors):\n", n_zb);
-    for (int i = 0; i < n_zb; i++) printf("    Z̃_%d: 0x%04lx\n", i, z_basis_raw[i]);
+    for (int i = 0; i < n_zb; i++) printf("    Z~_%d: 0x%08x%08x\n", i, (unsigned)((uint64_t)(z_basis_raw[i] >> 32)), (unsigned)((uint64_t)z_basis_raw[i]));
 
-    /* Compute overlap matrix M_ij = X̄_i · Z̃_j (mod 2) */
     int M[4][4] = {{0}};
     for (int i = 0; i < n_xb; i++)
         for (int j = 0; j < n_zb; j++)
-            M[i][j] = __builtin_popcountll(x_basis[i] & z_basis_raw[j]) & 1;
+            M[i][j] = popcnt_row(x_basis[i] & z_basis_raw[j]) & 1;
 
     printf("\n  Overlap matrix M_ij = X̄_i · Z̃_j:\n    ");
     for (int j = 0; j < n_zb; j++) printf("  Z̃_%d", j);
@@ -871,7 +901,7 @@ static void find_logical_basis(void) {
 
         /* Extract inverse: M^{-1} is in columns K_Q..2*K_Q-1 */
         /* Z̄_i = ∑_j (M^{-1})_{ji} Z̃_j */
-        uint64_t z_basis[4] = {0};
+        row_t z_basis[4] = {0};
         int n_zb_final = 0;
         for (int i = 0; i < K_Q; i++) {
             z_basis[i] = 0;
@@ -883,16 +913,16 @@ static void find_logical_basis(void) {
 
         printf("\n  Canonical Z-basis (%d vectors):\n", n_zb_final);
         for (int i = 0; i < n_zb_final; i++)
-            printf("    Z̄_%d: 0x%04lx\n", i, z_basis[i]);
+            printf("    Z_%d: 0x%08x%08x\n", i, (unsigned)((uint64_t)(z_basis[i] >> 32)), (unsigned)((uint64_t)z_basis[i]));
 
         printf("\n  Commutation relations (should be identity):\n    ");
         printf("    ");
-        for (int j = 0; j < n_zb_final; j++) printf("  Z̄_%d", j);
+        for (int j = 0; j < n_zb_final; j++) printf("  Z_%d", j);
         printf("\n");
         for (int i = 0; i < n_xb; i++) {
-            printf("  X̄_%d ", i);
+            printf("  X_%d ", i);
             for (int j = 0; j < n_zb_final; j++) {
-                int ac = __builtin_popcountll(x_basis[i] & z_basis[j]) & 1;
+                int ac = popcnt_row(x_basis[i] & z_basis[j]) & 1;
                 printf("   %d", ac);
             }
             printf("\n");
@@ -903,7 +933,7 @@ static void find_logical_basis(void) {
 }
 
 /* Forward declarations */
-static int is_logical_operator(uint64_t e_x, uint64_t e_z);
+static int is_logical_operator(row_t e_x, row_t e_z);
 
 /* ═══════════════════════════════════════════════════════════════════════
  * LATTICE SURGERY DEMO
@@ -927,7 +957,7 @@ static void lattice_surgery_demo(void) {
 
     rng_seed(0xCAFE);
     for (int t = 0; t < n_trials; t++) {
-        uint64_t e_x_a = 0, e_z_a = 0, e_x_b = 0, e_z_b = 0;
+        row_t e_x_a = 0, e_z_a = 0, e_x_b = 0, e_z_b = 0;
 
         /* Inject depolarizing noise on both blocks */
         css_depolarize(&e_x_a, &e_z_a, N_Q, 0.01);
@@ -963,8 +993,8 @@ static void lattice_surgery_demo(void) {
         int cx_trials = 200;
 
         for (int t = 0; t < cx_trials; t++) {
-            uint64_t e_x_c = 0, e_z_c = 0;  /* control block errors */
-            uint64_t e_x_t = 0, e_z_t = 0;  /* target block errors */
+            row_t e_x_c = 0, e_z_c = 0;  /* control block errors */
+            row_t e_x_t = 0, e_z_t = 0;  /* target block errors */
 
             /* Inject noise on both blocks before CNOT */
             css_depolarize(&e_x_c, &e_z_c, N_Q, 0.01);
@@ -1074,16 +1104,16 @@ static void magic_analysis(void) {
     printf("  %-12s  %10s  %10s  %8s  %8s\n",
            "────", "─────────", "────────", "──────", "──────");
     
-    int saved_N = N_Q, saved_K = K_Q;
+    int saved_N = N_Q;
     int code_list[] = {20, 34, 45, 58};
     
     for (int ci = 0; ci < 4; ci++) {
         int c = code_list[ci];
         int n, k;
-        if (c == 20) { init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 1); build_decoder(); n = N_Q; k = K_Q; }
-        else if (c == 34) { init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 1); build_decoder(); n = N_Q; k = K_Q; }
-        else if (c == 45) { init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 1); build_decoder(); n = N_Q; k = K_Q; }
-        else { init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 1); build_decoder(); n = N_Q; k = K_Q; }
+        if (c == 20) { init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 1, 1, NULL); build_decoder(); n = N_Q; k = K_Q; }
+        else if (c == 34) { init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 1, 1, NULL); build_decoder(); n = N_Q; k = K_Q; }
+        else if (c == 45) { init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 1, 1, NULL); build_decoder(); n = N_Q; k = K_Q; }
+        else { init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 1, 1, NULL); build_decoder(); n = N_Q; k = K_Q; }
         
         int d = (n >= 34) ? 3 : 2;
         double p = 0.001;
@@ -1105,10 +1135,10 @@ static void magic_analysis(void) {
     
     /* Restore state (quietly) */
     int restore = (saved_N == 20 ? 20 : saved_N == 34 ? 34 : saved_N == 45 ? 45 : 58);
-    if (restore == 20) init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 1);
-    else if (restore == 34) init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 1);
-    else if (restore == 45) init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 1);
-    else if (restore == 58) init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 1);
+    if (restore == 20) init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, 1, 1, NULL);
+    else if (restore == 34) init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, 1, 1, NULL);
+    else if (restore == 45) init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, 1, 1, NULL);
+    else if (restore == 58) init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, 1, 1, NULL);
     build_decoder();
     
     printf("\n  ── Key Insight ──\n");
@@ -1158,7 +1188,7 @@ typedef struct {
 
 /* Build Tanner graph from stabilizer bitmask array */
 static void tanner_init(TannerGraph *g, int n_var, int n_chk,
-                         const uint64_t *stabs, int n_stabs) {
+                         const row_t *stabs, int n_stabs) {
     g->n_var = n_var;
     g->n_chk = n_chk;
     memset(g->chk_deg, 0, sizeof(g->chk_deg));
@@ -1233,7 +1263,7 @@ static inline void flip_vn(TannerGraph *g, int v, uint64_t *syn) {
 /* Brute-force decode a connected component */
 static int decode_component_bf(TannerGraph *g, uint64_t comp_syn,
                                 uint64_t comp_vn_mask, int n_comp_vn,
-                                uint64_t *e_out_comp) {
+                                row_t *e_out_comp) {
     int vn_map[12];
     int nv = 0;
     uint64_t m = comp_vn_mask;
@@ -1254,7 +1284,7 @@ static int decode_component_bf(TannerGraph *g, uint64_t comp_syn,
     if (found) {
         *e_out_comp = 0;
         for (int pi = 0; pi < nv; pi++)
-            if ((best_e >> pi) & 1) *e_out_comp |= (1ULL << vn_map[pi]);
+            if ((best_e >> pi) & 1) *e_out_comp ^= row_bit(vn_map[pi]);
         return 0;
     }
     return 1;
@@ -1262,7 +1292,7 @@ static int decode_component_bf(TannerGraph *g, uint64_t comp_syn,
 
 /* Greedy fallback for large clusters */
 static int decode_component_greedy(TannerGraph *g, uint64_t *syn,
-                                    uint64_t *e_out) {
+                                    row_t *e_out) {
     *e_out = 0;
     for (int iter = 0; iter < 200 && *syn != 0; iter++) {
         int best_v = -1, best_gain = 0;
@@ -1274,18 +1304,18 @@ static int decode_component_greedy(TannerGraph *g, uint64_t *syn,
         }
         if (best_v < 0 || best_gain <= 0) break;
         flip_vn(g, best_v, syn);
-        *e_out ^= (1ULL << best_v);
+        *e_out ^= row_bit(best_v);
     }
     return (*syn == 0) ? 0 : 1;
 }
 
 /* Full Tanner graph decoder: component analysis + optimal/fallback decoding */
-static int tanner_decode(TannerGraph *g, uint64_t syn, uint64_t *e_out) {
+static int tanner_decode(TannerGraph *g, uint64_t syn, row_t *e_out) {
     *e_out = 0;
     if (syn == 0) return 0;
 
     uint64_t visited = 0;
-    uint64_t e_total = 0;
+    row_t e_total = 0;
     int all_ok = 1;
 
     while (visited != syn) {
@@ -1318,7 +1348,7 @@ static int tanner_decode(TannerGraph *g, uint64_t syn, uint64_t *e_out) {
         int nc = __builtin_popcountll(comp_c);
         uint64_t comp_syn = syn & comp_c;
 
-        uint64_t e_comp = 0;
+        row_t e_comp = 0;
         int ok;
         if (nv <= 12 && nc <= 8) {
             ok = decode_component_bf(g, comp_syn, comp_v, nv, &e_comp);
@@ -1335,8 +1365,8 @@ static int tanner_decode(TannerGraph *g, uint64_t syn, uint64_t *e_out) {
 }
 
 /* Full CSS decode using component decoder on HX and HZ independently */
-static int uf_decode(uint64_t e_x_in, uint64_t e_z_in,
-                      uint64_t *e_x_out, uint64_t *e_z_out) {
+static int uf_decode(row_t e_x_in, row_t e_z_in,
+                      row_t *e_x_out, row_t *e_z_out) {
     TannerGraph tg_x, tg_z;
     tanner_init(&tg_x, N_Q, N_Q_HX, HX_Q, N_Q_HX);
     tanner_init(&tg_z, N_Q, N_Q_HZ, HZ_Q, N_Q_HZ);
@@ -1344,7 +1374,7 @@ static int uf_decode(uint64_t e_x_in, uint64_t e_z_in,
     uint64_t syn_z = css_syn_z(e_x_in);
     uint64_t syn_x = css_syn_x(e_z_in);
 
-    uint64_t corr_x = 0, corr_z = 0;
+    row_t corr_x = 0, corr_z = 0;
     int ok_x = tanner_decode(&tg_z, syn_z, &corr_x);
     int ok_z = tanner_decode(&tg_x, syn_x, &corr_z);
 
@@ -1366,9 +1396,9 @@ static uint64_t uf_syndrome_smooth(uint64_t *rounds, int n_rounds, int n_bits) {
 }
 
 /* Syndrome history decoder: multiple rounds with measurement noise */
-static void uf_decode_history(uint64_t e_x_true, uint64_t e_z_true,
+static void uf_decode_history(row_t e_x_true, row_t e_z_true,
                                double p_meas, int n_rounds,
-                               uint64_t *e_x_dec, uint64_t *e_z_dec,
+                               row_t *e_x_dec, row_t *e_z_dec,
                                int *n_fail) {
     uint64_t syn_x_rounds[32], syn_z_rounds[32];
     int nr = n_rounds < 32 ? n_rounds : 32;
@@ -1395,7 +1425,7 @@ static void uf_decode_history(uint64_t e_x_true, uint64_t e_z_true,
     tanner_init(&tg_x, N_Q, N_Q_HX, HX_Q, N_Q_HX);
     tanner_init(&tg_z, N_Q, N_Q_HZ, HZ_Q, N_Q_HZ);
 
-    uint64_t corr_z = 0, corr_x = 0;
+    row_t corr_z = 0, corr_x = 0;
     *n_fail = 0;
     *n_fail += tanner_decode(&tg_x, syn_x_smooth, &corr_z);
     *n_fail += tanner_decode(&tg_z, syn_z_smooth, &corr_x);
@@ -1411,49 +1441,41 @@ static void uf_decode_history(uint64_t e_x_true, uint64_t e_z_true,
  *
  * The decoder simultaneously finds minimul-weight data error and
  * measurement error that explain the observed syndrome. */
-static int ss_decode(uint64_t e_x_in, uint64_t e_z_in,
+static int ss_decode(row_t e_x_in, row_t e_z_in,
                      double p_meas,
-                     uint64_t *e_x_out, uint64_t *e_z_out) {
-    int nv_x = N_Q + N_Q_HX;  /* 58 data + 21 meas vars for X-side */
-    int nv_z = N_Q + N_Q_HZ;  /* 58 data + 21 meas vars for Z-side */
+                     row_t *e_x_out, row_t *e_z_out) {
+    int nv_x = N_Q + N_Q_HX;
+    int nv_z = N_Q + N_Q_HZ;
 
-    /* Build extended check matrices: [HX | I_21] and [HZ | I_21] */
-    uint64_t hx_ext[64], hz_ext[64];
+    row_t hx_ext[64] = {0}, hz_ext[64] = {0};
     for (int i = 0; i < N_Q_HX; i++) {
         hx_ext[i] = HX_Q[i];
-        hx_ext[i] |= (1ULL << (N_Q + i));  /* identity column for meas error */
+        hx_ext[i] ^= row_bit(N_Q + i);
     }
     for (int i = 0; i < N_Q_HZ; i++) {
         hz_ext[i] = HZ_Q[i];
-        hz_ext[i] |= (1ULL << (N_Q + i));
+        hz_ext[i] ^= row_bit(N_Q + i);
     }
 
-    /* Build extended Tanner graphs */
     TannerGraph tg_x, tg_z;
     tanner_init(&tg_x, nv_x, N_Q_HX, hx_ext, N_Q_HX);
     tanner_init(&tg_z, nv_z, N_Q_HZ, hz_ext, N_Q_HZ);
 
-    /* Compute ideal syndromes from true data error */
     uint64_t syn_x = css_syn_x(e_z_in);
     uint64_t syn_z = css_syn_z(e_x_in);
 
-    /* Apply measurement noise: flip each syndrome bit independently */
     for (int s = 0; s < N_Q_HX; s++)
         if (rng_uniform() < p_meas) syn_x ^= (1ULL << s);
     for (int s = 0; s < N_Q_HZ; s++)
         if (rng_uniform() < p_meas) syn_z ^= (1ULL << s);
 
-    /* Decode on extended graphs — finds both data and measurement corrections */
-    uint64_t corr_x_ext = 0, corr_z_ext = 0;
+    row_t corr_x_ext = 0, corr_z_ext = 0;
     int ok_x = tanner_decode(&tg_z, syn_z, &corr_x_ext);
     int ok_z = tanner_decode(&tg_x, syn_x, &corr_z_ext);
 
-    /* Extract only the data-part of corrections (lower N_Q bits) */
-    uint64_t corr_x = corr_x_ext & ((1ULL << N_Q) - 1);
-    uint64_t corr_z = corr_z_ext & ((1ULL << N_Q) - 1);
-
-    *e_x_out = e_x_in ^ corr_x;
-    *e_z_out = e_z_in ^ corr_z;
+    row_t data_mask = (row_bit(N_Q) - 1);
+    *e_x_out = e_x_in ^ (corr_x_ext & data_mask);
+    *e_z_out = e_z_in ^ (corr_z_ext & data_mask);
     return (ok_x == 0 && ok_z == 0) ? 0 : 1;
 }
 
@@ -1483,19 +1505,19 @@ static void decoder_demo(void) {
     for (int w = 1; w <= 2; w++) {
         int uf_ok = 0, lt_ok = 0;
         for (int t = 0; t < n_test; t++) {
-            uint64_t e_x = 0, e_z = 0;
+            row_t e_x = 0, e_z = 0;
             /* Inject w random errors */
             for (int k = 0; k < w; k++) {
                 int q = (int)(rng_uniform() * N_Q);
                 double r = rng_uniform();
-                if      (r < 1.0/3) e_x ^= (1ULL << q);
-                else if (r < 2.0/3) e_z ^= (1ULL << q);
-                else { e_x ^= (1ULL << q); e_z ^= (1ULL << q); }
+                if      (r < 1.0/3) e_x ^= row_bit(q);
+                else if (r < 2.0/3) e_z ^= row_bit(q);
+                else { e_x ^= row_bit(q); e_z ^= row_bit(q); }
             }
-            uint64_t e_x_sav = e_x, e_z_sav = e_z;
+            row_t e_x_sav = e_x, e_z_sav = e_z;
 
             /* UF decode */
-            uint64_t e_x_uf, e_z_uf;
+            row_t e_x_uf, e_z_uf;
             int f = uf_decode(e_x, e_z, &e_x_uf, &e_z_uf);
             if (f == 0 && (e_x_uf == 0 || e_z_uf == 0 ||
                 (!is_logical_operator(e_x_uf, e_z_uf) && 
@@ -1522,10 +1544,10 @@ static void decoder_demo(void) {
         int ok = 0, log_err = 0;
         int trials = 500;
         for (int t = 0; t < trials; t++) {
-            uint64_t e_x = 0, e_z = 0;
+            row_t e_x = 0, e_z = 0;
             css_depolarize(&e_x, &e_z, N_Q, 0.001);
 
-            uint64_t e_x_dec, e_z_dec;
+            row_t e_x_dec, e_z_dec;
             int nf;
             uf_decode_history(e_x, e_z, 0.01, nr, &e_x_dec, &e_z_dec, &nf);
 
@@ -1551,9 +1573,9 @@ static void decoder_demo(void) {
         /* Single-shot */
         int ss_ok = 0, ss_log = 0, ss_fail = 0;
         for (int t = 0; t < trials; t++) {
-            uint64_t e_x = 0, e_z = 0;
+            row_t e_x = 0, e_z = 0;
             css_depolarize(&e_x, &e_z, N_Q, 0.001);
-            uint64_t e_x_dec, e_z_dec;
+            row_t e_x_dec, e_z_dec;
             int nf = ss_decode(e_x, e_z, pm, &e_x_dec, &e_z_dec);
             if (nf) { ss_fail++; continue; }
             if (css_is_id(e_x_dec, e_z_dec)) ss_ok++;
@@ -1570,9 +1592,9 @@ static void decoder_demo(void) {
         for (int nmi = 0; nmi < 3; nmi++) {
             int mr_ok = 0, mr_log = 0, mr_fail = 0;
             for (int t = 0; t < trials; t++) {
-                uint64_t e_x = 0, e_z = 0;
+                row_t e_x = 0, e_z = 0;
                 css_depolarize(&e_x, &e_z, N_Q, 0.001);
-                uint64_t e_x_dec, e_z_dec;
+                row_t e_x_dec, e_z_dec;
                 int nf;
                 uf_decode_history(e_x, e_z, pm, nr_mr[nmi], &e_x_dec, &e_z_dec, &nf);
                 if (nf) { mr_fail++; continue; }
@@ -1589,13 +1611,13 @@ static void decoder_demo(void) {
     /* ── Timing benchmark ── */
     printf("\n  ── Decoder Timing (avg over 10000 decodes) ──\n");
     {
-        uint64_t e_x = 0, e_z = 0;
+        row_t e_x = 0, e_z = 0;
         css_depolarize(&e_x, &e_z, N_Q, 0.001);
-        
+
         clock_t t0 = clock();
         int n_rep = 10000;
         for (int i = 0; i < n_rep; i++) {
-            uint64_t ex, ez;
+            row_t ex, ez;
             uf_decode(e_x, e_z, &ex, &ez);
         }
         clock_t t1 = clock();
@@ -1606,17 +1628,17 @@ static void decoder_demo(void) {
         /* Single-shot timing */
         t0 = clock();
         for (int i = 0; i < n_rep; i++) {
-            uint64_t ex, ez;
+            row_t ex, ez;
             ss_decode(e_x, e_z, 0.01, &ex, &ez);
         }
         t1 = clock();
         us = (double)(t1 - t0) / CLOCKS_PER_SEC * 1e6 / n_rep;
         printf("  Single-Shot: %.1f μs/decode (%.0f cycles at 2 GHz)\n",
                us, us * 2000);
-        
+
         t0 = clock();
         for (int i = 0; i < n_rep; i++) {
-            uint64_t ex = e_x, ez = e_z;
+            row_t ex = e_x, ez = e_z;
             css_correct(&ex, &ez);
         }
         t1 = clock();
@@ -1636,11 +1658,9 @@ static void decoder_demo(void) {
  * A logical operator commutes with all stabilizers (syndrome=0) but
  * is NOT a stabilizer itself. For CSS codes: it's in the intersection
  * of left null spaces of HX^T and HZ^T, minus the stabilizer group. */
-static int is_logical_operator(uint64_t e_x, uint64_t e_z) {
+static int is_logical_operator(row_t e_x, row_t e_z) {
     if (css_syn_z(e_x) != 0 || css_syn_x(e_z) != 0) return 0;
     if (e_x == 0 && e_z == 0) return 0;
-    /* For weights < min_stabilizer_weight (which is 4 for this code),
-     * any non-zero error with zero syndrome is automatically a logical. */
     return 1;
 }
 
@@ -1658,7 +1678,7 @@ static void run_benchmark(int n_repeats, double p_min, double p_max) {
         int logical_errors = 0;
         for (int r = 0; r < n_repeats; r++) {
             rng_seed(0xBEEF + (uint64_t)r * 0x9E3779B97F4A7C15ULL);
-            uint64_t e_x = 0, e_z = 0;
+            row_t e_x = 0, e_z = 0;
             css_depolarize(&e_x, &e_z, N_Q, p);
             css_correct(&e_x, &e_z);
             /* After correction: if residual error is a logical operator → logical error */
@@ -1695,7 +1715,7 @@ static void live_stream(int64_t max_cycles) {
     tanner_init(&tg_x, N_Q, N_Q_HX, HX_Q, N_Q_HX);
     tanner_init(&tg_z, N_Q, N_Q_HZ, HZ_Q, N_Q_HZ);
 
-    uint64_t e_x = 0, e_z = 0;
+    row_t e_x = 0, e_z = 0;
     long long n_phys_x = 0, n_phys_z = 0;
     long long n_logical = 0, n_fail_dec = 0;
     long long lat_min = 99999999, lat_max = 0, lat_sum = 0;
@@ -1757,7 +1777,7 @@ static void live_stream(int64_t max_cycles) {
         uint64_t syn_z_sm = uf_syndrome_smooth(syn_z_rounds, nr, N_Q_HZ);
 
         /* 3. Decode with real-time latency profiling */
-        uint64_t corr_x = 0, corr_z = 0;
+        row_t corr_x = 0, corr_z = 0;
         struct timespec cl0, cl1;
         clock_gettime(CLOCK_MONOTONIC, &cl0);
         int ok_x = tanner_decode(&tg_x, syn_x_sm, &corr_z);
@@ -1879,11 +1899,11 @@ static void live_stream(int64_t max_cycles) {
 
 /* Compute kernel (null space) of matrix M (n_rows × n_cols) over GF(2).
  * Returns kernel vectors in kernel[] (up to max_kern). n_cols must be ≤ 64. */
-static int find_kernel(const uint64_t *M, int n_rows, int n_cols,
-                       uint64_t *kernel, int max_kern) {
-    uint64_t work[64];
-    int pivot_col[64], n_pivots = 0;
-    int nr = n_rows < 64 ? n_rows : 64;
+static int find_kernel(const row_t *M, int n_rows, int n_cols,
+                       row_t *kernel, int max_kern) {
+    row_t work[128];
+    int pivot_col[128], n_pivots = 0;
+    int nr = n_rows < 128 ? n_rows : 128;
     for (int r = 0; r < nr; r++) work[r] = M[r];
 
     for (int c = 0; c < n_cols && n_pivots < nr; c++) {
@@ -1891,7 +1911,7 @@ static int find_kernel(const uint64_t *M, int n_rows, int n_cols,
         for (int r = n_pivots; r < nr; r++)
             if ((work[r] >> c) & 1) { p = r; break; }
         if (p < 0) continue;
-        uint64_t t = work[n_pivots]; work[n_pivots] = work[p]; work[p] = t;
+        row_t t = work[n_pivots]; work[n_pivots] = work[p]; work[p] = t;
         pivot_col[n_pivots] = c;
         for (int r = 0; r < nr; r++)
             if (r != n_pivots && ((work[r] >> c) & 1))
@@ -1905,10 +1925,10 @@ static int find_kernel(const uint64_t *M, int n_rows, int n_cols,
         for (int p = 0; p < n_pivots; p++)
             if (pivot_col[p] == c) { is_pivot = 1; break; }
         if (is_pivot) continue;
-        uint64_t kv = 1ULL << c;
+        row_t kv = row_bit(c);
         for (int p = 0; p < n_pivots; p++)
             if ((work[p] >> c) & 1)
-                kv ^= (1ULL << pivot_col[p]);
+                kv ^= row_bit(pivot_col[p]);
         kernel[nk++] = kv;
     }
     return nk;
@@ -1916,9 +1936,9 @@ static int find_kernel(const uint64_t *M, int n_rows, int n_cols,
 
 /* Compute RREF of M (rows n_rows × n_cols bits), store RREF rows in rref_out,
  * and return pivot column indices in pivots (up to *n_pivots). */
-static void rref_with_pivots(const uint64_t *M, int n_rows, int n_cols,
-                              uint64_t *rref_out, int *pivots, int *n_pivots) {
-    int nr = n_rows < 64 ? n_rows : 64;
+static void rref_with_pivots(const row_t *M, int n_rows, int n_cols,
+                              row_t *rref_out, int *pivots, int *n_pivots) {
+    int nr = n_rows < 128 ? n_rows : 128;
     for (int r = 0; r < nr; r++) rref_out[r] = M[r];
     *n_pivots = 0;
     for (int c = 0; c < n_cols && *n_pivots < nr; c++) {
@@ -1926,7 +1946,7 @@ static void rref_with_pivots(const uint64_t *M, int n_rows, int n_cols,
         for (int r = *n_pivots; r < nr; r++)
             if ((rref_out[r] >> c) & 1) { p = r; break; }
         if (p < 0) continue;
-        uint64_t t = rref_out[*n_pivots]; rref_out[*n_pivots] = rref_out[p]; rref_out[p] = t;
+        row_t t = rref_out[*n_pivots]; rref_out[*n_pivots] = rref_out[p]; rref_out[p] = t;
         pivots[*n_pivots] = c;
         for (int r = 0; r < nr; r++)
             if (r != *n_pivots && ((rref_out[r] >> c) & 1))
@@ -1937,7 +1957,7 @@ static void rref_with_pivots(const uint64_t *M, int n_rows, int n_cols,
 
 /* Reduce vector v modulo the row space of the RREF matrix.
  * After reduction, v has no bits in any pivot column. */
-static void reduce_mod_subspace(uint64_t *v, const uint64_t *rref, const int *pivots, int n_pivots) {
+static void reduce_mod_subspace(row_t *v, const row_t *rref, const int *pivots, int n_pivots) {
     for (int p = 0; p < n_pivots; p++)
         if ((*v >> pivots[p]) & 1)
             *v ^= rref[p];
@@ -1945,29 +1965,26 @@ static void reduce_mod_subspace(uint64_t *v, const uint64_t *rref, const int *pi
 
 /* Build full symplectic logical basis from kernel computation.
  * Finds K_Q properly paired X/Z logical operators. */
-static int find_routing_basis(uint64_t *x_logs, uint64_t *z_logs) {
-    uint64_t ker_x[64], ker_z[64];
-    int nx = find_kernel(HZ_Q, N_Q_HZ, N_Q, ker_x, 64);
-    int nz = find_kernel(HX_Q, N_Q_HX, N_Q, ker_z, 64);
+static int find_routing_basis(row_t *x_logs, row_t *z_logs) {
+    row_t ker_x[128], ker_z[128];
+    int nx = find_kernel(HZ_Q, N_Q_HZ, N_Q, ker_x, 128);
+    int nz = find_kernel(HX_Q, N_Q_HX, N_Q, ker_z, 128);
     if (nx < N_Q - N_Q_HZ || nz < N_Q - N_Q_HX) return -1;
 
-    /* RREF of HX and HZ to get pivot structure */
-    uint64_t hx_rref[64], hz_rref[64];
-    int hx_pivots[64], hz_pivots[64], nhx = 0, nhz = 0;
+    row_t hx_rref[128], hz_rref[128];
+    int hx_pivots[128], hz_pivots[128], nhx = 0, nhz = 0;
     rref_with_pivots(HX_Q, N_Q_HX, N_Q, hx_rref, hx_pivots, &nhx);
     rref_with_pivots(HZ_Q, N_Q_HZ, N_Q, hz_rref, hz_pivots, &nhz);
 
-    /* Build X-logical candidates: ker(HZ) reduced modulo row_space(HX) */
-    uint64_t x_raw[64];
+    row_t x_raw[128];
     int nxt = 0;
     for (int i = 0; i < nx; i++) {
-        uint64_t v = ker_x[i];
+        row_t v = ker_x[i];
         reduce_mod_subspace(&v, hx_rref, hx_pivots, nhx);
         if (v != 0)
             x_raw[nxt++] = v;
     }
-    /* Reduce to K_Q independent */
-    uint64_t x_basis[64];
+    row_t x_basis[64];
     int nxb = 0;
     for (int i = 0; i < nxt && nxb < K_Q; i++)
         if (!in_row_space(x_raw[i], x_basis, nxb))
@@ -1977,16 +1994,15 @@ static int find_routing_basis(uint64_t *x_logs, uint64_t *z_logs) {
         return -1;
     }
 
-    /* Build Z-logical candidates: ker(HX) reduced modulo row_space(HZ) */
-    uint64_t z_raw[64];
+    row_t z_raw[128];
     int nzt = 0;
     for (int i = 0; i < nz; i++) {
-        uint64_t v = ker_z[i];
+        row_t v = ker_z[i];
         reduce_mod_subspace(&v, hz_rref, hz_pivots, nhz);
         if (v != 0)
             z_raw[nzt++] = v;
     }
-    uint64_t z_basis[64];
+    row_t z_basis[64];
     int nzb = 0;
     for (int i = 0; i < nzt && nzb < K_Q; i++)
         if (!in_row_space(z_raw[i], z_basis, nzb))
@@ -1996,50 +2012,47 @@ static int find_routing_basis(uint64_t *x_logs, uint64_t *z_logs) {
         return -1;
     }
 
-    /* Compute overlap matrix */
-    uint64_t ov[16];
+    row_t ov[16];
     for (int r = 0; r < K_Q; r++) {
         ov[r] = 0;
         for (int c = 0; c < K_Q; c++)
-            if (__builtin_popcountll(x_basis[r] & z_basis[c]) & 1)
-                ov[r] |= (1ULL << c);
+            if (popcnt_row(x_basis[r] & z_basis[c]) & 1)
+                ov[r] ^= row_bit(c);
     }
     int ov_rank = gf2_rank(ov, K_Q);
     printf("  Overlap rank: %d / %d\n", ov_rank, K_Q);
     if (ov_rank < K_Q) return -1;
 
-    /* Symplectic Gram-Schmidt to pair X ↔ Z */
     for (int i = 0; i < K_Q; i++) {
         int j = -1;
         for (int k = i; k < K_Q; k++)
-            if (__builtin_popcountll(x_basis[i] & z_basis[k]) & 1) { j = k; break; }
+            if (popcnt_row(x_basis[i] & z_basis[k]) & 1) { j = k; break; }
         if (j < 0) return -1;
-        uint64_t t = z_basis[i]; z_basis[i] = z_basis[j]; z_basis[j] = t;
+        row_t t = z_basis[i]; z_basis[i] = z_basis[j]; z_basis[j] = t;
         for (int k = 0; k < K_Q; k++) {
             if (k == i) continue;
-            if (__builtin_popcountll(x_basis[i] & z_basis[k]) & 1)
+            if (popcnt_row(x_basis[i] & z_basis[k]) & 1)
                 z_basis[k] ^= z_basis[i];
         }
         for (int k = 0; k < K_Q; k++) {
             if (k == i) continue;
-            if (__builtin_popcountll(x_basis[k] & z_basis[i]) & 1)
+            if (popcnt_row(x_basis[k] & z_basis[i]) & 1)
                 x_basis[k] ^= x_basis[i];
         }
     }
 
-    /* Dot-product Gram-Schmidt: iterate until X·X=0 and Z·Z=0 */
     for (int iter = 0; iter < 4; iter++) {
         int dirty = 0;
         for (int j = 1; j < K_Q; j++)
             for (int i = 0; i < j; i++)
-                if (__builtin_popcountll(x_basis[j] & x_basis[i]) & 1) {
+                if (popcnt_row(x_basis[j] & x_basis[i]) & 1) {
                     x_basis[j] ^= x_basis[i];
                     z_basis[i] ^= z_basis[j];
                     dirty = 1;
                 }
         for (int j = 1; j < K_Q; j++)
             for (int i = 0; i < j; i++)
-                if (__builtin_popcountll(z_basis[j] & z_basis[i]) & 1) {
+                if (popcnt_row(z_basis[j] & z_basis[i]) & 1) {
                     z_basis[j] ^= z_basis[i];
                     x_basis[i] ^= x_basis[j];
                     dirty = 1;
@@ -2057,7 +2070,7 @@ static int find_routing_basis(uint64_t *x_logs, uint64_t *z_logs) {
 
 /* Apply logical CNOT(control, target) to the logical operator basis.
  * Heisenberg: XÌ_c â XÌ_c XÌ_t,  ZÌ_t â ZÌ_c ZÌ_t */
-static void apply_cnot_basis(uint64_t *x_logs, uint64_t *z_logs,
+static void apply_cnot_basis(row_t *x_logs, row_t *z_logs,
                               int ctrl, int targ) {
     x_logs[ctrl] ^= x_logs[targ];
     z_logs[targ] ^= z_logs[ctrl];
@@ -2065,11 +2078,11 @@ static void apply_cnot_basis(uint64_t *x_logs, uint64_t *z_logs,
 
 /* Verify Pauli algebra for K_Q logical qubits.
  * Returns number of violations. */
-static int verify_logical_algebra(const uint64_t *x_logs, const uint64_t *z_logs) {
+static int verify_logical_algebra(const row_t *x_logs, const row_t *z_logs) {
     int violations = 0;
     for (int i = 0; i < K_Q; i++) {
         for (int j = 0; j < K_Q; j++) {
-            int xz = __builtin_popcountll(x_logs[i] & z_logs[j]) & 1;
+            int xz = popcnt_row(x_logs[i] & z_logs[j]) & 1;
             if (xz != (i == j ? 1 : 0)) {
                 printf("  ALGEBRA ERROR: X|%d Z|%d = %d (expect %d)\n",
                        i, j, xz, (i == j ? 1 : 0));
@@ -2081,8 +2094,8 @@ static int verify_logical_algebra(const uint64_t *x_logs, const uint64_t *z_logs
 }
 
 /* Check CNOT leaves all non-target logical operators invariant. */
-static int check_cnot_isolation(const uint64_t *x_before, const uint64_t *z_before,
-                                 const uint64_t *x_after, const uint64_t *z_after,
+static int check_cnot_isolation(const row_t *x_before, const row_t *z_before,
+                                 const row_t *x_after, const row_t *z_after,
                                  int ctrl, int targ) {
     int changes = 0;
     for (int i = 0; i < K_Q; i++) {
@@ -2109,7 +2122,7 @@ static void routing_demo(void) {
     /* Phase 1: Logical operator basis */
     printf("Phase 1: Logical Operator Basis\n");
 
-    uint64_t x_logs[64], z_logs[64];
+    row_t x_logs[64], z_logs[64];
     int rv = find_routing_basis(x_logs, z_logs);
     if (rv) { printf("  FAILED to find logical basis.\n"); return; }
 
@@ -2125,13 +2138,13 @@ static void routing_demo(void) {
     printf("  %4s  %4s  %4s  %s\n", "LQ", "|XÌ|", "|ZÌ|", "XÌ support (first qubits)");
     printf("  %4s  %4s  %4s  %s\n", "---", "---", "---", "----------------------");
     for (int i = 0; i < K_Q && i < 16; i++) {
-        uint64_t m = x_logs[i];
+        row_t m = x_logs[i];
         printf("  %4d  %4d  %4d  ", i,
-               __builtin_popcountll(x_logs[i]),
-               __builtin_popcountll(z_logs[i]));
+               popcnt_row(x_logs[i]),
+               popcnt_row(z_logs[i]));
         int cnt = 0;
         while (m && cnt < 6) {
-            printf("q%d ", __builtin_ctzll(m));
+            printf("q%d ", ctz_row(m));
             m &= m - 1;
             cnt++;
         }
@@ -2140,11 +2153,8 @@ static void routing_demo(void) {
     }
 
     /* Phase 2: CNOT */
-    int ctrl = 2, targ = 14;
-    if (ctrl >= K_Q || targ >= K_Q || ctrl == targ) {
-        printf("\n  Invalid control/target (need 0-%d, distinct).\n", K_Q - 1);
-        return;
-    }
+    int ctrl = 0, targ = K_Q - 1;
+    if (targ == ctrl) targ = 1;
 
     printf("\nPhase 2: CNOT(LQ%d â LQ%d)\n", ctrl, targ);
     printf("  Heisenberg update:\n");
@@ -2152,7 +2162,7 @@ static void routing_demo(void) {
     printf("    ZÌ_%d â ZÌ_%d Â· ZÌ_%d\n", targ, ctrl, targ);
     printf("    All other 28 operators invariant.\n\n");
 
-    uint64_t x_save[64], z_save[64];
+    row_t x_save[64], z_save[64];
     for (int i = 0; i < K_Q; i++) { x_save[i] = x_logs[i]; z_save[i] = z_logs[i]; }
 
     apply_cnot_basis(x_logs, z_logs, ctrl, targ);
@@ -2161,15 +2171,17 @@ static void routing_demo(void) {
     printf("  Post-CNOT algebra: %s\n", v1 ? "FAIL (see above)" : "PASS");
 
     printf("\n  Target pair transformation:\n");
-    printf("    XÌ_%d:  %s  (0x%04lx â 0x%04lx)\n", ctrl,
+    printf("    X_%d:  %s  (0x%08x%08x -> 0x%08x%08x)\n", ctrl,
            x_logs[ctrl] == (x_save[ctrl] ^ x_save[targ]) ? "OK" : "FAIL",
-           x_save[ctrl], x_logs[ctrl]);
-    printf("    ZÌ_%d:  %s  (0x%04lx â 0x%04lx)\n", targ,
+           (unsigned)((uint64_t)(x_save[ctrl] >> 32)), (unsigned)((uint64_t)x_save[ctrl]),
+           (unsigned)((uint64_t)(x_logs[ctrl] >> 32)), (unsigned)((uint64_t)x_logs[ctrl]));
+    printf("    Z_%d:  %s  (0x%08x%08x -> 0x%08x%08x)\n", targ,
            z_logs[targ] == (z_save[ctrl] ^ z_save[targ]) ? "OK" : "FAIL",
-           z_save[targ], z_logs[targ]);
-    printf("    XÌ_%d unchanged: %s\n", targ,
+           (unsigned)((uint64_t)(z_save[targ] >> 32)), (unsigned)((uint64_t)z_save[targ]),
+           (unsigned)((uint64_t)(z_logs[targ] >> 32)), (unsigned)((uint64_t)z_logs[targ]));
+    printf("    X_%d unchanged: %s\n", targ,
            x_logs[targ] == x_save[targ] ? "OK" : "CHANGED");
-    printf("    ZÌ_%d unchanged: %s\n", ctrl,
+    printf("    Z_%d unchanged: %s\n", ctrl,
            z_logs[ctrl] == z_save[ctrl] ? "OK" : "CHANGED");
 
     int n_changed = check_cnot_isolation(x_save, z_save, x_logs, z_logs, ctrl, targ);
@@ -2250,13 +2262,13 @@ int main(int argc, char **argv) {
     int is_live = (argc > 1 && strcmp(argv[1], "--live") == 0);
 
     if (code_sel == 34)
-        init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, is_live);
+        init_code_quiet(H_CLASSIC_5_2_3, R5, N5, 3, is_live, 1, NULL);
     else if (code_sel == 45)
-        init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, is_live);
+        init_code_quiet(H_CLASSIC_6_3_3, R6, N6, 3, is_live, 1, NULL);
     else if (code_sel == 58)
-        init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, is_live);
+        init_code_quiet(H_CLASSIC_7_4_3, R7, N7, 3, is_live, 1, NULL);
     else
-        init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, is_live);
+        init_code_quiet(H_CLASSIC_4_2_2, R4, N4, 2, is_live, 1, NULL);
     
     if (argc > 1 && strcmp(argv[1], "--bench") == 0) {
         if (argc > 2) n_repeats = atoi(argv[2]);
