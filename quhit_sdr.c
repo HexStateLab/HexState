@@ -434,37 +434,58 @@ static int _v4l2_sdr_read(SdrState *sdr, int n_samples)
 {
     if (sdr->dev_fd < 0 || !sdr->v4l2_bufs) return 0;
 
-    /* Dequeue a filled buffer */
-    struct v4l2_buffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
+    int total_copied = 0;
+    int remaining = n_samples;
 
-    /* Non-blocking: poll for a buffer with short timeout.
-     * RTL-SDR USB transfers complete in ~1ms at 2.4 MSPS.
-     * 100ms is generous for the first buffer after stream start. */
-    struct pollfd pfd = { .fd = sdr->dev_fd, .events = POLLIN };
-    int pret = poll(&pfd, 1, 100); /* 100ms timeout */
-    if (pret <= 0) {
-        return 0;
+    while (remaining > 0) {
+        /* Serve from currently-open buffer if we have unconsumed data */
+        if (sdr->v4l2_cur_buf >= 0 &&
+            sdr->v4l2_cur_off < sdr->v4l2_buf_len[(uint32_t)sdr->v4l2_cur_buf]) {
+
+            uint32_t avail = sdr->v4l2_buf_len[(uint32_t)sdr->v4l2_cur_buf]
+                           - sdr->v4l2_cur_off;
+            int copy = (int)avail;
+            if (copy > remaining) copy = remaining;
+
+            memcpy(sdr->iq_buffer + total_copied,
+                   sdr->v4l2_bufs[(uint32_t)sdr->v4l2_cur_buf] + sdr->v4l2_cur_off,
+                   copy);
+            sdr->v4l2_cur_off += copy;
+            total_copied += copy;
+            remaining -= copy;
+            if (remaining == 0) break;
+
+            /* Buffer exhausted — requeue it */
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index  = (uint32_t)sdr->v4l2_cur_buf;
+            ioctl(sdr->dev_fd, VIDIOC_QBUF, &buf);
+            sdr->v4l2_cur_buf = -1;
+        }
+
+        /* Need a fresh buffer — poll with short timeout */
+        struct pollfd pfd = { .fd = sdr->dev_fd, .events = POLLIN };
+        int pret = poll(&pfd, 1, 100);
+        if (pret <= 0) break;
+
+        struct v4l2_buffer dbuf;
+        memset(&dbuf, 0, sizeof(dbuf));
+        dbuf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+        dbuf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(sdr->dev_fd, VIDIOC_DQBUF, &dbuf) < 0) {
+            if (errno == EAGAIN) break;
+            break;
+        }
+
+        sdr->v4l2_cur_buf = (int)dbuf.index;
+        sdr->v4l2_cur_off = 0;
+        if (dbuf.bytesused > 0 && dbuf.bytesused < sdr->v4l2_buf_len[dbuf.index])
+            sdr->v4l2_buf_len[dbuf.index] = dbuf.bytesused;
     }
 
-    if (ioctl(sdr->dev_fd, VIDIOC_DQBUF, &buf) < 0) {
-        if (errno == EAGAIN) return 0;
-        return 0;
-    }
-
-    /* Copy I/Q samples from the dequeued buffer */
-    int bytes = (int)buf.bytesused;
-    if (bytes > n_samples) bytes = n_samples;
-    if (bytes > sdr->v4l2_buf_len[buf.index])
-        bytes = sdr->v4l2_buf_len[buf.index];
-    memcpy(sdr->iq_buffer, sdr->v4l2_bufs[buf.index], bytes);
-
-    /* Requeue the buffer */
-    ioctl(sdr->dev_fd, VIDIOC_QBUF, &buf);
-
-    return bytes;
+    return total_copied;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════

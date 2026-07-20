@@ -94,6 +94,8 @@ typedef struct {
     uint8_t    **v4l2_bufs;        /* Mmap'd buffer pointers                   */
     uint32_t     v4l2_buf_count;   /* Number of queued buffers                 */
     uint32_t     v4l2_buf_len[8];  /* Per-buffer length                        */
+    int          v4l2_cur_buf;     /* Currently dequeued buffer index (-1=none)*/
+    uint32_t     v4l2_cur_off;     /* Read offset within current buffer        */
 
     /* I/Q sample buffers */
     uint8_t     *iq_buffer;       /* Raw 8-bit unsigned I/Q interleaved      */
