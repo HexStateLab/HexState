@@ -167,7 +167,7 @@ void quhit_sdr_disable(QuhitEngine *eng)
     fprintf(stderr, "[SDR] Engine SDR mode disabled — using deterministic PRNG\n");
 }
 
-uint32_t quhit_sdr_init(QuhitEngine *eng)
+uint32_t quhit_init_sdr(QuhitEngine *eng)
 {
     if (!eng->sdr_mode || !eng->sdr_state) {
         fprintf(stderr, "[SDR] ERROR: SDR mode not enabled. "

@@ -186,7 +186,7 @@ void     quhit_reset(QuhitEngine *eng, uint32_t id);     /* Reset to |0⟩      
  * Requires quhit_sdr.h for SdrState configuration. */
 int      quhit_sdr_enable(QuhitEngine *eng, void *sdr_state);
 void     quhit_sdr_disable(QuhitEngine *eng);
-uint32_t quhit_sdr_init(QuhitEngine *eng);        /* Init quhit from SDR EM spectrum */
+uint32_t quhit_init_sdr(QuhitEngine *eng);        /* Init quhit from SDR EM spectrum */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * API — quhit_gates.c

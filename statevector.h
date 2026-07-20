@@ -24,6 +24,15 @@
 #include <string.h>
 #include "born_rule.h"
 
+/* aligned_alloc is C11 — use posix_memalign for wider portability */
+#if !defined(_ISOC11_SOURCE) && !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
+#undef aligned_alloc
+#define aligned_alloc(a, s) ({ \
+    void *_p; \
+    posix_memalign(&_p, (a), (s)) == 0 ? _p : NULL; \
+})
+#endif
+
 /* ═══════════════════════════════════════════════════════════
  * SUBSTRATE CONSTANTS — extracted from this specific hardware
  * ═══════════════════════════════════════════════════════════ */

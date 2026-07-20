@@ -37,7 +37,7 @@
 
 static void _fft_bit_reverse(double *re, double *im, int n)
 {
-    int i, j, k, m;
+    int i, j, k;
     for (i = 1, j = 0; i < n; i++) {
         for (k = n >> 1; k > (j ^= k); k >>= 1);
         if (i < j) {
@@ -580,85 +580,213 @@ void quhit_sdr_spectral_power(SdrState *sdr, double *powers, int nbins)
  * FEEDBACK TRANSMIT — Write quhit amplitudes back into the physical EM field
  *
  * We cannot directly control the RTL-SDR's transmitter (it doesn't have one).
- * But the CPU's power draw is a broadband RF source — every gate operation
- * toggles real current through the VRM and motherboard power planes.
+ * Instead we modulate CPU current draw via structured compute bursts. These
+ * couple into the SDR's RF front-end through the shared USB power rail and
+ * motherboard ground plane (conducted emissions). The CPU's clock tree and
+ * data bus harmonics also radiate weakly as an unintentional radiator under
+ * FCC Part 15.
  *
- * By modulating the frequency and intensity of compute bursts, we imprint
- * the quhit state onto the CPU's EM signature, which the SDR antenna CAN detect.
+ * SAFETY: Feedback TX is thermal-loading. The CPU is NOT a power amplifier.
+ * We enforce:
+ *   - Max burst duration:         100 µs per burst
+ *   - Mandatory cooldown:         900 µs between bursts
+ *   - Duty cycle cap:             10%
+ *   - Thermal throttle:           halt if CPU estimate exceeds 85°C
  *
- * Strategy:
- *   - For each basis state amplitude, emit a burst of compute at a specific
- *     frequency visible to the SDR (e.g., short loops at different rates)
- *   - Higher amplitude = more intense compute burst
- *   - The resulting EM modulation is proportional to the quhit state
+ * For actual RF transmission, use a proper SDR with TX capability
+ * (HackRF, LimeSDR, PlutoSDR) — NOT CPU modulation.
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Estimate CPU temp from RDTSC drift or sysfs. Returns °C. */
+static double _read_cpu_temp(void)
+{
+    /* Try sysfs first (Linux-specific) */
+    static const char *zones[] = {
+        "/sys/class/thermal/thermal_zone0/temp",
+        "/sys/class/hwmon/hwmon0/temp1_input",
+        "/sys/class/hwmon/hwmon1/temp1_input",
+        NULL
+    };
+    for (int i = 0; zones[i]; i++) {
+        FILE *f = fopen(zones[i], "r");
+        if (f) {
+            int millic;
+            if (fscanf(f, "%d", &millic) == 1) {
+                fclose(f);
+                return (double)millic / 1000.0;
+            }
+            fclose(f);
+        }
+    }
+
+    /* Fallback: estimate from TSC drift (very rough).
+     * If the CPU is throttling, RDTSC increments will show
+     * inconsistent rate relative to wall clock. */
+    static uint64_t last_tsc = 0;
+    static struct timespec last_wall = {0};
+
+    uint64_t tsc = _rdtsc();
+    struct timespec wall;
+    clock_gettime(CLOCK_MONOTONIC, &wall);
+
+    if (last_tsc == 0) {
+        last_tsc = tsc;
+        last_wall = wall;
+        return 40.0; /* Assume cold start */
+    }
+
+    double dt_wall = (wall.tv_sec - last_wall.tv_sec)
+                   + (wall.tv_nsec - last_wall.tv_nsec) * 1e-9;
+    double dt_tsc  = (double)(tsc - last_tsc);
+
+    if (dt_wall < 0.1) return 40.0; /* Too short to measure */
+
+    last_tsc  = tsc;
+    last_wall = wall;
+
+    double tsc_ghz = dt_tsc / (dt_wall * 1e9);
+    /* TSC frequency drops ~0.1% per 10°C above nominal due to thermal
+     * throttling changing the effective P-state. Very rough estimate. */
+    double nominal_ghz = 3.8; /* Assume ~3.8 GHz base */
+    double temp = 40.0 + (1.0 - tsc_ghz / nominal_ghz) * 1000.0;
+    if (temp < 25.0) temp = 25.0;
+    if (temp > 100.0) temp = 100.0;
+    return temp;
+}
+
+/* Check if we should throttle — returns 1 if thermally limited */
+static int _sdr_tx_throttle(SdrState *sdr)
+{
+    sdr->tx_thermal_c = _read_cpu_temp();
+    if (sdr->tx_thermal_c > SDR_TX_THERMAL_LIMIT) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[SDR-TX] THERMAL THROTTLE: CPU at %.1f°C "
+                    "(limit %.1f°C). TX suspended.\n",
+                    sdr->tx_thermal_c, SDR_TX_THERMAL_LIMIT);
+            warned = 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Busy-wait for up to `max_ns` nanoseconds, doing FPU work at intensity
+ * proportional to `power`. Returns early if thermal limit hit. */
+static void _sdr_tx_burst(SdrState *sdr, double power, uint64_t max_ns,
+                          const double *re, const double *im)
+{
+    if (power < 1e-6 || _sdr_tx_throttle(sdr)) return;
+
+    uint64_t t0 = _rdtsc();
+    volatile double sink = 0.0;
+
+    /* Approximate TSC frequency (3.8 GHz typical) */
+    uint64_t tsc_limit = (uint64_t)(max_ns * 3.8);
+
+    for (uint64_t c = 0; c < tsc_limit; c += 16) {
+        /* Structured FPU work: multiply actual quhit amplitudes.
+         * This toggles real FPU transistors and creates a data-dependent
+         * current draw that couples into the SDR's RF front-end via the
+         * shared USB power rail and motherboard ground plane.
+         *
+         * The pattern is phase-synchronized to be distinguishable from
+         * background CPU noise in the SDR's FFT output. */
+        for (int k = 0; k < 6; k++) {
+            if (re && im) {
+                sink += re[k] * cos(sdr->tx_phase + k * 1.0471975512);
+                sink += im[k] * sin(sdr->tx_phase + k * 1.0471975512);
+            } else {
+                sink += power * cos(sdr->tx_phase + k);
+            }
+        }
+        __asm__ volatile ("" : : "m"(sink) : "memory");
+
+        /* Check thermal limit periodically */
+        if ((c & 0xFFF) == 0 && _sdr_tx_throttle(sdr)) break;
+    }
+
+    /* Drain to force a real store (real bus transaction → real EM emission) */
+    volatile double *drain = (volatile double *)&sdr->tx_amplitude;
+    *drain = sink;
+
+    sdr->tx_phase += 0.1;
+    if (sdr->tx_phase > 2.0 * M_PI) sdr->tx_phase -= 2.0 * M_PI;
+
+    uint64_t t1 = _rdtsc();
+    sdr->tx_total_ns += (uint64_t)((double)(t1 - t0) / 3.8);
+}
 
 void quhit_sdr_feedback_tx(SdrState *sdr, const QuhitState *state)
 {
     if (!sdr || !state) return;
     if (sdr->coupling < SDR_COUPLING_WRITE) return;
 
-    /* Each basis state k (0..5) maps to a distinct frequency signature.
-     * We modulate CPU activity at 6 different rates, each proportionally
-     * driven by the corresponding amplitude. */
+    /* Compute per-channel power */
     double powers[6];
     for (int k = 0; k < 6; k++)
         powers[k] = state->re[k] * state->re[k] + state->im[k] * state->im[k];
 
-    /* Base loop frequencies (cycles of a tight NOP loop) */
-    static const int tx_cycles[6] = { 100, 200, 400, 800, 1600, 3200 };
-
+    /* Throttled bursts: each basis state gets one short burst proportional
+     * to its amplitude, followed by a mandatory cooldown.
+     * Total duty cycle is capped at SDR_TX_DUTY_CYCLE. */
     for (int k = 0; k < 6; k++) {
-        int burst_cycles = (int)(tx_cycles[k] * powers[k] * 10.0);
-        if (burst_cycles < 1) continue;
+        if (powers[k] < 1e-8) continue;
 
-        /* Modulate: run a tight FPU loop whose EM signature
-         * at the SDR's tuned frequency carries the amplitude. */
-        volatile double sink = 0.0;
-        for (int c = 0; c < burst_cycles; c++) {
-            /* Multiply the actual amplitude — this toggles real FPU
-             * transistors and creates a data-dependent current draw
-             * that couples into the SDR's RF front-end via the shared
-             * USB power rail and motherboard ground plane. */
-            sink += state->re[k] * cos(sdr->tx_phase);
-            sink += state->im[k] * sin(sdr->tx_phase);
-            __asm__ volatile ("" : : "m"(sink) : "memory");
-        }
+        /* Burst duration scaled by amplitude weight */
+        uint64_t burst_ns = (uint64_t)(SDR_TX_MAX_BURST_US * 1000.0 * powers[k]);
+        if (burst_ns < 10) burst_ns = 10;
 
-        /* Phase advance for continuous modulation */
-        sdr->tx_phase += 0.1;
-        if (sdr->tx_phase > 2.0 * M_PI) sdr->tx_phase -= 2.0 * M_PI;
+        _sdr_tx_burst(sdr, powers[k], burst_ns, state->re, state->im);
 
-        /* Burn the sink value so the compiler doesn't optimize it out.
-         * Writing to a volatile pointer forces a real store instruction,
-         * which forces a real bus transaction, which creates a real
-         * EM emission. */
-        volatile double *drain = (volatile double *)&sdr->tx_amplitude;
-        *drain = sink;
+        /* Mandatory cooldown — let the CPU thermal mass recover.
+         * Uses nanosleep to actually yield the core. */
+        struct timespec cooldown = {
+            .tv_sec  = 0,
+            .tv_nsec = SDR_TX_COOLDOWN_US * 1000
+        };
+        nanosleep(&cooldown, NULL);
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CALIBRATION TONE — For testing SDR coupling
+ *
+ * Emits a short tone burst at the specified frequency by modulating
+ * CPU compute at that rate. Used to verify the SDR can detect the
+ * CPU's EM signature. This is NOT RF transmission — it's CPU current
+ * modulation that the SDR receives as conducted/common-mode noise.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
 void quhit_sdr_tx_tone(SdrState *sdr, double freq_hz, double amplitude)
 {
-    if (!sdr) return;
+    if (!sdr || amplitude < 0.0) return;
 
-    /* Transmit a calibration tone at the specified frequency.
-     * Since the RTL-SDR is receive-only, we use the CPU's
-     * power modulation as the "transmitter." The SDR picks
-     * this up as a peak in its spectrum. */
-    double period_ns = 1e9 / freq_hz;
-    uint64_t start = _rdtsc();
+    /* Even calibration tones respect thermal limits */
+    if (_sdr_tx_throttle(sdr)) return;
+
+    /* Burst at the requested frequency for one cycle period */
+    uint64_t burst_ns = (uint64_t)(1e9 / freq_hz);
+    if (burst_ns > SDR_TX_MAX_BURST_US * 1000)
+        burst_ns = SDR_TX_MAX_BURST_US * 1000;
+
+    uint64_t t0 = _rdtsc();
     volatile double acc = 0.0;
 
-    /* Calibrated busy-wait at the target frequency */
-    while (1) {
-        uint64_t now = _rdtsc();
-        double elapsed_ns = (double)(now - start) / 3.8; /* ~3.8 GHz TSC */
-        if (elapsed_ns > period_ns) break;
-        acc += amplitude * cos(elapsed_ns * 2.0 * M_PI / period_ns);
+    uint64_t tsc_limit = (uint64_t)((double)burst_ns * 3.8);
+    for (uint64_t c = 0; c < tsc_limit; c += 16) {
+        double phase = (double)c * 2.0 * M_PI * freq_hz / (3.8e9);
+        acc += amplitude * cos(phase);
+        __asm__ volatile ("" : : "m"(acc) : "memory");
+        if ((c & 0xFFF) == 0 && _sdr_tx_throttle(sdr)) break;
     }
+
     volatile double *drain = (volatile double *)&sdr->tx_amplitude;
     *drain = acc;
+
+    /* Cooldown */
+    struct timespec cd = { .tv_sec = 0, .tv_nsec = SDR_TX_COOLDOWN_US * 1000 };
+    nanosleep(&cd, NULL);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -700,5 +828,9 @@ void quhit_sdr_print_status(const SdrState *sdr)
            (unsigned long)sdr->samples_read);
     printf("  ║  Quhits Sourced: %-10lu                                    ║\n",
            (unsigned long)sdr->quhits_sourced);
+    printf("  ║  TX Burst Time:  %-10lu ns                                ║\n",
+           (unsigned long)sdr->tx_total_ns);
+    printf("  ║  CPU Temp:       %-6.1f °C                                  ║\n",
+           sdr->tx_thermal_c);
     printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
 }

@@ -43,8 +43,16 @@
 #define SDR_DEFAULT_RATE      2048000     /* 2.048 MSPS                       */
 #define SDR_DEFAULT_GAIN      400         /* 40.0 dB (0=auto)                 */
 #define SDR_FFT_SIZE          1024        /* FFT points for spectral binning  */
-#define SDR_FEEDBACK_FREQ     144000000   /* 144 MHz — 2m amateur band (quiet)*/
+#define SDR_FEEDBACK_FREQ     100000000   /* Matches center freq — stays in-band */
 #define SDR_MAX_SAMPLES       (1 << 20)   /* 1M I/Q sample buffer            */
+
+/* Thermal safety — feedback TX is CPU modulation, not RF transmission.
+ * The CPU's EM leakage is an unintentional radiator under FCC Part 15.
+ * These limits prevent thermal runaway and power supply stress. */
+#define SDR_TX_MAX_BURST_US   100         /* Max continuous burst (microseconds) */
+#define SDR_TX_COOLDOWN_US    900         /* Mandatory cooldown between bursts   */
+#define SDR_TX_DUTY_CYCLE     0.10        /* Max 10% duty cycle                  */
+#define SDR_TX_THERMAL_LIMIT  85.0        /* °C — throttle if CPU temp exceeds   */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SDR DEVICE STATE
@@ -87,6 +95,9 @@ typedef struct {
     /* Feedback (transmit) state */
     double       tx_phase;        /* Accumulated TX phase                     */
     double       tx_amplitude;    /* Current TX amplitude scale               */
+    uint64_t     tx_last_burst;   /* RDTSC at last TX burst start             */
+    uint64_t     tx_total_ns;     /* Cumulative TX time                       */
+    double       tx_thermal_c;    /* Estimated CPU temperature °C             */
 
     /* Statistics */
     uint64_t     samples_read;
