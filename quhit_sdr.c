@@ -462,7 +462,6 @@ static int _v4l2_sdr_read(SdrState *sdr, int n_samples)
 
     /* Requeue the buffer */
     ioctl(sdr->dev_fd, VIDIOC_QBUF, &buf);
-    sdr->samples_read += bytes;
 
     return bytes;
 }
@@ -673,16 +672,17 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
     }
 
 convert:
-    /* Convert 8-bit unsigned I/Q (interleaved) to complex doubles.
-     * RTL-SDR CU8 format: [I0, Q0, I1, Q1, ...]
-     * Each byte is centered at 127.5 (the ADC DC offset).
-     * Scale to [-1, +1] range. */
-    for (int i = 0; i < n_read; i++) {
-        sdr->iq_complex[2 * i]     = ((double)sdr->iq_buffer[i] - 127.5) / 128.0;
-        sdr->iq_complex[2 * i + 1] = 0.0;
+    /* Convert CU8 interleaved I/Q to complex doubles.
+     * RTL-SDR format: [I0, Q0, I1, Q1, ...] — 8-bit unsigned each.
+     * Center at 127.5 (ADC DC offset), scale to [-1, +1].
+     * n_read is the total byte count; each I/Q pair is 2 bytes. */
+    int n_pairs = n_read / 2;
+    for (int i = 0; i < n_pairs && i < SDR_MAX_SAMPLES; i++) {
+        sdr->iq_complex[2 * i]     = ((double)sdr->iq_buffer[2 * i]     - 127.5) / 128.0;
+        sdr->iq_complex[2 * i + 1] = ((double)sdr->iq_buffer[2 * i + 1] - 127.5) / 128.0;
     }
-    sdr->iq_len = n_read;
-    sdr->samples_read += n_read;
+    sdr->iq_len = n_pairs;
+    sdr->samples_read += n_pairs;
 
     return n_read;
 }
