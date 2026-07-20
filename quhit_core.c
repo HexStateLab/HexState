@@ -2,9 +2,13 @@
  * quhit_core.c — Engine Lifecycle, PRNG, Quhit Init
  *
  * The foundation. Every quhit starts here.
+ * In SDR mode, quhits are physically sourced from the electromagnetic
+ * field via an RTL-SDR dongle, and Born-rule randomness is physical
+ * quantum noise instead of a deterministic LCG.
  */
 
 #include "quhit_engine.h"
+#include "quhit_sdr.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * ENGINE LIFECYCLE
@@ -14,6 +18,8 @@ void quhit_engine_init(QuhitEngine *eng)
 {
     memset(eng, 0, sizeof(*eng));
     eng->prng_state = 0x5DEECE66DULL ^ 0xCAFEBABEULL;
+    eng->sdr_mode   = 0;
+    eng->sdr_state   = NULL;
 }
 
 void quhit_engine_destroy(QuhitEngine *eng)
@@ -30,12 +36,22 @@ void quhit_engine_destroy(QuhitEngine *eng)
 /* ═══════════════════════════════════════════════════════════════════════════════
  * PRNG — LCG (same constants as java.util.Random)
  *
- * Fast, deterministic, reproducible. Not cryptographic.
- * The quantum engine needs randomness for Born-rule sampling.
+ * In SDR mode, this is bypassed — quhit_sdr_random() provides physical
+ * quantum noise from the RTL-SDR's RF front-end (or CPU timing jitter).
+ * The deterministic LCG is the fallback for pure-simulation mode.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 uint64_t quhit_prng(QuhitEngine *eng)
 {
+    if (eng->sdr_mode && eng->sdr_state) {
+        /* Use physical noise — mix into LCG state for reproducibility tracking */
+        double r = quhit_sdr_random((SdrState *)eng->sdr_state);
+        uint64_t bits = (uint64_t)(r * (double)0x100000000ULL * (double)0x100000000ULL);
+        eng->prng_state = (eng->prng_state ^ bits) * 6364136223846793005ULL
+                        + 1442695040888963407ULL;
+        return eng->prng_state;
+    }
+
     eng->prng_state = eng->prng_state * 6364136223846793005ULL
                     + 1442695040888963407ULL;
     return eng->prng_state;
@@ -117,4 +133,52 @@ void quhit_reset(QuhitEngine *eng, uint32_t id)
     q->pair_id        = -1;
     q->pair_side      = 0;
     qm_init_zero(&q->state);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SDR MODE — Physical EM field as quhit source and entropy
+ *
+ * When SDR mode is enabled, quhit_sdr_init() sources amplitudes from the
+ * RTL-SDR's I/Q stream (partitioned into D=6 frequency bins), and all
+ * Born-rule measurements use physical quantum noise instead of the
+ * deterministic LCG.
+ *
+ * The engine's sdr_mode flag controls this behavior globally.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int quhit_sdr_enable(QuhitEngine *eng, void *sdr_state)
+{
+    if (!sdr_state) return -1;
+    SdrState *sdr = (SdrState *)sdr_state;
+    if (sdr->mode == SDR_MODE_OFF) return -1;
+
+    eng->sdr_mode  = 1;
+    eng->sdr_state = sdr_state;
+
+    fprintf(stderr, "[SDR] Engine SDR mode enabled: %s\n",
+            quhit_sdr_mode_string(sdr));
+    return 0;
+}
+
+void quhit_sdr_disable(QuhitEngine *eng)
+{
+    eng->sdr_mode  = 0;
+    eng->sdr_state = NULL;
+    fprintf(stderr, "[SDR] Engine SDR mode disabled — using deterministic PRNG\n");
+}
+
+uint32_t quhit_sdr_init(QuhitEngine *eng)
+{
+    if (!eng->sdr_mode || !eng->sdr_state) {
+        fprintf(stderr, "[SDR] ERROR: SDR mode not enabled. "
+                "Call quhit_sdr_enable() first.\n");
+        return quhit_init_plus(eng);  /* Fall back to |+⟩ */
+    }
+
+    if (eng->num_quhits >= MAX_QUHITS) {
+        fprintf(stderr, "[QUHIT] ERROR: max quhits (%d) reached\n", MAX_QUHITS);
+        return UINT32_MAX;
+    }
+
+    return quhit_sdr_init_quhit((SdrState *)eng->sdr_state, eng);
 }

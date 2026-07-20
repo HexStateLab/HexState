@@ -156,6 +156,10 @@ typedef struct {
     /* ─── PRNG state ─── */
     uint64_t     prng_state;
 
+    /* ─── SDR mode (physically-sourced quhits and randomness) ─── */
+    int          sdr_mode;        /* 0=deterministic PRNG, 1=physical SDR */
+    void        *sdr_state;       /* Opaque SdrState pointer              */
+
     /* ─── Measurement log ─── */
     uint32_t     measured_values[MAX_QUHITS];
 } QuhitEngine;
@@ -176,6 +180,13 @@ uint32_t quhit_init(QuhitEngine *eng);           /* Init to |0⟩, returns id  *
 uint32_t quhit_init_plus(QuhitEngine *eng);       /* Init to |+⟩             */
 uint32_t quhit_init_basis(QuhitEngine *eng, uint32_t k); /* Init to |k⟩      */
 void     quhit_reset(QuhitEngine *eng, uint32_t id);     /* Reset to |0⟩      */
+
+/* SDR mode — use physical EM field as quhit source and Born-rule entropy.
+ * Call quhit_sdr_enable() before any quhit_init_sdr() or measurement.
+ * Requires quhit_sdr.h for SdrState configuration. */
+int      quhit_sdr_enable(QuhitEngine *eng, void *sdr_state);
+void     quhit_sdr_disable(QuhitEngine *eng);
+uint32_t quhit_sdr_init(QuhitEngine *eng);        /* Init quhit from SDR EM spectrum */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * API — quhit_gates.c
