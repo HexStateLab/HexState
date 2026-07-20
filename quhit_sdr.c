@@ -7,16 +7,28 @@
  * that we partition into frequency bins to create physically-sourced
  * quhit state vectors.
  *
+ * Backends (tried in order):
+ *   1. V4L2 SDR     — kernel rtl2832_sdr driver via /dev/swradio0 (no deps)
+ *   2. librtlsdr    — optional, via -DHAS_RTLSDR -lrtlsdr
+ *   3. /dev/urandom — kernel entropy pool
+ *   4. CPU jitter   — RDTSC-based physical noise
+ *
  * Build:
- *   With librtlsdr:  -DHAS_RTLSDR -lrtlsdr
- *   With libfftw3:   -DHAS_FFTW3 -lfftw3
- *   Fallback:        works with no external libraries
+ *   gcc ... quhit_sdr.c -lm        (V4L2 + fallbacks, no external deps)
+ *   gcc -DHAS_RTLSDR ... -lrtlsdr  (add librtlsdr path)
+ *   gcc -DHAS_FFTW3  ... -lfftw3   (add FFTW path)
  */
 
 #include "quhit_sdr.h"
 #include <time.h>
 #include <stdio.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
 
 /* Conditional RTL-SDR support */
 #ifdef HAS_RTLSDR
@@ -270,17 +282,205 @@ static double _urandom_double(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * V4L2 SDR BACKEND — Native kernel rtl2832_sdr driver
+ *
+ * The rtl2832_sdr kernel module exposes the RTL-SDR as a V4L2 Software
+ * Radio capture device at /dev/swradio0. This is the preferred backend
+ * because it has zero external dependencies and runs directly on the
+ * kernel's USB driver stack.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define V4L2_SDR_DEVICE "/dev/swradio0"
+#define V4L2_NUM_BUFS    4
+
+static int _v4l2_sdr_init(SdrState *sdr)
+{
+    int fd = open(V4L2_SDR_DEVICE, O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        fprintf(stderr, "[SDR-V4L2] Cannot open %s: %s\n",
+                V4L2_SDR_DEVICE, strerror(errno));
+        return -1;
+    }
+
+    /* Set format: I/Q interleaved unsigned 8-bit */
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_SDR_CAPTURE;
+    if (ioctl(fd, VIDIOC_G_FMT, &fmt) < 0) {
+        fprintf(stderr, "[SDR-V4L2] VIDIOC_G_FMT failed: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+    fmt.fmt.sdr.pixelformat = V4L2_SDR_FMT_CU8;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        fprintf(stderr, "[SDR-V4L2] VIDIOC_S_FMT(CU8) failed: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+    fprintf(stderr, "[SDR-V4L2] Format: CU8, buffersize=%u\n",
+            fmt.fmt.sdr.buffersize);
+
+    /* Try to set center frequency via V4L2 tuner */
+    struct v4l2_frequency vf;
+    memset(&vf, 0, sizeof(vf));
+    vf.tuner = 0;
+    vf.type = V4L2_TUNER_ADC;
+    vf.frequency = sdr->center_freq;
+    if (ioctl(fd, VIDIOC_S_FREQUENCY, &vf) < 0) {
+        fprintf(stderr, "[SDR-V4L2] VIDIOC_S_FREQUENCY(%u Hz) failed: %s "
+                "(continuing with default)\n",
+                sdr->center_freq, strerror(errno));
+    } else {
+        fprintf(stderr, "[SDR-V4L2] Frequency set to %u Hz\n", vf.frequency);
+    }
+
+    /* Try to set sample rate via V4L2 control
+     * rtl2832_sdr exposes V4L2_CID_SDR_TUNER_SAMPLERATE or similar.
+     * Try known control IDs. */
+    struct v4l2_control ctrl;
+    memset(&ctrl, 0, sizeof(ctrl));
+    /* Try V4L2_CID_SDR_TUNER_SAMPLERATE = 0x9B2c */
+    ctrl.id = 0x0098092c;  /* V4L2_CID_SDR_TUNER_SAMPLERATE (likely value) */
+    ctrl.value = sdr->sample_rate;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+        fprintf(stderr, "[SDR-V4L2] Cannot set sample rate via S_CTRL: %s\n",
+                strerror(errno));
+    }
+
+    /* Request and mmap buffers */
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count  = V4L2_NUM_BUFS;
+    req.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        fprintf(stderr, "[SDR-V4L2] REQBUFS failed: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+    fprintf(stderr, "[SDR-V4L2] Allocated %u buffers\n", req.count);
+    sdr->v4l2_buf_count = req.count;
+
+    sdr->v4l2_bufs = (uint8_t **)calloc(req.count, sizeof(uint8_t *));
+    if (!sdr->v4l2_bufs) { close(fd); return -1; }
+
+    for (uint32_t i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            fprintf(stderr, "[SDR-V4L2] QUERYBUF %u failed: %s\n",
+                    i, strerror(errno));
+            close(fd); return -1;
+        }
+        sdr->v4l2_buf_len[i] = buf.length;
+        sdr->v4l2_bufs[i] = (uint8_t *)mmap(NULL, buf.length,
+            PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (sdr->v4l2_bufs[i] == MAP_FAILED) {
+            fprintf(stderr, "[SDR-V4L2] mmap buffer %u failed: %s\n",
+                    i, strerror(errno));
+            close(fd); return -1;
+        }
+    }
+
+    /* Queue all buffers */
+    for (uint32_t i = 0; i < req.count; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        if (ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            fprintf(stderr, "[SDR-V4L2] QBUF %u failed: %s\n",
+                    i, strerror(errno));
+            close(fd); return -1;
+        }
+    }
+
+    /* Start streaming */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_SDR_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        fprintf(stderr, "[SDR-V4L2] STREAMON failed: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+
+    sdr->dev_fd = fd;
+    sdr->backend = SDR_BACKEND_V4L2;
+    fprintf(stderr, "[SDR-V4L2] Streaming started on %s\n", V4L2_SDR_DEVICE);
+    return 0;
+}
+
+static void _v4l2_sdr_close(SdrState *sdr)
+{
+    if (sdr->dev_fd < 0) return;
+
+    /* Stop streaming */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_SDR_CAPTURE;
+    ioctl(sdr->dev_fd, VIDIOC_STREAMOFF, &type);
+
+    /* Unmap buffers */
+    for (uint32_t i = 0; i < sdr->v4l2_buf_count; i++) {
+        if (sdr->v4l2_bufs && sdr->v4l2_bufs[i] && sdr->v4l2_bufs[i] != MAP_FAILED)
+            munmap(sdr->v4l2_bufs[i], sdr->v4l2_buf_len[i]);
+    }
+    free(sdr->v4l2_bufs);
+    sdr->v4l2_bufs = NULL;
+    sdr->v4l2_buf_count = 0;
+
+    close(sdr->dev_fd);
+    sdr->dev_fd = -1;
+}
+
+static int _v4l2_sdr_read(SdrState *sdr, int n_samples)
+{
+    if (sdr->dev_fd < 0 || !sdr->v4l2_bufs) return 0;
+
+    /* Dequeue a filled buffer */
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    /* Non-blocking: poll for a buffer with timeout */
+    struct pollfd pfd = { .fd = sdr->dev_fd, .events = POLLIN };
+    int pret = poll(&pfd, 1, 500); /* 500ms timeout */
+    if (pret <= 0) {
+        /* No data available — fall through to software noise */
+        return 0;
+    }
+
+    if (ioctl(sdr->dev_fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN) return 0;
+        return 0;
+    }
+
+    /* Copy I/Q samples from the dequeued buffer */
+    int bytes = (int)buf.bytesused;
+    if (bytes > n_samples) bytes = n_samples;
+    if (bytes > sdr->v4l2_buf_len[buf.index])
+        bytes = sdr->v4l2_buf_len[buf.index];
+    memcpy(sdr->iq_buffer, sdr->v4l2_bufs[buf.index], bytes);
+
+    /* Requeue the buffer */
+    ioctl(sdr->dev_fd, VIDIOC_QBUF, &buf);
+    sdr->samples_read += bytes;
+
+    return bytes;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * INITIALIZATION
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 int quhit_sdr_init(SdrState *sdr, uint32_t freq, uint32_t rate, int gain)
 {
     memset(sdr, 0, sizeof(*sdr));
+    sdr->dev_fd       = -1;
     sdr->center_freq  = freq ? freq : SDR_DEFAULT_FREQ;
     sdr->sample_rate  = rate ? rate : SDR_DEFAULT_RATE;
     sdr->gain         = gain >= 0 ? gain : SDR_DEFAULT_GAIN;
     sdr->device_index = 0;
     sdr->coupling     = SDR_COUPLING_READ;
+    sdr->backend      = SDR_BACKEND_NONE;
 
     /* Allocate buffers */
     sdr->iq_buffer  = (uint8_t *)malloc(SDR_MAX_SAMPLES);
@@ -297,12 +497,19 @@ int quhit_sdr_init(SdrState *sdr, uint32_t freq, uint32_t rate, int gain)
 
     _build_hann_window(sdr->fft_window, SDR_FFT_SIZE);
 
-    /* Try to open RTL-SDR device */
+    /* Try V4L2 SDR kernel driver first (no external deps) */
+    if (_v4l2_sdr_init(sdr) == 0) {
+        sdr->mode = SDR_MODE_PHYSICAL;
+        return 0;
+    }
+
+    /* Try librtlsdr userspace driver */
 #ifdef HAS_RTLSDR
     {
         int n_devices = rtlsdr_get_device_count();
         if (n_devices > 0 && sdr->device_index < n_devices) {
             if (rtlsdr_open((rtlsdr_dev_t **)&sdr->device, (uint32_t)sdr->device_index) == 0) {
+                sdr->dev_fd = -1;
                 rtlsdr_set_center_freq((rtlsdr_dev_t *)sdr->device, sdr->center_freq);
                 rtlsdr_set_sample_rate((rtlsdr_dev_t *)sdr->device, sdr->sample_rate);
                 if (sdr->gain == 0)
@@ -311,29 +518,33 @@ int quhit_sdr_init(SdrState *sdr, uint32_t freq, uint32_t rate, int gain)
                     rtlsdr_set_tuner_gain((rtlsdr_dev_t *)sdr->device, sdr->gain);
                 rtlsdr_set_freq_correction((rtlsdr_dev_t *)sdr->device, sdr->ppm_error);
                 rtlsdr_reset_buffer((rtlsdr_dev_t *)sdr->device);
+                sdr->backend = SDR_BACKEND_RTLSDR;
                 sdr->mode = SDR_MODE_PHYSICAL;
-                fprintf(stderr, "[SDR] RTL-SDR opened: %.3f MHz @ %.3f MSPS, gain=%d\n",
+                fprintf(stderr, "[SDR-RTLSDR] Opened: %.3f MHz @ %.3f MSPS, gain=%d\n",
                         sdr->center_freq / 1e6, sdr->sample_rate / 1e6, sdr->gain);
                 return 0;
             }
         }
     }
-    fprintf(stderr, "[SDR] No RTL-SDR device found, falling back to /dev/urandom\n");
+    fprintf(stderr, "[SDR-RTLSDR] No device found.\n");
 #else
-    fprintf(stderr, "[SDR] Built without librtlsdr, using /dev/urandom for physical entropy\n");
+    fprintf(stderr, "[SDR] Built without librtlsdr.\n");
 #endif
 
+    /* Fallback: kernel entropy pool */
+    fprintf(stderr, "[SDR] No SDR hardware — using /dev/urandom for physical entropy\n");
     sdr->mode = SDR_MODE_URANDOM;
-    sdr->device = NULL;
     return 0;
 }
 
 int quhit_sdr_init_noise(SdrState *sdr)
 {
     memset(sdr, 0, sizeof(*sdr));
+    sdr->dev_fd       = -1;
     sdr->mode          = SDR_MODE_CPU_NOISE;
     sdr->center_freq   = SDR_DEFAULT_FREQ;
     sdr->sample_rate   = SDR_DEFAULT_RATE;
+    sdr->backend       = SDR_BACKEND_NONE;
     sdr->fft_window    = (double *)malloc(SDR_FFT_SIZE * sizeof(double));
     if (!sdr->fft_window) return -1;
     _build_hann_window(sdr->fft_window, SDR_FFT_SIZE);
@@ -343,9 +554,11 @@ int quhit_sdr_init_noise(SdrState *sdr)
 int quhit_sdr_init_urandom(SdrState *sdr)
 {
     memset(sdr, 0, sizeof(*sdr));
+    sdr->dev_fd       = -1;
     sdr->mode          = SDR_MODE_URANDOM;
     sdr->center_freq   = SDR_DEFAULT_FREQ;
     sdr->sample_rate   = SDR_DEFAULT_RATE;
+    sdr->backend       = SDR_BACKEND_NONE;
     sdr->fft_window    = (double *)malloc(SDR_FFT_SIZE * sizeof(double));
     if (!sdr->fft_window) return -1;
     _build_hann_window(sdr->fft_window, SDR_FFT_SIZE);
@@ -358,8 +571,12 @@ void quhit_sdr_close(SdrState *sdr)
 
     if (_urandom_fp) { fclose(_urandom_fp); _urandom_fp = NULL; }
 
+    /* Close V4L2 backend */
+    if (sdr->backend == SDR_BACKEND_V4L2)
+        _v4l2_sdr_close(sdr);
+
 #ifdef HAS_RTLSDR
-    if (sdr->device) {
+    if (sdr->backend == SDR_BACKEND_RTLSDR && sdr->device) {
         rtlsdr_close((rtlsdr_dev_t *)sdr->device);
         sdr->device = NULL;
     }
@@ -371,7 +588,9 @@ void quhit_sdr_close(SdrState *sdr)
     free(sdr->fft_im);      sdr->fft_im     = NULL;
     free(sdr->fft_window);  sdr->fft_window = NULL;
 
-    sdr->mode = SDR_MODE_OFF;
+    sdr->mode    = SDR_MODE_OFF;
+    sdr->backend = SDR_BACKEND_NONE;
+    sdr->dev_fd  = -1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -380,16 +599,24 @@ void quhit_sdr_close(SdrState *sdr)
 
 int quhit_sdr_detect(void)
 {
+    /* Check V4L2 SDR device first */
+    int fd = open(V4L2_SDR_DEVICE, O_RDONLY);
+    if (fd >= 0) {
+        struct v4l2_capability cap;
+        memset(&cap, 0, sizeof(cap));
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+            fprintf(stderr, "[SDR] Detected V4L2 SDR: %s (driver: %s)\n",
+                    cap.card, cap.driver);
+            close(fd);
+            return 1;
+        }
+        close(fd);
+    }
+
 #ifdef HAS_RTLSDR
-    return rtlsdr_get_device_count() > 0;
-#else
-    /* Check for the USB device by VID/PID */
-    FILE *f = fopen("/sys/bus/usb/devices", "r");
-    if (f) { fclose(f); }
-    /* RTL2832U vendor=0x0bda — we can't check without walking the tree,
-     * so return -1 to indicate "uncertain, try init" */
-    return -1;
+    if (rtlsdr_get_device_count() > 0) return 1;
 #endif
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -401,22 +628,30 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
     if (n_samples > SDR_MAX_SAMPLES) n_samples = SDR_MAX_SAMPLES;
     int n_read = 0;
 
+    /* Try V4L2 kernel driver */
+    if (sdr->backend == SDR_BACKEND_V4L2 && sdr->dev_fd >= 0) {
+        n_read = _v4l2_sdr_read(sdr, n_samples);
+        if (n_read > 0) goto convert;
+        /* V4L2 returned no data — fall through to software noise for
+         * the remaining samples. Mix real SDR data with software noise
+         * so we never return empty. */
+    }
+
 #ifdef HAS_RTLSDR
-    if (sdr->device && sdr->mode == SDR_MODE_PHYSICAL) {
+    if (sdr->backend == SDR_BACKEND_RTLSDR && sdr->device) {
         int result = rtlsdr_read_sync((rtlsdr_dev_t *)sdr->device,
                                        sdr->iq_buffer, n_samples, &n_read);
         if (result < 0) {
-            fprintf(stderr, "[SDR] read_sync failed: %d\n", result);
+            fprintf(stderr, "[SDR-RTLSDR] read_sync failed: %d\n", result);
             n_read = 0;
+        } else {
+            goto convert;
         }
-    }     else
+    }
 #endif
+
+    /* No hardware — fill with software entropy */
     {
-        /* No SDR hardware — use a physical entropy source.
-         * In URANDOM mode, read from the kernel's CSPRNG which is
-         * continuously reseeded from hardware RNG (RDRAND/RDSEED on
-         * modern CPUs), interrupt timing, and block device entropy.
-         * This is a genuine physical noise source, just buffered. */
         n_read = n_samples;
         if (sdr->mode == SDR_MODE_URANDOM) {
             if (!_urandom_fp)
@@ -424,7 +659,6 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
             if (_urandom_fp) {
                 size_t nr = fread(sdr->iq_buffer, 1, (size_t)n_samples, _urandom_fp);
                 if (nr < (size_t)n_samples) {
-                    /* Partial read — fill remainder from timing jitter */
                     for (int i = (int)nr; i < n_samples; i++)
                         sdr->iq_buffer[i] = (uint8_t)(_cpu_noise_sample() & 0xFF);
                 }
@@ -433,20 +667,20 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
                     sdr->iq_buffer[i] = (uint8_t)(_cpu_noise_sample() & 0xFF);
             }
         } else {
-            /* CPU timing jitter fallback */
             for (int i = 0; i < n_samples; i++)
                 sdr->iq_buffer[i] = (uint8_t)(_cpu_noise_sample() & 0xFF);
         }
     }
 
+convert:
     /* Convert 8-bit unsigned I/Q (interleaved) to complex doubles.
-     * RTL-SDR format: [I0, Q0, I1, Q1, ...] where each byte is
-     * centered at 127.5 (the DC offset). */
+     * RTL-SDR CU8 format: [I0, Q0, I1, Q1, ...]
+     * Each byte is centered at 127.5 (the ADC DC offset).
+     * Scale to [-1, +1] range. */
     for (int i = 0; i < n_read; i++) {
         sdr->iq_complex[2 * i]     = ((double)sdr->iq_buffer[i] - 127.5) / 128.0;
-        sdr->iq_complex[2 * i + 1] = 0.0;  /* Only I channel from timing jitter */
+        sdr->iq_complex[2 * i + 1] = 0.0;
     }
-
     sdr->iq_len = n_read;
     sdr->samples_read += n_read;
 

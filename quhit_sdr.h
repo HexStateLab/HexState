@@ -72,8 +72,16 @@ typedef enum {
     SDR_COUPLING_LOOP   = 3,  /* Full bidirectional loop                     */
 } SdrCouplingMode;
 
+typedef enum {
+    SDR_BACKEND_NONE     = 0,  /* No SDR hardware                             */
+    SDR_BACKEND_V4L2     = 1,  /* Kernel rtl2832_sdr via /dev/swradio0        */
+    SDR_BACKEND_RTLSDR   = 2,  /* librtlsdr userspace driver                  */
+} SdrBackend;
+
 typedef struct {
-    void        *device;          /* Opaque rtl-sdr device handle             */
+    SdrBackend   backend;         /* Active hardware backend                   */
+    int          dev_fd;          /* File descriptor (V4L2 / librtlsdr)        */
+    void        *device;          /* Opaque device handle (librtlsdr only)     */
     SdrMode      mode;            /* Active SDR mode                          */
     SdrCouplingMode coupling;     /* Read/write coupling level                */
     uint32_t     center_freq;     /* Center frequency in Hz                   */
@@ -81,6 +89,11 @@ typedef struct {
     int          gain;            /* Tuner gain (0=auto, tenths of dB)        */
     int          device_index;    /* Which RTL-SDR device (0=first)           */
     int          ppm_error;       /* Frequency correction in ppm              */
+
+    /* V4L2 buffer management */
+    uint8_t    **v4l2_bufs;        /* Mmap'd buffer pointers                   */
+    uint32_t     v4l2_buf_count;   /* Number of queued buffers                 */
+    uint32_t     v4l2_buf_len[8];  /* Per-buffer length                        */
 
     /* I/Q sample buffers */
     uint8_t     *iq_buffer;       /* Raw 8-bit unsigned I/Q interleaved      */
