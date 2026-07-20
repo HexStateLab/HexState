@@ -403,6 +403,29 @@ static int _v4l2_sdr_init(SdrState *sdr)
         close(fd); return -1;
     }
 
+    /* Warmup: drain pre-allocated buffers until USB data arrives.
+     * The first few DQBUFs return mmap-zeroed buffers. We dequeue
+     * and requeue them until we see real data (mean ~127 for CU8).
+     * This ensures subsequent reads get live RF from the antenna. */
+    {
+        int warmed = 0;
+        for (int attempt = 0; attempt < (int)req.count * 2 && !warmed; attempt++) {
+            struct v4l2_buffer wbuf;
+            memset(&wbuf, 0, sizeof(wbuf));
+            wbuf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
+            wbuf.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd, VIDIOC_DQBUF, &wbuf) != 0) break;
+            /* Check if this buffer has real data */
+            int sum = 0;
+            uint8_t *data = sdr->v4l2_bufs[wbuf.index];
+            int ncheck = wbuf.bytesused > 256 ? 256 : (int)wbuf.bytesused;
+            for (int i = 0; i < ncheck; i++) sum += data[i];
+            double mean = (double)sum / ncheck;
+            if (mean > 50.0 && mean < 200.0) warmed = 1;
+            ioctl(fd, VIDIOC_QBUF, &wbuf); /* requeue */
+        }
+    }
+
     sdr->dev_fd = fd;
     sdr->backend = SDR_BACKEND_V4L2;
     fprintf(stderr, "[SDR-V4L2] Streaming started on %s\n", V4L2_SDR_DEVICE);
@@ -592,6 +615,10 @@ void quhit_sdr_close(SdrState *sdr)
 
     if (_urandom_fp) { fclose(_urandom_fp); _urandom_fp = NULL; }
 
+    /* Close record/replay files */
+    if (sdr->record_fp) { fclose(sdr->record_fp); sdr->record_fp = NULL; }
+    if (sdr->replay_fp) { fclose(sdr->replay_fp); sdr->replay_fp = NULL; }
+
     /* Close V4L2 backend */
     if (sdr->backend == SDR_BACKEND_V4L2)
         _v4l2_sdr_close(sdr);
@@ -612,6 +639,56 @@ void quhit_sdr_close(SdrState *sdr)
     sdr->mode    = SDR_MODE_OFF;
     sdr->backend = SDR_BACKEND_NONE;
     sdr->dev_fd  = -1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * RECORD / REPLAY
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int quhit_sdr_record_open(SdrState *sdr, const char *path)
+{
+    if (!sdr || !path) return -1;
+    sdr->record_fp = fopen(path, "wb");
+    if (!sdr->record_fp) {
+        fprintf(stderr, "[SDR-RECORD] Cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[SDR-RECORD] Recording I/Q stream to %s\n", path);
+    return 0;
+}
+
+int quhit_sdr_replay_open(SdrState *sdr, const char *path)
+{
+    if (!sdr || !path) return -1;
+
+    /* Close any hardware backend first */
+    if (sdr->backend == SDR_BACKEND_V4L2) _v4l2_sdr_close(sdr);
+#ifdef HAS_RTLSDR
+    if (sdr->backend == SDR_BACKEND_RTLSDR && sdr->device) {
+        rtlsdr_close((rtlsdr_dev_t *)sdr->device);
+        sdr->device = NULL;
+    }
+#endif
+
+    sdr->replay_fp = fopen(path, "rb");
+    if (!sdr->replay_fp) {
+        fprintf(stderr, "[SDR-REPLAY] Cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    /* Get file size */
+    fseeko(sdr->replay_fp, 0, SEEK_END);
+    sdr->replay_size = (uint64_t)ftello(sdr->replay_fp);
+    fseeko(sdr->replay_fp, 0, SEEK_SET);
+    sdr->replay_offset = 0;
+
+    sdr->mode    = SDR_MODE_REPLAY;
+    sdr->backend = SDR_BACKEND_NONE;
+    sdr->dev_fd  = -1;
+
+    fprintf(stderr, "[SDR-REPLAY] Opened %s (%lu bytes), mode=REPLAY\n",
+            path, (unsigned long)sdr->replay_size);
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -648,6 +725,17 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
 {
     if (n_samples > SDR_MAX_SAMPLES) n_samples = SDR_MAX_SAMPLES;
     int n_read = 0;
+
+    /* Replay mode: read from pre-recorded file */
+    if (sdr->mode == SDR_MODE_REPLAY && sdr->replay_fp) {
+        if (sdr->replay_offset + (uint64_t)n_samples > sdr->replay_size) {
+            fseeko(sdr->replay_fp, 0, SEEK_SET);
+            sdr->replay_offset = 0;
+        }
+        n_read = (int)fread(sdr->iq_buffer, 1, (size_t)n_samples, sdr->replay_fp);
+        sdr->replay_offset += (uint64_t)n_read;
+        if (n_read > 0) goto convert;
+    }
 
     /* Try V4L2 kernel driver */
     if (sdr->backend == SDR_BACKEND_V4L2 && sdr->dev_fd >= 0) {
@@ -694,6 +782,10 @@ int quhit_sdr_read_iq(SdrState *sdr, int n_samples)
     }
 
 convert:
+    /* Record mode: dump raw I/Q bytes to file */
+    if (sdr->record_fp && n_read > 0)
+        fwrite(sdr->iq_buffer, 1, (size_t)n_read, sdr->record_fp);
+
     /* Convert CU8 interleaved I/Q to complex doubles.
      * RTL-SDR format: [I0, Q0, I1, Q1, ...] — 8-bit unsigned each.
      * Center at 127.5 (ADC DC offset), scale to [-1, +1].
@@ -1111,6 +1203,7 @@ const char* quhit_sdr_mode_string(const SdrState *sdr)
         case SDR_MODE_PHYSICAL:  return "PHYSICAL (RTL-SDR)";
         case SDR_MODE_CPU_NOISE: return "CPU_TIMING_NOISE";
         case SDR_MODE_URANDOM:   return "/DEV/URANDOM";
+        case SDR_MODE_REPLAY:    return "REPLAY (file)";
         default:                 return "UNKNOWN";
     }
 }

@@ -63,6 +63,7 @@ typedef enum {
     SDR_MODE_PHYSICAL  = 1,   /* Physical SDR dongle active                  */
     SDR_MODE_CPU_NOISE = 2,   /* No dongle — use CPU timing jitter as noise  */
     SDR_MODE_URANDOM   = 3,   /* Fallback to /dev/urandom                    */
+    SDR_MODE_REPLAY    = 4,   /* Replay from pre-recorded I/Q file           */
 } SdrMode;
 
 typedef enum {
@@ -118,6 +119,12 @@ typedef struct {
     uint64_t     samples_read;
     uint64_t     quhits_sourced;
     double       avg_noise_power;
+
+    /* Record / Replay */
+    FILE        *record_fp;       /* File for recording I/Q stream            */
+    FILE        *replay_fp;       /* File for replaying I/Q stream            */
+    uint64_t     replay_offset;   /* Byte offset in replay file               */
+    uint64_t     replay_size;     /* Total size of replay file                */
 } SdrState;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -135,6 +142,12 @@ int  quhit_sdr_init_urandom(SdrState *sdr);
 
 /* Shut down SDR subsystem. */
 void quhit_sdr_close(SdrState *sdr);
+
+/* Record: open a file for dumping raw I/Q bytes (CU8 format). */
+int  quhit_sdr_record_open(SdrState *sdr, const char *path);
+
+/* Replay: open a pre-recorded I/Q file, bypass all hardware. */
+int  quhit_sdr_replay_open(SdrState *sdr, const char *path);
 
 /* ─── Quhit Sourcing ─── */
 
