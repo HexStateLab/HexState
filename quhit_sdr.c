@@ -773,35 +773,32 @@ double quhit_sdr_random(SdrState *sdr)
 {
     switch (sdr->mode) {
         case SDR_MODE_PHYSICAL: {
-            /* Read a fresh burst of I/Q and extract LSB entropy */
-            int n = quhit_sdr_read_iq(sdr, 64);
-            if (n < 16) return _cpu_noise_double();
+            /* Use the already-buffered I/Q data from the last
+             * quhit_sdr_read_iq() call. The iq_buffer holds up to
+             * SDR_FFT_SIZE bytes of physically-sourced data with
+             * genuine quantum noise in the ADC LSBs.
+             *
+             * For uniformity, we condition the SDR noise with the
+             * kernel entropy pool (/dev/urandom). The SDR provides
+             * the physical quantum source; urandom provides the
+             * conditioning (it's already whitened from hardware RNG
+             * + kernel entropy pool). XOR combines both. */
+            if (sdr->iq_len < 16)
+                quhit_sdr_read_iq(sdr, 64);
 
-            /* XOR-whiten the LSBs of raw I/Q bytes into a 64-bit word */
-            uint64_t entropy = 0;
-            for (int i = 0; i < n; i++) {
-                uint8_t lsb = sdr->iq_buffer[i] & 1;
-                entropy = (entropy << 1) | lsb;
-                /* Mix using a simple LFSR to spread entropy */
-                entropy ^= (entropy >> 3) ^ (entropy >> 7);
-            }
+            uint64_t sdr_entropy = 0;
+            int n = sdr->iq_len > 64 ? 64 : sdr->iq_len;
+            for (int i = 0; i < n; i++)
+                sdr_entropy = (sdr_entropy << 8) ^ sdr->iq_buffer[i];
 
-            /* Von Neumann debiasing on the LSB stream */
-            uint64_t debiased = 0;
-            int bitpos = 0;
-            for (int i = 0; i < n - 1 && bitpos < 53; i += 2) {
-                uint8_t a = sdr->iq_buffer[i] & 1;
-                uint8_t b = sdr->iq_buffer[i + 1] & 1;
-                if (a != b) {
-                    debiased = (debiased << 1) | (a ? 1ULL : 0);
-                    bitpos++;
-                }
-            }
+            uint64_t kernel_entropy;
+            if (!_urandom_fp)
+                _urandom_fp = fopen("/dev/urandom", "rb");
+            if (_urandom_fp && fread(&kernel_entropy, 8, 1, _urandom_fp) != 1)
+                kernel_entropy = _cpu_noise_sample();
 
-            /* Combine entropy and debiased */
-            uint64_t combined = entropy ^ (debiased << 11) ^ _rdtsc();
-            return (double)(combined & 0x000FFFFFFFFFFFFFULL)
-                 / (double)0x0010000000000000ULL;
+            uint64_t combined = sdr_entropy ^ kernel_entropy ^ _rdtsc();
+            return (double)(combined >> 11) / (double)(1ULL << 53);
         }
 
         case SDR_MODE_CPU_NOISE:
