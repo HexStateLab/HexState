@@ -440,11 +440,12 @@ static int _v4l2_sdr_read(SdrState *sdr, int n_samples)
     buf.type   = V4L2_BUF_TYPE_SDR_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
 
-    /* Non-blocking: poll for a buffer with timeout */
+    /* Non-blocking: poll for a buffer with short timeout.
+     * RTL-SDR USB transfers complete in ~1ms at 2.4 MSPS.
+     * 100ms is generous for the first buffer after stream start. */
     struct pollfd pfd = { .fd = sdr->dev_fd, .events = POLLIN };
-    int pret = poll(&pfd, 1, 500); /* 500ms timeout */
+    int pret = poll(&pfd, 1, 100); /* 100ms timeout */
     if (pret <= 0) {
-        /* No data available — fall through to software noise */
         return 0;
     }
 
